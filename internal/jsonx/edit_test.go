@@ -203,5 +203,81 @@ func FuzzEdit(f *testing.F) {
 		if out, err := SetTopLevelRaw(body, "tools", []byte(`[]`)); err == nil && !json.Valid(out) {
 			t.Fatalf("SetTopLevelRaw produced invalid JSON: %s", out)
 		}
+		out, err := SetTopLevelValues(body, map[string][]byte{"tools": []byte(`[]`), "system": []byte(`""`)})
+		if err == nil && !json.Valid(out) {
+			t.Fatalf("SetTopLevelValues produced invalid JSON: %s", out)
+		}
 	})
+}
+
+func TestSetTopLevelValues(t *testing.T) {
+	body := []byte(`{"model":"m","system":"s","temperature":1.50,"tools":[{"a":1}],"stream":true}`)
+
+	got, err := SetTopLevelValues(body, map[string][]byte{
+		"tools":  []byte(`[{"a":1,"marked":true}]`),
+		"system": []byte(`[{"type":"text","text":"s"}]`),
+	})
+	if err != nil {
+		t.Fatalf("SetTopLevelValues: %v", err)
+	}
+	want := `{"model":"m","system":[{"type":"text","text":"s"}],"temperature":1.50,"tools":[{"a":1,"marked":true}],"stream":true}`
+	if string(got) != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+// The replacements are applied wherever their keys sit, not in the order they
+// were handed over — a map has no order to inherit.
+func TestSetTopLevelValuesIgnoresArgumentOrder(t *testing.T) {
+	body := []byte(`{"a":1,"b":2,"c":3}`)
+
+	first, err := SetTopLevelValues(body, map[string][]byte{"c": []byte(`"z"`), "a": []byte(`"x"`)})
+	if err != nil {
+		t.Fatalf("SetTopLevelValues: %v", err)
+	}
+	if want := `{"a":"x","b":2,"c":"z"}`; string(first) != want {
+		t.Errorf("got %s, want %s", first, want)
+	}
+}
+
+func TestSetTopLevelValuesRejectsMissingKeysAndBadValues(t *testing.T) {
+	body := []byte(`{"model":"m"}`)
+
+	// Nothing is written when any key is absent, so a partial edit cannot reach
+	// an upstream.
+	if _, err := SetTopLevelValues(body, map[string][]byte{
+		"model": []byte(`"n"`), "system": []byte(`[]`),
+	}); !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("missing key: err = %v, want ErrKeyNotFound", err)
+	}
+	if _, err := SetTopLevelValues(body, map[string][]byte{"model": []byte(`{oops`)}); err == nil {
+		t.Error("invalid replacement: err = nil, want an error")
+	}
+	if got, err := SetTopLevelValues(body, nil); err != nil || string(got) != string(body) {
+		t.Errorf("empty edit: got %s, %v; want the body unchanged", got, err)
+	}
+}
+
+// One walk for two edits must produce exactly what two separate walks did.
+func TestSetTopLevelValuesMatchesRepeatedSingleEdits(t *testing.T) {
+	body := []byte("{\n  \"system\" : \"s\",\n  \"n\": 1.50,\n  \"tools\" : [ {\"a\":1} ]\n}")
+	system, tools := []byte(`["s"]`), []byte(`[{"a":2}]`)
+
+	once, err := SetTopLevelValues(body, map[string][]byte{"system": system, "tools": tools})
+	if err != nil {
+		t.Fatalf("SetTopLevelValues: %v", err)
+	}
+	twice, err := SetTopLevelRaw(body, "system", system)
+	if err != nil {
+		t.Fatalf("SetTopLevelRaw: %v", err)
+	}
+	if twice, err = SetTopLevelRaw(twice, "tools", tools); err != nil {
+		t.Fatalf("SetTopLevelRaw: %v", err)
+	}
+	if string(once) != string(twice) {
+		t.Errorf("one pass gave  %s\ntwo passes gave %s", once, twice)
+	}
+	if !strings.Contains(string(once), `"n": 1.50`) {
+		t.Errorf("an unrelated number was renormalized: %s", once)
+	}
 }

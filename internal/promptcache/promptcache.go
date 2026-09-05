@@ -123,27 +123,30 @@ func Inject(body []byte, minBytes int) ([]byte, bool, error) {
 		return body, false, nil
 	}
 
-	out, changed := body, false
+	// Both breakpoints are decided before either is spliced, so the document is
+	// walked once to read and once to write rather than once per edit. Each
+	// walk revalidates the whole body, and on the request bodies this runs
+	// against that is what editing actually costs.
+	marks := make(map[string][]byte, 2)
 	if marked, ok, err := markLastElement(tools); err != nil {
 		return body, false, err
 	} else if ok {
-		if out, err = jsonx.SetTopLevelRaw(out, "tools", marked); err != nil {
-			return body, false, err
-		}
-		changed = true
+		marks["tools"] = marked
+	}
+	if marked, ok, err := markSystem(system); err != nil {
+		return body, false, err
+	} else if ok {
+		marks["system"] = marked
+	}
+	if len(marks) == 0 {
+		return body, false, nil
 	}
 
-	marked, ok, err := markSystem(system)
+	out, err := jsonx.SetTopLevelValues(body, marks)
 	if err != nil {
 		return body, false, err
 	}
-	if ok {
-		if out, err = jsonx.SetTopLevelRaw(out, "system", marked); err != nil {
-			return body, false, err
-		}
-		changed = true
-	}
-	return out, changed, nil
+	return out, true, nil
 }
 
 // markSystem places a breakpoint on the system prompt in either of the two

@@ -34,8 +34,9 @@ balancing is.
 
 ```yaml
 prompt_cache:
-  affinity: true         # the default
+  affinity: true                       # the default
   affinity_ttl: 5m
+  affinity_max_in_flight_lead: 4
 ```
 
 The gateway fingerprints the part of a request that stays byte-identical as a
@@ -53,6 +54,40 @@ for health, format, permissions and capacity exactly like every other candidate.
 If it is cooling down, at its rate limit, or has already failed this request,
 selection carries on as though there were no pin at all. Affinity can cost you
 some balance; it can never cost you a request.
+
+### The bound on concentration
+
+A fingerprint covers a *prefix*, not a conversation. Traffic that shares a
+system prompt, its tools and its opening turns shares one pin — a templated
+single-turn caller, for instance — and with nothing else in play every request
+of it would land on one deployment while the rest of the group sat idle.
+
+`affinity_max_in_flight_lead` bounds that. A pin is passed over once the pinned
+deployment is carrying that many more in-flight requests than the least busy
+deployment that could serve the request instead.
+
+It is a **load comparison rather than a share quota**, because concentration is
+only a problem when there is contention. One busy conversation pinned to one
+deployment while its peers are idle is the feature working; diverting it would
+buy a cache write and nothing else. So the bound does not fire until the pinned
+deployment is genuinely ahead of somewhere else the request could go.
+
+The default of 4 is deliberately loose. A handful of concurrent Claude Code
+sessions never reaches it. Traffic that has collapsed onto one deployment passes
+it almost immediately, and each request that yields lowers the lead, so the group
+settles with most requests still reaching a warm cache rather than swinging to an
+even split.
+
+A yielded request re-pins to whoever served it — that deployment now holds the
+prefix, so it is where the next request should go. Under sustained overload the
+pin will move between deployments, and each move costs one cache write. That is
+the trade the bound exists to make.
+
+In-flight is per-instance even where the rest of routing state is shared, so this
+costs no round trip: it reads the load this instance is carrying, which is also
+the load it is in a position to redistribute. Set the lead to `0` to yield to any
+idler peer at all; there is no value that disables the bound, because `affinity:
+false` already does that.
 
 The pin's TTL is refreshed on every success, so it lives as long as the
 conversation is active and lapses once it stops — the same lifetime the upstream
@@ -149,6 +184,9 @@ Per response:
 | `x-gateway-prompt-affinity: new` | this prefix had no pin; it has one now |
 | `x-gateway-prompt-affinity: miss` | a pin existed and something else served it |
 | absent | no pin was in play |
+
+A pin passed over for load that the strategy then chose anyway still reports
+`hit`: the request did reach the warm upstream, which is what the metric is for.
 
 `new` and `miss` are deliberately separate. Both mean the request did not land on
 a pinned deployment, but only a miss is a problem — a new prefix has nothing to

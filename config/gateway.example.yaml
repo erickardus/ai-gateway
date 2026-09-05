@@ -216,6 +216,13 @@ virtual_keys:
 prompt_cache:
   affinity: true
   affinity_ttl: 5m
+  # Bounds how far a pin may concentrate load: it is passed over once the pinned
+  # deployment carries this many more in-flight requests than the idlest
+  # deployment that could serve the request instead. A load comparison rather
+  # than a share quota, because concentration only hurts when there is
+  # contention — one busy conversation among idle peers is the feature working.
+  # 0 yields to any idler peer.
+  affinity_max_in_flight_lead: 4
   inject: false
   # Prefixes smaller than this are left unmarked. Anthropic ignores a breakpoint
   # below its own minimum rather than rejecting it, so this is an economy rather

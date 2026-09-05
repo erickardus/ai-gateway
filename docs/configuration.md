@@ -130,6 +130,7 @@ The **provider's** cache of a request's leading tokens, as distinct from
 |---|---|---|
 | `affinity` | `true` | Pin requests sharing a cacheable prefix to the deployment that last served one. A preference, never a constraint. Inert in a group with one deployment. |
 | `affinity_ttl` | `5m` | How long a pin survives without use. Matches the lifetime of an ephemeral prompt-cache entry. |
+| `affinity_max_in_flight_lead` | `4` | A pin is passed over once the pinned deployment carries this many more in-flight requests than the idlest deployment that could serve it instead. `0` yields to any idler peer. |
 | `inject` | `false` | Place cache breakpoints on the tools and system prompt of an Anthropic request that carries none of its own. |
 | `inject_min_bytes` | `4096` | Prefixes smaller than this are left unmarked; a provider would ignore the breakpoint anyway. |
 

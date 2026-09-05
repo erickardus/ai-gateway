@@ -118,8 +118,13 @@ const (
 	// upstream's prompt cache was there to be read.
 	AffinityHit = "hit"
 	// AffinityMiss means a pin existed and something else served the request
-	// anyway — the pinned deployment was cooling down, at its limit, or had
-	// already failed this request.
+	// anyway — the pinned deployment was cooling down, at its limit, carrying
+	// too much of the group's load, or had already failed this request.
+	//
+	// It describes where the request landed, not what the router intended: a
+	// pin passed over for load that the strategy then chose anyway still
+	// reports a hit, because the request did reach the warm upstream, which is
+	// what the metric is for.
 	AffinityMiss = "miss"
 )
 
@@ -277,13 +282,21 @@ func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, fai
 	// A prompt-prefix pin biases the choice; it never constrains it. The pinned
 	// deployment has already been through the same health, format, permission
 	// and capacity filters as every other candidate, and if it did not survive
-	// them — or loses the race for its last slot — selection carries on exactly
-	// as it would with no pin at all. Nothing is reserved on the way past,
-	// because a failed reservation consumes nothing.
+	// them — or is carrying too much of the group's load, or loses the race for
+	// its last slot — selection carries on exactly as it would with no pin at
+	// all. Nothing is reserved on the way past, because a failed reservation
+	// consumes nothing.
 	if pinned != "" {
 		for _, c := range candidates {
 			if c.ID() != pinned {
 				continue
+			}
+			overloaded, err := r.pinYieldsToLoad(ctx, candidates, c)
+			if err != nil {
+				return nil, err
+			}
+			if overloaded {
+				break
 			}
 			reserved, err := r.reserve(ctx, c)
 			if err != nil {
@@ -320,6 +333,57 @@ func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, fai
 		candidates = without(candidates, dep)
 	}
 	return nil, core.ErrNoHealthyDeployment
+}
+
+// pinYieldsToLoad reports whether the pinned deployment is carrying so much more
+// work than the best alternative that honouring the pin would cost more in
+// contention than it saves in cache reads.
+//
+// Load rather than traffic share is the test, because concentration is only a
+// problem when there is something to contend for. A fingerprint covers a
+// request's prefix, not a conversation, so traffic that shares a system prompt,
+// its tools and its opening turns shares one pin — and where that is one busy
+// conversation among idle peers, sending it all to one deployment is the feature
+// working. Where it is the whole workload, the lead builds immediately and each
+// request that yields brings it back down, so the group settles with most
+// requests still reaching a warm cache.
+//
+// In-flight is per-instance even when the rest of routing state is shared, so
+// this costs no round trip: it reads the load this instance is itself carrying,
+// which is also the load it is in a position to redistribute.
+func (r *Router) pinYieldsToLoad(ctx context.Context, candidates []*config.Deployment, pinned *config.Deployment) (bool, error) {
+	if len(candidates) < 2 {
+		return false, nil // nowhere else to send it
+	}
+	lead := r.prompt.MaxInFlightLead()
+
+	pinnedLoad, err := r.state.InFlight(ctx, pinned.ID())
+	if err != nil {
+		// Without the signal, keep the pin. Losing cache hits is the more
+		// expensive way to be wrong.
+		r.log.Warn("read in-flight for prompt affinity", "deployment", pinned.ID(), "error", err)
+		return false, nil
+	}
+	if pinnedLoad <= lead {
+		// Cannot be more than lead ahead of anything, so there is nothing to
+		// check and no reason to read every other candidate.
+		return false, nil
+	}
+
+	for _, c := range candidates {
+		if c.ID() == pinned.ID() {
+			continue
+		}
+		load, err := r.state.InFlight(ctx, c.ID())
+		if err != nil {
+			r.log.Warn("read in-flight for prompt affinity", "deployment", c.ID(), "error", err)
+			continue
+		}
+		if pinnedLoad-load > lead {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // reserve consumes one request's capacity on a deployment, reporting whether it

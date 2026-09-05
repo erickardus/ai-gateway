@@ -190,6 +190,14 @@ type countingState struct {
 	StateStore
 	reads, writes int
 	fail          bool
+	failInFlight  bool
+}
+
+func (c *countingState) InFlight(ctx context.Context, id string) (int, error) {
+	if c.failInFlight {
+		return 0, errors.New("state unavailable")
+	}
+	return c.StateStore.InFlight(ctx, id)
 }
 
 func (c *countingState) Affinity(ctx context.Context, fingerprint string) (string, bool, error) {
@@ -336,5 +344,178 @@ func TestAffinityDistinguishesANewPrefixFromAPassedOverPin(t *testing.T) {
 	}
 	if got := route(t, r, "prefix-a").PromptAffinity; got != AffinityMiss {
 		t.Errorf("passed-over pin: affinity = %q, want %q", got, AffinityMiss)
+	}
+}
+
+// load puts n requests in flight against a deployment, and returns a function
+// that retires them.
+func load(t *testing.T, state StateStore, id string, n int) func() {
+	t.Helper()
+	for range n {
+		if err := state.BeginRequest(context.Background(), id); err != nil {
+			t.Fatalf("BeginRequest: %v", err)
+		}
+	}
+	return func() {
+		for range n {
+			_ = state.EndRequest(context.Background(), id, time.Millisecond, true)
+		}
+	}
+}
+
+// A fingerprint covers a prefix, not a conversation, so traffic sharing a system
+// prompt, its tools and its opening turns shares one pin. Without a bound, all
+// of it lands on one deployment while the rest of the group sits idle.
+func TestAffinityYieldsWhenThePinnedDeploymentIsOverloaded(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, _ := buildAffinityRouter(t, []int{1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	pinned := route(t, r, "prefix-a").Deployment.ID()
+	if got := route(t, r, "prefix-a").Deployment.ID(); got != pinned {
+		t.Fatalf("pin not established: went to %s, want %s", got, pinned)
+	}
+
+	release := load(t, state, pinned, config.DefaultAffinityMaxInFlightLead+1)
+	defer release()
+
+	// Once the pin yields the strategy decides, and it may still land on the
+	// overloaded deployment by chance — so what is asserted is that selection
+	// is happening at all, rather than every request going one way.
+	elsewhere := 0
+	for range 30 {
+		if route(t, r, "prefix-a").Deployment.ID() != pinned {
+			elsewhere++
+		}
+	}
+	if elsewhere == 0 {
+		t.Errorf("all 30 requests went to %s while it led its idle peer by more than the configured lead", pinned)
+	}
+}
+
+// Shedding re-pins: the deployment that served the request is the one now
+// holding this prefix, so that is what the next request should be sent back to.
+// A pin that stayed on the overloaded deployment would send every later request
+// through the guard again, and a pin that named a deployment which had never
+// served the prefix would point at a cache that does not exist.
+func TestAffinityFollowsARequestItShed(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, _ := buildAffinityRouter(t, []int{1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	pinned := route(t, r, "prefix-a").Deployment.ID()
+	release := load(t, state, pinned, config.DefaultAffinityMaxInFlightLead+1)
+
+	// Shed until the request lands elsewhere, then let the load subside.
+	var moved string
+	for range 30 {
+		if id := route(t, r, "prefix-a").Deployment.ID(); id != pinned {
+			moved = id
+			break
+		}
+	}
+	release()
+	if moved == "" {
+		t.Fatal("the guard never shed a request")
+	}
+
+	got, ok, err := state.Affinity(context.Background(), "g\x00prefix-a")
+	if err != nil || !ok {
+		t.Fatalf("Affinity: got=%q ok=%v err=%v", got, ok, err)
+	}
+	if got != moved {
+		t.Errorf("pin = %s, want %s — the deployment that actually served the prefix", got, moved)
+	}
+	res := route(t, r, "prefix-a")
+	if res.Deployment.ID() != moved || res.PromptAffinity != AffinityHit {
+		t.Errorf("next request went to %s (%s), want %s and %q",
+			res.Deployment.ID(), res.PromptAffinity, moved, AffinityHit)
+	}
+}
+
+// The bound is a load comparison, not a share quota. One busy conversation
+// pinned to one deployment while its peers are idle is the feature working:
+// diverting it would buy a cache write and nothing else.
+func TestAffinityHoldsWhileTheGroupIsIdle(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, _ := buildAffinityRouter(t, []int{1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	pinned := route(t, r, "prefix-a").Deployment.ID()
+
+	// Some load, but not enough to lead the idle peer by more than the bound.
+	release := load(t, state, pinned, config.DefaultAffinityMaxInFlightLead)
+	defer release()
+
+	for i := range 20 {
+		res := route(t, r, "prefix-a")
+		if res.Deployment.ID() != pinned {
+			t.Fatalf("request %d left the pinned %s with no contention to justify it", i, pinned)
+		}
+	}
+}
+
+// The lead is measured against the least busy alternative, so a pin is only
+// passed over when there is somewhere better to send the request.
+func TestAffinityHoldsWhenEveryAlternativeIsBusyToo(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, deps := buildAffinityRouter(t, []int{1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	pinned := route(t, r, "prefix-a").Deployment.ID()
+	other := deps[0].ID()
+	if other == pinned {
+		other = deps[1].ID()
+	}
+
+	defer load(t, state, pinned, config.DefaultAffinityMaxInFlightLead+1)()
+	defer load(t, state, other, config.DefaultAffinityMaxInFlightLead+1)()
+
+	if got := route(t, r, "prefix-a").Deployment.ID(); got != pinned {
+		t.Errorf("left the pinned %s for %s, which is no less loaded", pinned, got)
+	}
+}
+
+// An explicit 0 means what it says: yield as soon as any alternative is less
+// loaded at all.
+func TestAffinityLeadOfZeroYieldsToAnyIdlePeer(t *testing.T) {
+	zero := 0
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, _ := buildAffinityRouter(t, []int{1, 1},
+		config.PromptCacheConfig{AffinityMaxInFlightLead: &zero}, 0, exec, state)
+
+	pinned := route(t, r, "prefix-a").Deployment.ID()
+	defer load(t, state, pinned, 1)()
+
+	elsewhere := 0
+	for range 30 {
+		if route(t, r, "prefix-a").Deployment.ID() != pinned {
+			elsewhere++
+		}
+	}
+	if elsewhere == 0 {
+		t.Errorf("all 30 requests held the pin on %s with an idle peer and a lead of 0", pinned)
+	}
+}
+
+// Losing the load signal must not lose the pin: cache hits are the more
+// expensive thing to be wrong about.
+func TestAffinityKeepsThePinWhenLoadCannotBeRead(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := &countingState{StateStore: NewMemState()}
+	r, _ := buildAffinityRouter(t, []int{1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	pinned := route(t, r, "prefix-a").Deployment.ID()
+
+	// Loaded past the bound, so a working signal would yield here. With the
+	// signal broken, every request must still hold the pin.
+	defer load(t, state, pinned, config.DefaultAffinityMaxInFlightLead+1)()
+	state.failInFlight = true
+
+	for i := range 30 {
+		if got := route(t, r, "prefix-a").Deployment.ID(); got != pinned {
+			t.Fatalf("request %d left the pinned %s because in-flight was unreadable", i, pinned)
+		}
 	}
 }

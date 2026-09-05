@@ -83,16 +83,29 @@ response-cache key, so it was not worth doing before the feature had users.
 Claude Code places its own breakpoints, so nothing is lost on the traffic this
 gateway primarily carries.
 
-### 🟡 Prefix affinity can trade balance for cache hits
+### 🟡 Prefix affinity concentrates load, bounded by in-flight rather than share
 
-A pin sends every turn of a conversation to one deployment. That is the point,
-but a small number of very long conversations will load one upstream more than
-weights alone would. The pin yields to cooldowns and rate limits, so the effect
-is bounded by whatever limits are configured — and unbounded where none are.
+A fingerprint covers a request's prefix, not a conversation, so all traffic
+sharing a system prompt, its tools and its opening two turns shares one pin.
+For a conversational caller that is exactly right. For a templated single-turn
+caller it means the whole workload has one pin, and before
+`affinity_max_in_flight_lead` existed every request of it landed on one
+deployment while the rest of the group sat idle.
 
-`gateway_prompt_affinity_total` alongside `gateway_in_flight` shows whether it is
-happening. Turning `prompt_cache.affinity` off restores pure weighted balance at
-the cost of a cache write per turn.
+The bound is a load comparison, so it fires on contention rather than on share.
+That is deliberate — concentration without contention costs nothing — but it
+means a workload that concentrates *and* keeps in-flight low, many small fast
+requests against a fast upstream, is not redistributed. Throughput is fine there
+and cache hits are maximal, so the cost is paid capacity going unused rather than
+latency. An operator who wants that capacity used needs `rpm` on the deployment,
+or `affinity: false`.
+
+A share-based bound would catch it, but wants a per-deployment request rate
+compared against weight share, which under Redis is a round trip per candidate on
+every request — the same objection that keeps in-flight and latency local.
+
+`gateway_prompt_affinity_total{outcome="miss"}` alongside `gateway_in_flight`
+shows the bound firing.
 
 ### 🟡 Budget windows reset lazily
 

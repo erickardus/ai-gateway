@@ -67,6 +67,7 @@ model_list:
 
 		{"prompt_cache.affinity", cfg.PromptCache.AffinityEnabled(), true},
 		{"prompt_cache.affinity_ttl", cfg.PromptCache.AffinityTTL.String(), "5m0s"},
+		{"prompt_cache.affinity_max_in_flight_lead", cfg.PromptCache.MaxInFlightLead(), 4},
 		{"prompt_cache.inject", cfg.PromptCache.Inject, false},
 		{"prompt_cache.inject_min_bytes", cfg.PromptCache.InjectMinBytes, 4096},
 

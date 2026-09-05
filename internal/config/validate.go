@@ -109,6 +109,9 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if l := c.PromptCache.AffinityMaxInFlightLead; l != nil && *l < 0 {
+		errs = append(errs, fmt.Errorf("prompt_cache.affinity_max_in_flight_lead: must be >= 0, got %d", *l))
+	}
 	if c.PromptCache.InjectMinBytes < 0 {
 		errs = append(errs, fmt.Errorf("prompt_cache.inject_min_bytes: must be >= 0, got %d", c.PromptCache.InjectMinBytes))
 	}

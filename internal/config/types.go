@@ -43,6 +43,25 @@ type PromptCacheConfig struct {
 	// lifetime of an ephemeral prompt cache entry, since a pin outliving the
 	// cache it points at only concentrates load.
 	AffinityTTL time.Duration `yaml:"affinity_ttl"`
+	// AffinityMaxInFlightLead bounds how far a pin may concentrate load. A pin
+	// is passed over once the pinned deployment is carrying this many more
+	// in-flight requests than the least busy deployment that could serve the
+	// request instead.
+	//
+	// It exists because a fingerprint is a prefix, not a conversation: traffic
+	// that shares a system prompt, its tools and its opening turns — a
+	// templated single-turn caller, say — shares one pin, and without a bound
+	// every request of it lands on one deployment while the rest of the group
+	// sits idle.
+	//
+	// The bound is a load comparison rather than a share quota, because
+	// concentration is only a problem when there is contention. One busy
+	// conversation pinned to one deployment while its peers are idle is the
+	// feature working; diverting it would buy a cache write and nothing else.
+	//
+	// A pointer, so an explicit 0 — yield as soon as any alternative is less
+	// loaded — is not mistaken for an omitted field.
+	AffinityMaxInFlightLead *int `yaml:"affinity_max_in_flight_lead"`
 
 	// Inject marks the stable prefix of an Anthropic request — the tools and
 	// the system prompt — as cacheable when the caller has not marked anything
@@ -61,6 +80,15 @@ type PromptCacheConfig struct {
 // AffinityEnabled reports whether prefix affinity is on, defaulting to true.
 func (p PromptCacheConfig) AffinityEnabled() bool {
 	return p.Affinity == nil || *p.Affinity
+}
+
+// MaxInFlightLead returns the configured in-flight lead a pin may hold before it
+// is passed over, or the default when unset.
+func (p PromptCacheConfig) MaxInFlightLead() int {
+	if p.AffinityMaxInFlightLead == nil {
+		return DefaultAffinityMaxInFlightLead
+	}
+	return *p.AffinityMaxInFlightLead
 }
 
 // CacheConfig controls response caching.

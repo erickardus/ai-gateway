@@ -137,6 +137,11 @@ func TestValidationErrors(t *testing.T) {
 			want: "prompt_cache.affinity_ttl",
 		},
 		{
+			name: "negative prompt cache in-flight lead",
+			yaml: minimalConfig + "\nprompt_cache:\n  affinity_max_in_flight_lead: -1\n",
+			want: "prompt_cache.affinity_max_in_flight_lead",
+		},
+		{
 			name: "negative prompt cache inject minimum",
 			yaml: minimalConfig + "\nprompt_cache:\n  inject_min_bytes: -1\n",
 			want: "prompt_cache.inject_min_bytes",

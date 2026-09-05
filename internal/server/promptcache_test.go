@@ -243,9 +243,10 @@ func TestHealthReportsPromptCacheConfiguration(t *testing.T) {
 
 	var health struct {
 		PromptCache struct {
-			Affinity    bool   `json:"affinity"`
-			AffinityTTL string `json:"affinity_ttl"`
-			Inject      bool   `json:"inject"`
+			Affinity        bool   `json:"affinity"`
+			AffinityTTL     string `json:"affinity_ttl"`
+			MaxInFlightLead int    `json:"affinity_max_in_flight_lead"`
+			Inject          bool   `json:"inject"`
 		} `json:"prompt_cache"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &health); err != nil {
@@ -256,6 +257,9 @@ func TestHealthReportsPromptCacheConfiguration(t *testing.T) {
 	}
 	if health.PromptCache.AffinityTTL != "5m0s" {
 		t.Errorf("affinity_ttl = %q, want 5m0s", health.PromptCache.AffinityTTL)
+	}
+	if health.PromptCache.MaxInFlightLead != 4 {
+		t.Errorf("affinity_max_in_flight_lead = %d, want 4", health.PromptCache.MaxInFlightLead)
 	}
 	if !health.PromptCache.Inject {
 		t.Error("inject = false, want true")

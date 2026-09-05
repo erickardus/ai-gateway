@@ -65,6 +65,62 @@ func SetTopLevelRaw(body []byte, key string, value []byte) ([]byte, error) {
 	return out, nil
 }
 
+// SetTopLevelValues replaces several top-level values in one pass, leaving every
+// other byte of the document identical. Every named key must already be present:
+// this edits a request, it does not extend one.
+//
+// It exists so that an edit touching two members costs one walk rather than two.
+// Each walk revalidates the whole document, which on a request body carrying a
+// large system prompt and a table of tool definitions is the dominant cost of
+// editing it at all.
+func SetTopLevelValues(body []byte, values map[string][]byte) ([]byte, error) {
+	if len(values) == 0 {
+		return body, nil
+	}
+	for key, value := range values {
+		if !json.Valid(value) {
+			return nil, fmt.Errorf("set %q: replacement is not valid JSON", key)
+		}
+	}
+
+	// Collected in document order, which is the order walkTopLevel visits
+	// members in, so the splice below can run straight through.
+	type edit struct {
+		start, end int64
+		value      []byte
+	}
+	edits := make([]edit, 0, len(values))
+	found := make(map[string]bool, len(values))
+	err := walkTopLevel(body, func(m member) error {
+		if value, ok := values[m.key]; ok {
+			edits = append(edits, edit{m.start, m.end, value})
+			found[m.key] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("set top-level values: %w", err)
+	}
+	for key := range values {
+		if !found[key] {
+			return nil, fmt.Errorf("set %q: %w", key, ErrKeyNotFound)
+		}
+	}
+
+	size := len(body)
+	for _, e := range edits {
+		size += len(e.value) - int(e.end-e.start)
+	}
+	out := make([]byte, 0, size)
+	at := int64(0)
+	for _, e := range edits {
+		out = append(out, body[at:e.start]...)
+		out = append(out, e.value...)
+		at = e.end
+	}
+	return append(out, body[at:]...), nil
+}
+
 // Elements returns the extent of each element of a JSON array, as [start, end)
 // offsets into array. An empty array yields no spans.
 func Elements(array []byte) ([][2]int, error) {
