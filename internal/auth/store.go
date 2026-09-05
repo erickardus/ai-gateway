@@ -62,7 +62,10 @@ func (s *MemStore) load() error {
 	if err := json.Unmarshal(raw, &keys); err != nil {
 		return fmt.Errorf("parse key store %s: %w", s.path, err)
 	}
-	for _, k := range keys {
+	for i, k := range keys {
+		if k == nil || k.Hash == "" {
+			return fmt.Errorf("key store %s: entry %d is missing its hash", s.path, i)
+		}
 		s.keys[k.Hash] = k
 	}
 	return nil

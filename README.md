@@ -32,7 +32,8 @@ make build
 
 # Configure
 cp config/gateway.example.yaml config/gateway.yaml
-export ANTHROPIC_API_KEY=sk-ant-api03-...      # for api_key deployments
+export ANTHROPIC_API_KEY=sk-ant-api03-...      # for the api_key deployments
+export OPENAI_API_KEY=sk-...                   # for the openai deployment
 export GATEWAY_MASTER_KEY=sk-master-...        # enables /key/* endpoints
 export DEV_KEY=sk-vk-...                       # a config-declared virtual key
 
@@ -66,7 +67,7 @@ claude    # /login → "Claude account with subscription"
 | `POST /v1/chat/completions` | OpenAI Chat Completions API. |
 | `GET /v1/models` | Model discovery. Served directly — never redirects. |
 | `HEAD /api/hello` | Connection-warming probe. |
-| `GET /health` | Per-deployment status. |
+| `GET /health` | Per-deployment status. Requires a key: it discloses upstream hosts. |
 | `GET /health/liveliness`, `/health/readiness` | Probes, unauthenticated. |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | Key management, master-key only. |
 

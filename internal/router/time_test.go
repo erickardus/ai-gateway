@@ -122,7 +122,7 @@ func TestRouterSkipsCooledDeploymentThenRecovers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rc := config.RouterConfig{
 			Strategy:   config.StrategyWeightedShuffle,
-			NumRetries: 1,
+			NumRetries: intPtr(1),
 			Cooldown:   config.CooldownConfig{AllowedFails: intPtr(0), Period: 30 * time.Second},
 			Backoff:    config.BackoffConfig{Initial: time.Millisecond, Max: time.Millisecond},
 		}
@@ -168,7 +168,7 @@ func TestRouterSkipsCooledDeploymentThenRecovers(t *testing.T) {
 func TestNoBackoffWhenAHealthyPeerExists(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rc := config.RouterConfig{
-			Strategy: config.StrategyWeightedShuffle, NumRetries: 2,
+			Strategy: config.StrategyWeightedShuffle, NumRetries: intPtr(2),
 			Cooldown: config.CooldownConfig{AllowedFails: intPtr(100), Period: time.Minute},
 			// A backoff long enough that any wait would be unmistakable.
 			Backoff: config.BackoffConfig{Initial: 10 * time.Second, Max: 60 * time.Second},
@@ -194,9 +194,9 @@ func TestNoBackoffWhenAHealthyPeerExists(t *testing.T) {
 func TestBackoffAppliesWhenNothingElseIsHealthy(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rc := config.RouterConfig{
-			Strategy: config.StrategyWeightedShuffle, NumRetries: 1,
+			Strategy: config.StrategyWeightedShuffle, NumRetries: intPtr(1),
 			Cooldown: config.CooldownConfig{AllowedFails: intPtr(100), Period: time.Minute},
-			Backoff:  config.BackoffConfig{Initial: 5 * time.Second, Max: 30 * time.Second, Jitter: 0},
+			Backoff:  config.BackoffConfig{Initial: 5 * time.Second, Max: 30 * time.Second, Jitter: floatPtr(0)},
 		}
 		exec := &fakeExec{replies: map[string]error{}}
 		r, deps := buildRouter(t, "g", []int{1}, rc, exec, nil)
@@ -217,9 +217,9 @@ func TestBackoffAppliesWhenNothingElseIsHealthy(t *testing.T) {
 func TestRetryAfterHeaderHonoured(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rc := config.RouterConfig{
-			Strategy: config.StrategyWeightedShuffle, NumRetries: 1,
+			Strategy: config.StrategyWeightedShuffle, NumRetries: intPtr(1),
 			Cooldown: config.CooldownConfig{AllowedFails: intPtr(100), Period: time.Minute},
-			Backoff:  config.BackoffConfig{Initial: time.Second, Max: 2 * time.Second, Jitter: 0},
+			Backoff:  config.BackoffConfig{Initial: time.Second, Max: 2 * time.Second, Jitter: floatPtr(0)},
 		}
 		exec := &fakeExec{replies: map[string]error{}}
 		r, deps := buildRouter(t, "g", []int{1}, rc, exec, nil)

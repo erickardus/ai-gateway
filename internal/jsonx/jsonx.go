@@ -30,6 +30,11 @@ type Fields struct {
 	Model     string
 	Stream    bool
 	HasStream bool
+	// DisableFallbacks is a gateway control field. It is read here so the body
+	// need not be parsed a second time, and stripped before forwarding: an
+	// upstream that rejects unknown top-level fields would 400 the request.
+	DisableFallbacks    bool
+	HasDisableFallbacks bool
 }
 
 // Peek extracts the top-level "model" and "stream" fields without materializing
@@ -45,6 +50,10 @@ func Peek(body []byte) (Fields, error) {
 		case "stream":
 			if b, ok := value.(bool); ok {
 				out.Stream, out.HasStream = b, true
+			}
+		case "disable_fallbacks":
+			if b, ok := value.(bool); ok {
+				out.DisableFallbacks, out.HasDisableFallbacks = b, true
 			}
 		}
 		return false, nil
@@ -64,15 +73,18 @@ func SetTopLevelString(body []byte, key, value string) ([]byte, error) {
 	isString := false
 	found := false
 
+	// Do not stop at the first match. encoding/json — and therefore every
+	// upstream and this package's own Peek — resolves a duplicated top-level
+	// key to its LAST occurrence, so rewriting the first would leave the
+	// caller's original value authoritative and silently defeat the rewrite.
 	err := walkTopLevel(body, func(k string, v json.Token, afterKey, end int64) (bool, error) {
 		if k != key {
 			return false, nil
 		}
 		found = true
-		s, ok := v.(string)
-		_ = s
-		if !ok {
-			return true, nil
+		if _, ok := v.(string); !ok {
+			isString = false
+			return false, nil
 		}
 		isString = true
 		valEnd = end
@@ -82,10 +94,10 @@ func SetTopLevelString(body []byte, key, value string) ([]byte, error) {
 		rel := bytes.IndexByte(body[afterKey:end], '"')
 		if rel < 0 {
 			isString = false
-			return true, nil
+			return false, nil
 		}
 		valStart = afterKey + int64(rel)
-		return true, nil
+		return false, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("set %q: %w", key, err)
@@ -197,4 +209,58 @@ func walkTopLevel(body []byte, visit visitFn) error {
 		// Back to expecting the next key of the root object.
 		expectKey = true
 	}
+}
+
+// DeleteTopLevelKey removes a top-level key and its value, leaving the rest of
+// the document byte-identical. It is used to strip gateway control fields from a
+// body before it is forwarded upstream.
+func DeleteTopLevelKey(body []byte, key string) ([]byte, error) {
+	var keyStart, valEnd int64
+	found := false
+
+	err := walkTopLevel(body, func(k string, _ json.Token, afterKey, end int64) (bool, error) {
+		if k != key {
+			return false, nil
+		}
+		// Walk back from the key token to its opening quote.
+		rel := bytes.LastIndexByte(body[:afterKey-1], '"')
+		if rel < 0 {
+			return false, nil
+		}
+		keyStart, valEnd, found = int64(rel), end, true
+		return false, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("delete %q: %w", key, err)
+	}
+	if !found {
+		return body, nil
+	}
+
+	// Absorb the separating comma, whichever side of the pair it sits on.
+	start, end := keyStart, valEnd
+	for start > 0 && isJSONSpace(body[start-1]) {
+		start--
+	}
+	switch {
+	case start > 0 && body[start-1] == ',':
+		start--
+	default:
+		for int(end) < len(body) && isJSONSpace(body[end]) {
+			end++
+		}
+		if int(end) < len(body) && body[end] == ',' {
+			end++
+		}
+	}
+
+	out := make([]byte, 0, len(body)-int(end-start))
+	out = append(out, body[:start]...)
+	out = append(out, body[end:]...)
+	return out, nil
+}
+
+// isJSONSpace reports whether c is JSON insignificant whitespace.
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }

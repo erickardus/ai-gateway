@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/erickardus/ai-gateway/internal/core"
 )
@@ -23,14 +24,14 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("router.strategy: unknown strategy %q (valid: %s)",
 			c.Router.Strategy, strings.Join(KnownStrategies, ", ")))
 	}
-	if c.Router.NumRetries < 0 {
-		errs = append(errs, fmt.Errorf("router.num_retries: must be >= 0, got %d", c.Router.NumRetries))
+	if c.Router.NumRetries != nil && *c.Router.NumRetries < 0 {
+		errs = append(errs, fmt.Errorf("router.num_retries: must be >= 0, got %d", *c.Router.NumRetries))
 	}
 	if c.Router.Cooldown.AllowedFails != nil && *c.Router.Cooldown.AllowedFails < 0 {
 		errs = append(errs, fmt.Errorf("router.cooldown.allowed_fails: must be >= 0, got %d", *c.Router.Cooldown.AllowedFails))
 	}
-	if j := c.Router.Backoff.Jitter; j < 0 || j > 10 {
-		errs = append(errs, fmt.Errorf("router.backoff.jitter: must be within [0,10], got %v", j))
+	if j := c.Router.Backoff.Jitter; j != nil && (*j < 0 || *j > 10) {
+		errs = append(errs, fmt.Errorf("router.backoff.jitter: must be within [0,10], got %v", *j))
 	}
 	if c.Router.MaxFallbackHops < 1 {
 		errs = append(errs, fmt.Errorf("router.max_fallback_hops: must be >= 1, got %d", c.Router.MaxFallbackHops))
@@ -38,6 +39,39 @@ func (c *Config) Validate() error {
 	if b := c.Router.LowestLatencyBuffer; b < 0 || b > 1 {
 		errs = append(errs, fmt.Errorf("router.lowest_latency_buffer: must be within [0,1], got %v", b))
 	}
+	for _, d := range []struct {
+		path  string
+		value time.Duration
+	}{
+		{"server.read_header_timeout", c.Server.ReadHeaderTimeout},
+		{"server.idle_timeout", c.Server.IdleTimeout},
+		{"server.shutdown_grace", c.Server.ShutdownGrace},
+		{"router.timeout", c.Router.Timeout},
+		{"router.stream_timeout", c.Router.StreamTimeout},
+		{"router.cooldown.period", c.Router.Cooldown.Period},
+		{"router.backoff.initial", c.Router.Backoff.Initial},
+		{"router.backoff.max", c.Router.Backoff.Max},
+	} {
+		if d.value < 0 {
+			errs = append(errs, fmt.Errorf("%s: must not be negative, got %s", d.path, d.value))
+		}
+	}
+
+	// A group must speak one wire format: the gateway does not translate, so a
+	// mixed group would route some requests to an upstream expecting a
+	// different schema.
+	groupFormat := make(map[string]core.Format)
+	for i := range c.ModelList {
+		d := &c.ModelList[i]
+		if seen, ok := groupFormat[d.ModelName]; ok && seen != d.Params.Format {
+			errs = append(errs, fmt.Errorf(
+				"model_list[%d].params.format: model group %q mixes %q and %q; a group must speak one format because the gateway does not translate between them",
+				i, d.ModelName, seen, d.Params.Format))
+		} else if !ok {
+			groupFormat[d.ModelName] = d.Params.Format
+		}
+	}
+
 	if c.Server.MaxBodyBytes <= 0 {
 		errs = append(errs, fmt.Errorf("server.max_body_bytes: must be > 0, got %d", c.Server.MaxBodyBytes))
 	}
@@ -104,8 +138,8 @@ func (c *Config) Validate() error {
 				p, core.AuthModeAPIKey, core.AuthModePassthrough, d.Params.AuthMode))
 		}
 
-		if d.Weight < 0 {
-			errs = append(errs, fmt.Errorf("%s.weight: must be >= 0, got %d", p, d.Weight))
+		if d.Weight != nil && *d.Weight < 0 {
+			errs = append(errs, fmt.Errorf("%s.weight: must be >= 0, got %d", p, *d.Weight))
 		}
 		if d.RPM < 0 {
 			errs = append(errs, fmt.Errorf("%s.rpm: must be >= 0, got %d", p, d.RPM))
@@ -140,6 +174,13 @@ func (c *Config) Validate() error {
 				}
 				if to == r.From {
 					errs = append(errs, fmt.Errorf("%s[%d].to[%d]: model group %q cannot fall back to itself", set.name, i, j, to))
+				}
+				if from, okFrom := groupFormat[r.From]; okFrom {
+					if dst, okTo := groupFormat[to]; okTo && dst != from {
+						errs = append(errs, fmt.Errorf(
+							"%s[%d].to[%d]: %q speaks %q but %q speaks %q; a fallback must not cross wire formats",
+							set.name, i, j, r.From, from, to, dst))
+					}
 				}
 			}
 		}

@@ -1,14 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 
-	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/jsonx"
 	"github.com/erickardus/ai-gateway/internal/provider"
@@ -17,24 +16,24 @@ import (
 
 // handleMessages serves the Anthropic Messages API.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	s.serveInference(w, r, "/v1/messages")
+	s.serveInference(w, r, "/v1/messages", core.FormatAnthropic)
 }
 
 // handleCountTokens serves Anthropic's token counting endpoint. It is optional
 // for a gateway, but exposing it keeps Claude Code from spending an inference
 // request to measure context.
 func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
-	s.serveInference(w, r, "/v1/messages/count_tokens")
+	s.serveInference(w, r, "/v1/messages/count_tokens", core.FormatAnthropic)
 }
 
 // handleChatCompletions serves the OpenAI Chat Completions API.
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	s.serveInference(w, r, "/v1/chat/completions")
+	s.serveInference(w, r, "/v1/chat/completions", core.FormatOpenAI)
 }
 
 // serveInference is the shared path for every inference endpoint: authenticate,
 // read the body once, route, relay.
-func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstreamPath string) {
+func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstreamPath string, format core.Format) {
 	ctx := r.Context()
 
 	authCtx, err := s.auth.Authenticate(ctx, r.Header)
@@ -69,14 +68,23 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	overrides := router.OverridesFromHeaders(r.Header)
 	overrides.AllowPassthrough = authCtx.Key != nil && authCtx.Key.AllowPassthrough
-	if disabled, ok := disableFallbacks(body); ok {
-		overrides.DisableFallbacks = disabled
+	if fields.HasDisableFallbacks {
+		overrides.DisableFallbacks = fields.DisableFallbacks
+		// It is a gateway directive, not part of the provider's schema, so it
+		// must not reach the upstream.
+		stripped, err := jsonx.DeleteTopLevelKey(body, "disable_fallbacks")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "could not process disable_fallbacks")
+			return
+		}
+		body = stripped
 	}
 
 	req := &provider.Request{
 		Path:   upstreamPath,
 		Query:  r.URL.RawQuery,
 		Body:   body,
+		Format: format,
 		Header: r.Header,
 		Creds:  authCtx.Credentials,
 		Stream: fields.Stream,
@@ -114,26 +122,22 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 // readBody reads the request body under the configured size limit.
 func (s *Server) readBody(r *http.Request) ([]byte, error) {
 	limited := http.MaxBytesReader(nil, r.Body, s.cfg.Server.MaxBodyBytes)
-	body, err := io.ReadAll(limited)
-	if err != nil {
+
+	// Presize from Content-Length where the client supplied a credible one:
+	// io.ReadAll otherwise starts at 512 bytes and repeatedly reallocates,
+	// churning several times the body size in garbage on every request.
+	var buf bytes.Buffer
+	if n := r.ContentLength; n > 0 && n <= s.cfg.Server.MaxBodyBytes {
+		buf.Grow(int(n) + bytes.MinRead)
+	}
+	if _, err := buf.ReadFrom(limited); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			return nil, fmt.Errorf("body exceeds %d bytes: %w", s.cfg.Server.MaxBodyBytes, core.ErrBodyTooLarge)
 		}
 		return nil, fmt.Errorf("read request body: %w", err)
 	}
-	return body, nil
-}
-
-// disableFallbacks reads the optional disable_fallbacks request field.
-func disableFallbacks(body []byte) (bool, bool) {
-	var probe struct {
-		DisableFallbacks *bool `json:"disable_fallbacks"`
-	}
-	if err := json.Unmarshal(body, &probe); err != nil || probe.DisableFallbacks == nil {
-		return false, false
-	}
-	return *probe.DisableFallbacks, true
+	return buf.Bytes(), nil
 }
 
 // fail writes an error response, relaying an upstream error verbatim when there
@@ -146,14 +150,8 @@ func disableFallbacks(body []byte) (bool, bool) {
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	var upstream *core.UpstreamError
 	if errors.As(err, &upstream) {
-		for name, values := range upstream.Header {
-			if name == "Content-Length" || name == "Transfer-Encoding" {
-				continue
-			}
-			for _, v := range values {
-				w.Header().Add(name, v)
-			}
-		}
+		provider.SanitizeResponseHeaders(w.Header(), upstream.Header)
+		w.Header().Del("Content-Length")
 		if w.Header().Get("Content-Type") == "" {
 			w.Header().Set("Content-Type", "application/json")
 		}
@@ -230,5 +228,3 @@ func writeError(w http.ResponseWriter, status int, kind, message string) {
 
 // authHeaderNames is used by the key endpoints to find a presented credential.
 func (s *Server) authHeaderNames() []string { return s.auth.HeaderNames() }
-
-var _ = auth.HashKey

@@ -31,6 +31,8 @@ type Router struct {
 	log      *slog.Logger
 
 	// rnd is guarded because math/rand/v2.Rand is not safe for concurrent use.
+	// The lock is taken only around a draw, never across a strategy's state
+	// lookups, which a distributed StateStore would perform over the network.
 	rndMu sync.Mutex
 	rnd   *rand.Rand
 
@@ -67,6 +69,14 @@ func New(cfg *config.Config, state StateStore, exec Executor, log *slog.Logger, 
 		rnd:      rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)),
 		now:      opts.Now,
 	}, nil
+}
+
+// rand returns a generator safe to use for one selection. Callers hold no lock;
+// the returned value is a snapshot seeded from the shared stream.
+func (r *Router) rand() *rand.Rand {
+	r.rndMu.Lock()
+	defer r.rndMu.Unlock()
+	return rand.New(rand.NewPCG(r.rnd.Uint64(), r.rnd.Uint64()))
 }
 
 // Groups returns the configured model group names.
@@ -134,7 +144,7 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 		return nil, fmt.Errorf("model %q: %w", model, core.ErrModelNotFound)
 	}
 
-	maxRetries := r.cfg.NumRetries
+	maxRetries := r.cfg.Retries()
 	if overrides.NumRetries != nil {
 		maxRetries = *overrides.NumRetries
 	}
@@ -146,7 +156,7 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 	var firstErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		dep, err := r.pick(ctx, deployments, failed, overrides)
+		dep, err := r.pick(ctx, deployments, failed, overrides, req.Format)
 		if err != nil {
 			if firstErr != nil {
 				return nil, firstErr
@@ -174,7 +184,7 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 		// alternative available there is nothing to wait for. Only when every
 		// deployment has failed is it worth pausing before trying again, and
 		// the failure set is then cleared so the next attempt can proceed.
-		if r.hasUntried(ctx, deployments, failed, overrides) {
+		if r.hasUntried(ctx, deployments, failed, overrides, req.Format) {
 			continue
 		}
 		if err := r.sleep(ctx, r.backoff(attempt, attemptErr)); err != nil {
@@ -188,16 +198,14 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 // pick chooses a deployment and consumes its rate-limit budget. Capacity is
 // only consumed for the deployment actually dispatched to, so filtering never
 // spends budget on candidates that go unused.
-func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides) (*config.Deployment, error) {
-	candidates, err := r.candidates(ctx, deployments, failed, overrides)
+func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) (*config.Deployment, error) {
+	candidates, err := r.candidates(ctx, deployments, failed, overrides, format)
 	if err != nil {
 		return nil, err
 	}
 
 	for len(candidates) > 0 {
-		r.rndMu.Lock()
-		dep, err := r.strategy.Pick(ctx, candidates, r.state, r.rnd)
-		r.rndMu.Unlock()
+		dep, err := r.strategy.Pick(ctx, candidates, r.state, r.rand())
 		if err != nil {
 			return nil, err
 		}
@@ -220,8 +228,8 @@ func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, fai
 
 // hasUntried reports whether any deployment outside the failed set could still
 // serve this request. It does not consume capacity.
-func (r *Router) hasUntried(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides) bool {
-	candidates, err := r.candidates(ctx, deployments, failed, overrides)
+func (r *Router) hasUntried(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) bool {
+	candidates, err := r.candidates(ctx, deployments, failed, overrides, format)
 	return err == nil && len(candidates) > 0
 }
 
@@ -238,39 +246,57 @@ func without(candidates []*config.Deployment, dep *config.Deployment) []*config.
 
 // attempt dispatches one request to one deployment and records the outcome.
 func (r *Router) attempt(ctx context.Context, dep *config.Deployment, req *provider.Request, overrides Overrides) (*provider.Response, error) {
-	timeout := r.cfg.Timeout
-	if req.Stream && r.cfg.StreamTimeout > 0 {
-		// For a streaming request the deadline bounds time to the first chunk,
-		// not the whole response, which may legitimately run for minutes.
-		timeout = r.cfg.StreamTimeout
+	// A streaming request gets a deadline on reaching the response headers
+	// only. Attaching it to the request context would bound the whole response,
+	// because net/http ties the body's lifetime to that context — so a long
+	// completion would be severed mid-stream after the status line had already
+	// been sent. A non-streaming request has no such distinction, so its
+	// deadline covers the entire exchange.
+	headerTimeout, bodyTimeout := r.cfg.Timeout, time.Duration(0)
+	if req.Stream {
+		headerTimeout, bodyTimeout = r.cfg.StreamTimeout, 0
 	}
 	if overrides.Timeout != nil {
-		timeout = *overrides.Timeout
+		bodyTimeout = *overrides.Timeout
+		if !req.Stream {
+			headerTimeout = *overrides.Timeout
+		}
 	}
+	if req.Stream && overrides.StreamTimeout != nil {
+		headerTimeout = *overrides.StreamTimeout
+	}
+	_ = bodyTimeout
 
-	attemptCtx := ctx
-	var cancel context.CancelFunc
-	if timeout > 0 {
-		attemptCtx, cancel = context.WithTimeout(ctx, timeout)
+	// The attempt context lives until the body is closed; a separate timer
+	// enforces the header deadline and is stopped as soon as headers arrive.
+	attemptCtx, cancel := context.WithCancel(ctx)
+	var headerTimer *time.Timer
+	if headerTimeout > 0 {
+		headerTimer = time.AfterFunc(headerTimeout, cancel)
+	}
+	stopHeaderTimer := func() {
+		if headerTimer != nil {
+			headerTimer.Stop()
+		}
 	}
 
 	if err := r.state.BeginRequest(ctx, dep.ID()); err != nil {
-		if cancel != nil {
-			cancel()
-		}
+		stopHeaderTimer()
+		cancel()
 		return nil, fmt.Errorf("begin request: %w", err)
 	}
 	start := r.now()
 
 	resp, err := r.exec.Do(attemptCtx, dep, req)
+	// Headers have either arrived or failed; either way the header deadline no
+	// longer applies.
+	stopHeaderTimer()
 	if err != nil {
 		// The attempt is over, so release both the in-flight slot and the
-		// deadline before returning.
+		// context before returning.
 		_ = r.state.EndRequest(ctx, dep.ID(), r.now().Sub(start), false)
-		if cancel != nil {
-			cancel()
-		}
-		if coolable(err) {
+		cancel()
+		if coolable(err, dep.Params.AuthMode) {
 			if cerr := r.state.RecordFailure(ctx, dep.ID(), r.now(), r.cfg.Cooldown.Fails(), r.cfg.Cooldown.Period); cerr != nil {
 				r.log.Warn("record failure", "deployment", dep.ID(), "error", cerr)
 			}
@@ -278,15 +304,17 @@ func (r *Router) attempt(ctx context.Context, dep *config.Deployment, req *provi
 		return nil, err
 	}
 
-	// Success: the body has not been read yet, so the in-flight slot and the
-	// deadline stay held until the caller finishes relaying it.
+	// Success: the body has not been read yet, so the in-flight slot stays held
+	// until the caller finishes relaying it. Relaying uses a context detached
+	// from the client's, so an aborted request still records its completion —
+	// otherwise the in-flight count would drift upward and starve the
+	// deployment under least-busy routing.
+	release := context.WithoutCancel(ctx)
 	resp.Body = &trackedBody{
 		readCloser: resp.Body,
 		onClose: func() {
-			_ = r.state.EndRequest(ctx, dep.ID(), r.now().Sub(start), true)
-			if cancel != nil {
-				cancel()
-			}
+			_ = r.state.EndRequest(release, dep.ID(), r.now().Sub(start), true)
+			cancel()
 		},
 	}
 	return resp, nil
@@ -308,7 +336,7 @@ func (r *Router) sleep(ctx context.Context, d time.Duration) error {
 }
 
 // candidates filters a group down to the deployments eligible right now.
-func (r *Router) candidates(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides) ([]*config.Deployment, error) {
+func (r *Router) candidates(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) ([]*config.Deployment, error) {
 	now := r.now()
 	out := make([]*config.Deployment, 0, len(deployments))
 	for _, d := range deployments {
@@ -318,6 +346,13 @@ func (r *Router) candidates(ctx context.Context, deployments []*config.Deploymen
 		// A passthrough deployment forwards the caller's own credential, so it
 		// is only offered to keys explicitly permitted to use one.
 		if d.Params.AuthMode == core.AuthModePassthrough && !overrides.AllowPassthrough {
+			continue
+		}
+		// The gateway does not translate between wire formats, so an ingress
+		// may only reach deployments speaking its own. Without this a fallback
+		// could relay an Anthropic body — and, on a passthrough deployment, the
+		// caller's Anthropic credential — to a different vendor's host.
+		if format != "" && d.Params.Format != format {
 			continue
 		}
 		cooling, err := r.state.InCooldown(ctx, d.ID(), now)
@@ -390,10 +425,20 @@ func retryable(err error) bool {
 // than the deployment. Among 4xx only the statuses that indicate the deployment
 // itself is unusable count; a plain 400 is the caller's fault and would
 // otherwise let one malformed request eject a healthy upstream.
-func coolable(err error) bool {
+func coolable(err error, mode core.AuthMode) bool {
 	var ue *core.UpstreamError
 	if !errors.As(err, &ue) {
 		return false
+	}
+	if mode == core.AuthModePassthrough {
+		// On a passthrough deployment the credential is the caller's own, so an
+		// authentication or quota rejection describes that caller, not the
+		// deployment. Counting it would let one developer's expired
+		// subscription token eject the shared upstream for everyone else.
+		switch ue.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+			return false
+		}
 	}
 	switch ue.StatusCode {
 	case http.StatusTooManyRequests, http.StatusUnauthorized,
@@ -417,7 +462,7 @@ func (r *Router) backoff(attempt int, err error) time.Duration {
 	r.rndMu.Lock()
 	jitter := r.rnd.Float64()
 	r.rndMu.Unlock()
-	return d + time.Duration(float64(d)*r.cfg.Backoff.Jitter*jitter)
+	return d + time.Duration(float64(d)*r.cfg.Backoff.JitterFactor()*jitter)
 }
 
 // retryAfter reads an upstream Retry-After header, honouring only plausible

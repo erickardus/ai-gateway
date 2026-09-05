@@ -4,8 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
-
-	"github.com/erickardus/ai-gateway/internal/core"
+	"strconv"
 )
 
 // modelEntry is one row of the /v1/models response. The field names match what
@@ -58,21 +57,7 @@ func describeGroup(deployments int) string {
 	if deployments == 1 {
 		return "1 deployment behind the gateway"
 	}
-	return "load balanced across " + itoa(deployments) + " deployments"
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
+	return "load balanced across " + strconv.Itoa(deployments) + " deployments"
 }
 
 // handleLiveliness answers whether the process is running. It is unauthenticated
@@ -111,9 +96,16 @@ type deploymentHealth struct {
 	InFlight   int    `json:"in_flight"`
 }
 
-// handleHealth reports per-deployment status. It never includes credentials.
+// handleHealth reports per-deployment status. It never includes credentials,
+// but it does disclose the upstream topology — hostnames, auth modes and which
+// deployments are currently ejected — so it requires a valid key. Orchestrator
+// probes should use /health/liveliness, which is unauthenticated by design.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	if _, err := s.auth.Authenticate(ctx, r.Header); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	groups := s.router.Groups()
 	rows := make([]deploymentHealth, 0)
 	healthy := 0
@@ -152,5 +144,3 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"deployments":         rows,
 	})
 }
-
-var _ = core.StatusFor

@@ -66,7 +66,7 @@ func buildRouter(t *testing.T, group string, weights []int, rc config.RouterConf
 	for _, w := range weights {
 		cfg.ModelList = append(cfg.ModelList, config.Deployment{
 			ModelName: group,
-			Weight:    w,
+			Weight:    intPtr(w),
 			Params: config.DeploymentParams{
 				Format: core.FormatAnthropic, APIBase: "https://up.example.com",
 				Model: group, AuthMode: core.AuthModeAPIKey,
@@ -133,7 +133,7 @@ func TestZeroWeightsFallBackToUniform(t *testing.T) {
 // A retry must land on a different deployment, not the one that just failed.
 func TestRetryExcludesFailedDeployment(t *testing.T) {
 	rc := config.RouterConfig{
-		Strategy: config.StrategyWeightedShuffle, NumRetries: 3,
+		Strategy: config.StrategyWeightedShuffle, NumRetries: intPtr(3),
 		Cooldown: config.CooldownConfig{AllowedFails: intPtr(100), Period: time.Minute},
 		Backoff:  config.BackoffConfig{Initial: time.Millisecond, Max: time.Millisecond},
 	}
@@ -164,7 +164,7 @@ func TestRetryExcludesFailedDeployment(t *testing.T) {
 
 func TestRetriesExhaustedReturnsFirstError(t *testing.T) {
 	rc := config.RouterConfig{
-		Strategy: config.StrategyWeightedShuffle, NumRetries: 2,
+		Strategy: config.StrategyWeightedShuffle, NumRetries: intPtr(2),
 		Cooldown: config.CooldownConfig{AllowedFails: intPtr(100), Period: time.Minute},
 		Backoff:  config.BackoffConfig{Initial: time.Nanosecond, Max: time.Nanosecond},
 	}
@@ -184,7 +184,7 @@ func TestRetriesExhaustedReturnsFirstError(t *testing.T) {
 // A 400 is the caller's fault, so it must not be retried.
 func TestNonRetryableStatusStopsImmediately(t *testing.T) {
 	rc := config.RouterConfig{
-		Strategy: config.StrategyWeightedShuffle, NumRetries: 3,
+		Strategy: config.StrategyWeightedShuffle, NumRetries: intPtr(3),
 		Cooldown: config.CooldownConfig{AllowedFails: intPtr(100), Period: time.Minute},
 		Backoff:  config.BackoffConfig{Initial: time.Nanosecond, Max: time.Nanosecond},
 	}
@@ -266,7 +266,7 @@ func TestDoubleCloseReleasesOnce(t *testing.T) {
 func TestFallbackToAnotherGroup(t *testing.T) {
 	cfg := &config.Config{
 		Router: config.RouterConfig{
-			Strategy: config.StrategyWeightedShuffle, NumRetries: 0,
+			Strategy: config.StrategyWeightedShuffle, NumRetries: intPtr(0),
 			Cooldown:  config.CooldownConfig{AllowedFails: intPtr(100), Period: time.Minute},
 			Backoff:   config.BackoffConfig{Initial: time.Nanosecond, Max: time.Nanosecond},
 			Fallbacks: []config.FallbackRule{{From: "primary", To: []string{"backup"}}},
@@ -274,7 +274,7 @@ func TestFallbackToAnotherGroup(t *testing.T) {
 	}
 	for _, name := range []string{"primary", "backup"} {
 		cfg.ModelList = append(cfg.ModelList, config.Deployment{
-			ModelName: name, Weight: 1,
+			ModelName: name, Weight: intPtr(1),
 			Params: config.DeploymentParams{
 				Format: core.FormatAnthropic, APIBase: "https://up.example.com",
 				Model: name, AuthMode: core.AuthModeAPIKey, AuthHeader: "x-api-key", APIKey: "k",
@@ -319,5 +319,8 @@ func TestUnknownModelGroup(t *testing.T) {
 	}
 }
 
-// intPtr is a helper for the pointer-valued allowed_fails setting.
+// intPtr and floatPtr build the pointer-valued config fields, which exist so an
+// explicit zero is distinguishable from an omitted field.
 func intPtr(n int) *int { return &n }
+
+func floatPtr(f float64) *float64 { return &f }

@@ -62,9 +62,6 @@ func (c *Config) applyDefaults() {
 	if r.Strategy == "" {
 		r.Strategy = DefaultStrategy
 	}
-	if r.NumRetries == 0 {
-		r.NumRetries = DefaultNumRetries
-	}
 	if r.Timeout == 0 {
 		r.Timeout = DefaultTimeout
 	}
@@ -79,9 +76,6 @@ func (c *Config) applyDefaults() {
 	}
 	if r.Backoff.Max == 0 {
 		r.Backoff.Max = DefaultBackoffMax
-	}
-	if r.Backoff.Jitter == 0 {
-		r.Backoff.Jitter = DefaultBackoffJitter
 	}
 	if r.MaxFallbackHops == 0 {
 		r.MaxFallbackHops = DefaultMaxFallbackHops
@@ -107,9 +101,6 @@ func (c *Config) applyDefaults() {
 		}
 		if d.Params.Model == "" {
 			d.Params.Model = d.ModelName
-		}
-		if d.Weight == 0 {
-			d.Weight = 1
 		}
 		if d.Params.AuthHeader == "" {
 			if d.Params.Format == "anthropic" {

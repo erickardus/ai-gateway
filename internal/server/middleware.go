@@ -43,8 +43,13 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 // streaming relay can still flush through this wrapper.
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
+// withMiddleware orders the chain so that each layer can see what the layers
+// below it did: the request ID is planted first, the access log wraps the
+// response so it can observe the final status, and recovery sits innermost
+// where the *statusRecorder is visible and a panic is still attributable to a
+// request that gets logged.
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
-	return s.withRecovery(s.withRequestID(s.withAccessLog(next)))
+	return s.withRequestID(s.withAccessLog(s.withRecovery(next)))
 }
 
 func (s *Server) withRequestID(next http.Handler) http.Handler {
@@ -70,10 +75,12 @@ func (s *Server) withRecovery(next http.Handler) http.Handler {
 					"request_id", RequestIDFrom(r.Context()),
 					"panic", v)
 				// If the handler already started writing, the response is
-				// committed and adding a status would only corrupt it.
-				if rec, ok := w.(*statusRecorder); !ok || !rec.wrote {
-					writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+				// committed: appending an error envelope would corrupt the
+				// body the client is mid-way through parsing.
+				if rec, ok := w.(*statusRecorder); ok && rec.wrote {
+					return
 				}
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			}
 		}()
 		next.ServeHTTP(w, r)

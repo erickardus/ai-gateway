@@ -17,7 +17,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/gateway /usr/local/bin/gateway
-COPY --from=build /src/config/gateway.example.yaml /etc/ai-gateway/gateway.example.yaml
+# Shipped as gateway.yaml so the default CMD works out of the box. Mount your
+# own over /etc/ai-gateway/gateway.yaml to override it:
+#   docker run -v ./gateway.yaml:/etc/ai-gateway/gateway.yaml ai-gateway
+COPY --from=build /src/config/gateway.example.yaml /etc/ai-gateway/gateway.yaml
 
 USER nonroot:nonroot
 EXPOSE 4000

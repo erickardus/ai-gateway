@@ -164,3 +164,55 @@ func FuzzSetTopLevelString(f *testing.F) {
 		}
 	})
 }
+
+// encoding/json resolves a duplicated top-level key to its LAST occurrence, so
+// Peek and SetTopLevelString must both agree on that one, or the rewrite is
+// silently defeated by the caller's original value.
+func TestDuplicateKeyLastOccurrenceWins(t *testing.T) {
+	in := []byte(`{"model":"public-a","max_tokens":1,"model":"public-b"}`)
+
+	f, err := Peek(in)
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+	if f.Model != "public-b" {
+		t.Fatalf("Peek returned %q, want the last occurrence", f.Model)
+	}
+
+	out, err := SetTopLevelString(in, "model", "upstream-x")
+	if err != nil {
+		t.Fatalf("SetTopLevelString: %v", err)
+	}
+	var check map[string]any
+	if err := json.Unmarshal(out, &check); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	if check["model"] != "upstream-x" {
+		t.Errorf("upstream would see model=%v, want upstream-x", check["model"])
+	}
+}
+
+func TestDeleteTopLevelKey(t *testing.T) {
+	tests := []struct{ in, key, want string }{
+		{`{"a":1,"disable_fallbacks":true,"b":2}`, "disable_fallbacks", `{"a":1,"b":2}`},
+		{`{"disable_fallbacks":true,"b":2}`, "disable_fallbacks", `{"b":2}`},
+		{`{"a":1,"disable_fallbacks":true}`, "disable_fallbacks", `{"a":1}`},
+		{`{"disable_fallbacks":false}`, "disable_fallbacks", `{}`},
+		{`{"a":1}`, "disable_fallbacks", `{"a":1}`},
+		// A nested occurrence must survive.
+		{`{"m":{"disable_fallbacks":true},"disable_fallbacks":true}`, "disable_fallbacks", `{"m":{"disable_fallbacks":true}}`},
+	}
+	for _, tc := range tests {
+		got, err := DeleteTopLevelKey([]byte(tc.in), tc.key)
+		if err != nil {
+			t.Errorf("DeleteTopLevelKey(%s): %v", tc.in, err)
+			continue
+		}
+		if string(got) != tc.want {
+			t.Errorf("DeleteTopLevelKey(%s)\n got: %s\nwant: %s", tc.in, got, tc.want)
+		}
+		if !json.Valid(got) {
+			t.Errorf("DeleteTopLevelKey(%s) produced invalid JSON: %s", tc.in, got)
+		}
+	}
+}

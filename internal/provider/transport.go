@@ -26,9 +26,13 @@ const maxErrorBodyBytes = 1 << 20
 type Request struct {
 	// Path is the upstream path, e.g. "/v1/messages". Query strings are carried
 	// separately so routing can match on path alone.
-	Path   string
-	Query  string
-	Body   []byte
+	Path  string
+	Query string
+	Body  []byte
+	// Format is the wire protocol the caller spoke. The router only dispatches
+	// to deployments declaring the same format, since the gateway does not
+	// translate between them.
+	Format core.Format
 	Header http.Header
 	Creds  auth.Credentials
 	Stream bool
@@ -94,14 +98,22 @@ func (c *Client) Do(ctx context.Context, dep *config.Deployment, req *Request) (
 	}
 
 	body := req.Body
-	// Rewrite the model only when the upstream's identifier differs from the
-	// public name. When they match the body is forwarded byte for byte.
-	if params.Model != "" && params.Model != dep.ModelName {
-		rewritten, err := jsonx.SetTopLevelString(body, "model", params.Model)
+	// Rewrite the model only when the upstream's identifier differs from the one
+	// the body actually carries. Comparing against dep.ModelName instead would
+	// skip the rewrite on a fallback hop, where the body still names the
+	// original group and the upstream would reject it.
+	if params.Model != "" {
+		current, err := jsonx.Peek(body)
 		if err != nil {
-			return nil, fmt.Errorf("rewrite model for deployment %s: %w", dep.ID(), err)
+			return nil, fmt.Errorf("inspect body for deployment %s: %w", dep.ID(), err)
 		}
-		body = rewritten
+		if current.Model != params.Model {
+			rewritten, err := jsonx.SetTopLevelString(body, "model", params.Model)
+			if err != nil {
+				return nil, fmt.Errorf("rewrite model for deployment %s: %w", dep.ID(), err)
+			}
+			body = rewritten
+		}
 	}
 
 	target, err := buildURL(params.APIBase, req.Path, req.Query)
@@ -146,14 +158,37 @@ func (c *Client) Do(ctx context.Context, dep *config.Deployment, req *Request) (
 	}, nil
 }
 
-// buildURL joins a deployment's base URL with the request path, preserving any
-// path prefix on the base (so an api_base of https://host/anthropic works).
+// buildURL joins a deployment's base URL with the request path.
+//
+// Two details matter. A base that already ends in the path's leading segment
+// (api_base https://api.openai.com/v1 with path /v1/chat/completions) must not
+// double it, and any query string on the base — Azure's api-version, for
+// instance — must survive alongside the caller's own.
 func buildURL(apiBase, path, query string) (string, error) {
 	u, err := url.Parse(apiBase)
 	if err != nil {
 		return "", fmt.Errorf("parse api_base %q: %w", apiBase, err)
 	}
-	u.Path = strings.TrimSuffix(u.Path, "/") + path
-	u.RawQuery = query
+
+	base := strings.TrimSuffix(u.Path, "/")
+	// Drop any leading path segments the base already supplies.
+	for _, seg := range strings.Split(strings.Trim(base, "/"), "/") {
+		if seg == "" {
+			continue
+		}
+		if after, found := strings.CutPrefix(path, "/"+seg+"/"); found {
+			base = strings.TrimSuffix(base, "/"+seg)
+			path = "/" + seg + "/" + after
+			break
+		}
+	}
+	u.Path = base + path
+
+	switch {
+	case u.RawQuery == "":
+		u.RawQuery = query
+	case query != "":
+		u.RawQuery += "&" + query
+	}
 	return u.String(), nil
 }

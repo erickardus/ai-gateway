@@ -35,7 +35,6 @@ func Relay(w http.ResponseWriter, body io.Reader) (core.Usage, error) {
 		n, readErr := body.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
-			sniffer.observe(chunk)
 			if _, writeErr := w.Write(chunk); writeErr != nil {
 				return sniffer.usage, fmt.Errorf("write to client: %w", writeErr)
 			}
@@ -45,9 +44,15 @@ func Relay(w http.ResponseWriter, body io.Reader) (core.Usage, error) {
 			if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
 				return sniffer.usage, fmt.Errorf("flush to client: %w", err)
 			}
+			// Sniff only after the bytes are on their way, so parsing never
+			// sits between the upstream and the client.
+			sniffer.observe(chunk)
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
+				// A non-streaming body is a single object with no trailing
+				// newline, so the last line is still buffered here.
+				sniffer.flush()
 				return sniffer.usage, nil
 			}
 			return sniffer.usage, fmt.Errorf("read from upstream: %w", readErr)
@@ -100,12 +105,20 @@ type usageEnvelope struct {
 	} `json:"usage"`
 }
 
+// flush scans whatever partial line remains once the stream ends.
+func (s *usageSniffer) flush() {
+	if s.buf.Len() > 0 {
+		s.scanLine(bytes.TrimSpace(s.buf.Bytes()))
+		s.buf.Reset()
+	}
+}
+
 func (s *usageSniffer) scanLine(line []byte) {
 	payload := line
 	if after, found := bytes.CutPrefix(line, []byte("data:")); found {
 		payload = bytes.TrimSpace(after)
 	}
-	if len(payload) == 0 || payload[0] != '{' {
+	if len(payload) == 0 || payload[0] != '{' || !bytes.Contains(payload, []byte(`"usage"`)) {
 		return
 	}
 	var env usageEnvelope
@@ -128,3 +141,6 @@ func SniffUsage(body []byte) core.Usage {
 	s.scanLine(bytes.TrimSpace(body))
 	return s.usage
 }
+
+// observedUsage exposes what a sniffer has seen, for tests.
+func (s *usageSniffer) observedUsage() core.Usage { return s.usage }

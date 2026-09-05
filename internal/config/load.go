@@ -1,8 +1,6 @@
 package config
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
@@ -68,11 +66,4 @@ func Finalize(cfg *Config) error {
 	}
 
 	return cfg.Validate()
-}
-
-// HashKey returns the SHA-256 hex digest used to store and look up a virtual
-// key. Plaintext keys are never persisted.
-func HashKey(plaintext string) string {
-	sum := sha256.Sum256([]byte(plaintext))
-	return hex.EncodeToString(sum[:])
 }

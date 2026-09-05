@@ -11,25 +11,13 @@ import (
 	"github.com/erickardus/ai-gateway/internal/limiter"
 )
 
-// ctxKey is unexported so nothing outside this package can plant or overwrite an
-// authentication result in a request context.
-type ctxKey struct{}
-
-// Context carries the authenticated caller through the request.
+// Context carries the authenticated caller through a request. It is returned
+// from Authenticate and threaded explicitly rather than smuggled through the
+// request context, so a handler cannot forget to authenticate and silently
+// receive a zero value.
 type Context struct {
 	Key         *core.Key
 	Credentials Credentials
-}
-
-// NewContext returns ctx carrying the authentication result.
-func NewContext(ctx context.Context, ac *Context) context.Context {
-	return context.WithValue(ctx, ctxKey{}, ac)
-}
-
-// FromContext returns the authentication result placed by the middleware.
-func FromContext(ctx context.Context) (*Context, bool) {
-	ac, ok := ctx.Value(ctxKey{}).(*Context)
-	return ac, ok
 }
 
 // Authenticator resolves and authorizes virtual keys.

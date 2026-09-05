@@ -83,15 +83,20 @@ func BuildUpstreamHeaders(in http.Header, params config.DeploymentParams, creds 
 
 	switch params.AuthMode {
 	case core.AuthModePassthrough:
-		// Relay the caller's provider credential, except the header that
-		// authenticated them to the gateway.
+		// Relay the caller's provider credential. Two conditions must both
+		// hold: the header must not be the one that authenticated them here,
+		// and the value must actually look like a provider credential. Testing
+		// only the header name would forward the gateway's own virtual key
+		// upstream whenever a caller sets it in Authorization as well.
 		for _, name := range []string{"Authorization", "X-Api-Key"} {
 			if strings.EqualFold(name, creds.ViaHeader) {
 				continue
 			}
-			if v := in.Get(name); v != "" {
-				out.Set(name, v)
+			v := in.Get(name)
+			if v == "" || !core.IsUpstreamCredential(v) {
+				continue
 			}
+			out.Set(name, v)
 		}
 	case core.AuthModeAPIKey:
 		// The caller's credentials were already dropped above; present the

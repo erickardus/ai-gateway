@@ -36,12 +36,22 @@ type ServerConfig struct {
 type Deployment struct {
 	ModelName string           `yaml:"model_name"`
 	Params    DeploymentParams `yaml:"params"`
-	Weight    int              `yaml:"weight"`
-	RPM       int              `yaml:"rpm"`
-	TPM       int              `yaml:"tpm"`
+	// Weight is a pointer so an explicit 0, meaning "drain this deployment",
+	// is distinguishable from an omitted field.
+	Weight *int `yaml:"weight"`
+	RPM    int  `yaml:"rpm"`
+	TPM    int  `yaml:"tpm"`
 
 	// id is derived at load time and is stable for a given config.
 	id string
+}
+
+// Share returns the deployment's selection weight, or 1 when unset.
+func (d *Deployment) Share() int {
+	if d.Weight == nil {
+		return 1
+	}
+	return *d.Weight
 }
 
 // ID returns the deployment's stable identifier. Routing state, cooldowns and
@@ -76,8 +86,11 @@ type DeploymentParams struct {
 
 // RouterConfig controls deployment selection, retries and fallbacks.
 type RouterConfig struct {
-	Strategy      string        `yaml:"strategy"`
-	NumRetries    int           `yaml:"num_retries"`
+	Strategy string `yaml:"strategy"`
+	// NumRetries is how many attempts follow the first. Like AllowedFails it is
+	// a pointer, so an explicit 0 meaning "never retry" is not mistaken for an
+	// omitted field and silently replaced by the default.
+	NumRetries    *int          `yaml:"num_retries"`
 	Timeout       time.Duration `yaml:"timeout"`
 	StreamTimeout time.Duration `yaml:"stream_timeout"`
 
@@ -105,6 +118,14 @@ type CooldownConfig struct {
 	Period       time.Duration `yaml:"period"`
 }
 
+// Retries returns the configured retry count, or the default when unset.
+func (r RouterConfig) Retries() int {
+	if r.NumRetries == nil {
+		return DefaultNumRetries
+	}
+	return *r.NumRetries
+}
+
 // Fails returns the configured failure allowance, or the default when unset.
 func (c CooldownConfig) Fails() int {
 	if c.AllowedFails == nil {
@@ -119,7 +140,17 @@ func (c CooldownConfig) Fails() int {
 type BackoffConfig struct {
 	Initial time.Duration `yaml:"initial"`
 	Max     time.Duration `yaml:"max"`
-	Jitter  float64       `yaml:"jitter"`
+	// Jitter is a pointer so an explicit 0, meaning deterministic backoff, is
+	// distinguishable from an omitted field.
+	Jitter *float64 `yaml:"jitter"`
+}
+
+// JitterFactor returns the configured jitter, or the default when unset.
+func (b BackoffConfig) JitterFactor() float64 {
+	if b.Jitter == nil {
+		return DefaultBackoffJitter
+	}
+	return *b.Jitter
 }
 
 // FallbackRule redirects a failing model group to other groups, in order.

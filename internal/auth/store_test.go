@@ -143,3 +143,23 @@ func TestKeyUsableAndModelMatching(t *testing.T) {
 		}
 	}
 }
+
+// A malformed key file must be reported, not panic the process at startup.
+func TestFileStoreRejectsMalformedEntries(t *testing.T) {
+	for name, content := range map[string]string{
+		"null entry":   `[null]`,
+		"missing hash": `[{"alias":"x"}]`,
+		"not json":     `{`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "keys.json")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			// Must return an error rather than panicking.
+			if _, err := NewFileStore(path); err == nil {
+				t.Fatal("expected an error for a malformed key store")
+			}
+		})
+	}
+}

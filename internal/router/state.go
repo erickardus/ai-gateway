@@ -42,6 +42,10 @@ type StateStore interface {
 	Reserve(ctx context.Context, id string, rpm, tpm int) (bool, error)
 	// AddTokens records token usage reported by a completed response.
 	AddTokens(ctx context.Context, id string, tokens int) error
+	// TokensUsed reports tokens consumed in the current window. It is the read
+	// half of AddTokens, so usage-based routing can go through the interface
+	// rather than reaching into a concrete implementation.
+	TokensUsed(ctx context.Context, id string) (int, error)
 }
 
 // deploymentState is the in-memory state of a single deployment.
@@ -66,12 +70,6 @@ type MemState struct {
 // NewMemState returns an empty in-memory state store.
 func NewMemState() *MemState {
 	return &MemState{states: make(map[string]*deploymentState), limits: limiter.New()}
-}
-
-// NewMemStateWithClock returns a state store whose rate limiter uses the given
-// clock, for tests.
-func NewMemStateWithClock(now func() time.Time) *MemState {
-	return &MemState{states: make(map[string]*deploymentState), limits: limiter.NewWithClock(now)}
 }
 
 func (s *MemState) getLocked(id string) *deploymentState {
@@ -176,6 +174,12 @@ func (s *MemState) Allow(_ context.Context, id string, rpm, tpm int) (bool, erro
 // Reserve implements StateStore.
 func (s *MemState) Reserve(_ context.Context, id string, rpm, tpm int) (bool, error) {
 	return s.limits.Reserve(id, rpm, tpm), nil
+}
+
+// TokensUsed implements StateStore.
+func (s *MemState) TokensUsed(_ context.Context, id string) (int, error) {
+	_, tokens := s.limits.Snapshot(id)
+	return tokens, nil
 }
 
 // AddTokens implements StateStore.

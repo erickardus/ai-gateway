@@ -61,6 +61,7 @@ Not every failure counts toward ejection:
 
 | Failure | Ejects? | Why |
 |---|---|---|
+| `401`, `403`, `429` on a **passthrough** deployment | No | The credential is the caller's own, so the failure describes that caller. Counting it would let one developer's expired token eject the shared upstream for everyone. |
 | Connection error / timeout | No | Says more about the network than the deployment. |
 | `400`, `422`, other 4xx | No | The caller's fault; one bad request must not eject a healthy upstream. |
 | `401`, `404`, `408`, `429` | Yes | The deployment itself is unusable or saturated. |
@@ -117,7 +118,18 @@ Header names match LiteLLM's, so existing tooling works unchanged:
 |---|---|
 | `x-litellm-num-retries` | Override `num_retries` for this request (0–10). |
 | `x-litellm-timeout` | Override the request timeout, in seconds. |
-| `x-litellm-stream-timeout` | Override the time-to-first-chunk timeout. |
+| `x-litellm-stream-timeout` | Override the time-to-first-chunk timeout. Independent of `x-litellm-timeout`. |
+
+Both are capped at 30 minutes. A larger value would overflow the conversion to a
+duration and read as no deadline at all.
+
+## Timeouts
+
+`timeout` bounds a non-streaming request end to end. `stream_timeout` bounds
+only the time until the upstream's response headers arrive — it is deliberately
+**not** attached to the request context, because that would also bound reading
+the body and would sever a long completion mid-stream after the status line had
+already been sent.
 
 A `"disable_fallbacks": true` field in the request body skips fallbacks entirely.
 
@@ -144,5 +156,6 @@ behaviour and actual behaviour diverge, these follow neither blindly:
 | Retry target | Re-enters selection, but nothing forces a different deployment | Already-failed deployments are excluded |
 | Backoff with a healthy peer | Skipped | Skipped — this one is right |
 | Rate-limit window | Wall-clock `HH-MM`, wraps daily | Monotonic |
-| In-flight counter | Can go negative | Clamped; released exactly once |
+| In-flight counter | Can go negative | Clamped; released exactly once, on a context detached from the client's so an aborted request still decrements |
+| Wire format | Not a routing dimension | Enforced: an ingress reaches only deployments of its own format, groups must be homogeneous, and fallbacks may not cross formats |
 | `InternalServerErrorRetries` | Declared but never read | Every declared policy field is honoured |

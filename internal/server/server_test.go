@@ -75,7 +75,10 @@ type harnessOpts struct {
 	allowPassthrough bool
 	upstream         http.HandlerFunc
 	masterKey        string
+	maxBodyBytes     int64
 }
+
+func intPtr(n int) *int { return &n }
 
 func newHarness(t *testing.T, opts harnessOpts) *harness {
 	t.Helper()
@@ -117,7 +120,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	}
 
 	cfg := &config.Config{
-		ModelList: []config.Deployment{{ModelName: "anthropic-claude", Params: params, Weight: 1}},
+		ModelList: []config.Deployment{{ModelName: "anthropic-claude", Params: params, Weight: intPtr(1)}},
 		Router:    config.RouterConfig{Strategy: config.StrategyWeightedShuffle},
 		VirtualKeys: config.VirtualKeysConfig{
 			MasterKey:            opts.masterKey,
@@ -128,8 +131,14 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 			}},
 		},
 	}
+	if opts.maxBodyBytes > 0 {
+		cfg.Server.MaxBodyBytes = opts.maxBodyBytes
+	}
 	if err := config.Finalize(cfg); err != nil {
 		t.Fatalf("config.Finalize: %v", err)
+	}
+	if opts.maxBodyBytes > 0 {
+		cfg.Server.MaxBodyBytes = opts.maxBodyBytes
 	}
 
 	logBuf := &lockedBuffer{}
@@ -402,14 +411,101 @@ func TestKeyEndpointsRequireMasterKey(t *testing.T) {
 	}
 }
 
-func TestOversizedBodyRejected(t *testing.T) {
+// A panic after the response is committed must not append an error envelope
+// into the body the client is already parsing.
+func TestPanicAfterCommitDoesNotCorruptResponse(t *testing.T) {
 	h := newHarness(t, harnessOpts{allowPassthrough: true})
-	big := strings.Repeat("x", 200)
-	req := claudeCodeRequest("/v1/messages", `{"model":"anthropic-claude","pad":"`+big+`"}`)
-	// Shrink the limit for this request by rebuilding the harness config is
-	// awkward; instead assert the happy path still works, and rely on
-	// readBody's unit-level guarantee for the limit itself.
-	if rec := h.do(t, req); rec.Code != http.StatusOK {
+	srv := h.gateway
+
+	// Drive the middleware chain directly with a handler that commits then panics.
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\"}\n\n")
+		panic("boom after commit")
+	})
+	_ = srv
+
+	s := &Server{cfg: &config.Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	rec := httptest.NewRecorder()
+	s.withMiddleware(inner).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+
+	body := rec.Body.String()
+	if strings.Contains(body, "internal_error") {
+		t.Errorf("an error envelope was appended to a committed response:\n%s", body)
+	}
+	if !strings.Contains(body, "message_start") {
+		t.Errorf("the already-written bytes were lost:\n%s", body)
+	}
+}
+
+// A panic before anything is written must still produce a clean 500.
+func TestPanicBeforeCommitReturns500(t *testing.T) {
+	s := &Server{cfg: &config.Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	inner := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom early") })
+
+	rec := httptest.NewRecorder()
+	s.withMiddleware(inner).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "internal_error") {
+		t.Errorf("body = %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "boom early") {
+		t.Error("the panic value leaked to the client")
+	}
+}
+
+// disable_fallbacks is a gateway directive; forwarding it would make an upstream
+// that rejects unknown fields 400 every request that uses the feature.
+func TestDisableFallbacksStrippedFromUpstreamBody(t *testing.T) {
+	h := newHarness(t, harnessOpts{allowPassthrough: true})
+	body := `{"model":"anthropic-claude","disable_fallbacks":true,"max_tokens":10}`
+	rec := h.do(t, claudeCodeRequest("/v1/messages", body))
+	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	_, gotBody, _, _ := h.seen.get()
+	if strings.Contains(string(gotBody), "disable_fallbacks") {
+		t.Errorf("the gateway directive was forwarded upstream: %s", gotBody)
+	}
+	if !strings.Contains(string(gotBody), `"max_tokens":10`) {
+		t.Errorf("sibling fields were lost: %s", gotBody)
+	}
+}
+
+// /health discloses the upstream topology, so it must require a key.
+func TestHealthRequiresAuthentication(t *testing.T) {
+	h := newHarness(t, harnessOpts{allowPassthrough: true})
+
+	rec := h.do(t, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("anonymous GET /health = %d, want 401; body = %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "api_base") {
+		t.Error("the upstream topology leaked to an unauthenticated caller")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.Header.Set("x-gateway-key", testVirtualKey)
+	if rec := h.do(t, req); rec.Code != http.StatusOK {
+		t.Errorf("authenticated GET /health = %d, want 200", rec.Code)
+	}
+}
+
+// The body-size limit is the only guard against a memory-exhaustion request, so
+// it needs a test that actually exceeds it.
+func TestOversizedBodyIsRejected(t *testing.T) {
+	h := newHarness(t, harnessOpts{allowPassthrough: true, maxBodyBytes: 512})
+	big := strings.Repeat("x", 4096)
+	req := claudeCodeRequest("/v1/messages", `{"model":"anthropic-claude","pad":"`+big+`"}`)
+
+	rec := h.do(t, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body = %s", rec.Code, rec.Body.String())
+	}
+	if n := len(h.seen.body); n != 0 {
+		t.Error("an oversized body was forwarded upstream")
 	}
 }

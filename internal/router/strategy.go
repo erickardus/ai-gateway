@@ -55,8 +55,8 @@ func (WeightedShuffle) Pick(_ context.Context, candidates []*config.Deployment, 
 
 	total := 0
 	for _, d := range candidates {
-		if d.Weight > 0 {
-			total += d.Weight
+		if w := d.Share(); w > 0 {
+			total += w
 		}
 	}
 	if total <= 0 {
@@ -67,10 +67,11 @@ func (WeightedShuffle) Pick(_ context.Context, candidates []*config.Deployment, 
 
 	target := rnd.IntN(total)
 	for _, d := range candidates {
-		if d.Weight <= 0 {
+		w := d.Share()
+		if w <= 0 {
 			continue
 		}
-		target -= d.Weight
+		target -= w
 		if target < 0 {
 			return d, nil
 		}
@@ -118,16 +119,13 @@ func (UsageBased) Pick(ctx context.Context, candidates []*config.Deployment, st 
 	if len(candidates) == 0 {
 		return nil, core.ErrNoHealthyDeployment
 	}
-	ms, ok := st.(*MemState)
-	if !ok {
-		// Without direct usage access, fall back to in-flight load.
-		return LeastBusy{}.Pick(ctx, candidates, st, rnd)
-	}
-
 	best := make([]*config.Deployment, 0, len(candidates))
 	lowest := -1
 	for _, d := range candidates {
-		_, tokens := ms.limits.Snapshot(d.ID())
+		tokens, err := st.TokensUsed(ctx, d.ID())
+		if err != nil {
+			return nil, fmt.Errorf("read token usage: %w", err)
+		}
 		switch {
 		case lowest < 0 || tokens < lowest:
 			lowest, best = tokens, append(best[:0], d)
@@ -164,18 +162,34 @@ func (l LatencyBased) Pick(ctx context.Context, candidates []*config.Deployment,
 	all := make([]scored, 0, len(candidates))
 	lowest := time.Duration(-1)
 
+	unseen := make([]*config.Deployment, 0, len(candidates))
 	for _, d := range candidates {
 		mean, seen, err := st.MeanLatency(ctx, d.ID())
 		if err != nil {
 			return nil, fmt.Errorf("read latency: %w", err)
 		}
 		if !seen {
-			mean = 0
+			// No successful sample yet. Such a deployment is handled
+			// separately rather than scored as infinitely fast: a deployment
+			// that has only ever failed never records latency, and treating it
+			// as zero would collapse the candidate band onto the one upstream
+			// known to be broken.
+			unseen = append(unseen, d)
+			continue
 		}
 		all = append(all, scored{d, mean})
 		if lowest < 0 || mean < lowest {
 			lowest = mean
 		}
+	}
+
+	// Give an untried deployment a turn, but never to the exclusion of
+	// deployments with a proven record.
+	if len(all) == 0 {
+		return unseen[rnd.IntN(len(unseen))], nil
+	}
+	if len(unseen) > 0 && rnd.IntN(len(candidates)) < len(unseen) {
+		return unseen[rnd.IntN(len(unseen))], nil
 	}
 
 	limit := lowest + time.Duration(float64(lowest)*l.Buffer)
@@ -186,7 +200,7 @@ func (l LatencyBased) Pick(ctx context.Context, candidates []*config.Deployment,
 		}
 	}
 	if len(within) == 0 {
-		within = candidates
+		return all[rnd.IntN(len(all))].dep, nil
 	}
 	return within[rnd.IntN(len(within))], nil
 }
