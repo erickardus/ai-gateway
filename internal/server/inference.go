@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -164,7 +165,9 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 			"deployment", result.Deployment.ID(),
 			"error", relayErr)
 	}
-	s.router.RecordUsage(ctx, result.Deployment, usage)
+	// Detached for the same reason as record: a client that disconnected must
+	// still have its usage counted against the deployment and its key.
+	s.router.RecordUsage(context.WithoutCancel(ctx), result.Deployment, usage)
 	if authCtx.Key != nil {
 		s.auth.Limiter().AddTokens(authCtx.Key.Hash, usage.Total())
 	}

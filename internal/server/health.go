@@ -81,6 +81,19 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("readiness: key store unavailable", "error", err)
 	}
 
+	// Shared state being down is reported but does not make the instance
+	// unready: it still serves correctly, just with per-instance limits, and
+	// removing it from the load balancer would make the outage worse.
+	if s.shared != nil {
+		if err := s.shared.Ping(r.Context()); err != nil {
+			status["shared_state"] = "degraded"
+			status["shared_state_note"] = "limits and budgets are enforced per instance until Redis recovers"
+		} else {
+			status["shared_state"] = "ok"
+		}
+		status["shared_state_degradations"] = s.shared.Degradations()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(status)

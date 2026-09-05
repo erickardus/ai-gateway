@@ -21,6 +21,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/provider"
 	"github.com/erickardus/ai-gateway/internal/router"
+	"github.com/erickardus/ai-gateway/internal/rstate"
 	"github.com/erickardus/ai-gateway/internal/server"
 	"github.com/erickardus/ai-gateway/internal/spend"
 )
@@ -73,29 +74,55 @@ func run() error {
 		return fmt.Errorf("initialize authentication: %w", err)
 	}
 
-	state := router.NewMemState()
+	local := router.NewMemState()
 	ids := make([]string, 0, len(cfg.ModelList))
 	for i := range cfg.ModelList {
 		ids = append(ids, cfg.ModelList[i].ID())
 	}
-	state.Prepare(ids)
+	local.Prepare(ids)
+
+	localLedger, err := newSpendLedger(cfg.Observability)
+	if err != nil {
+		return err
+	}
+
+	// Sharing state is what makes several replicas enforce one limit rather
+	// than one each. Without Redis the gateway still runs, but every limit and
+	// budget is per-process.
+	var (
+		state  router.StateStore = local
+		ledger spend.Store       = localLedger
+		shared *rstate.Store
+	)
+	if cfg.Redis.Enabled() {
+		shared = rstate.New(rstate.Options{
+			Addr: cfg.Redis.Addr, Username: cfg.Redis.Username,
+			Password: cfg.Redis.Password, DB: cfg.Redis.DB,
+			KeyPrefix: cfg.Redis.KeyPrefix, Timeout: cfg.Redis.Timeout,
+		}, local, log)
+		defer shared.Close()
+
+		if err := shared.Ping(ctx); err != nil {
+			// Not fatal: the gateway degrades to local state and says so, which
+			// is better than refusing to start because a dependency is slow.
+			log.Error("redis unreachable at startup; starting with per-instance state",
+				"addr", cfg.Redis.Addr, "error", err)
+		}
+		state = shared
+		ledger = rstate.NewLedger(shared, localLedger, cfg.Redis.KeyPrefix, log, cfg.Redis.Timeout)
+	}
 
 	client := newUpstreamClient(cfg)
 	rtr, err := router.New(cfg, state, client, log, router.Options{})
 	if err != nil {
 		return fmt.Errorf("initialize router: %w", err)
 	}
-
-	ledger, err := newSpendLedger(cfg.Observability)
-	if err != nil {
-		return err
-	}
 	var reg *metrics.Registry
 	if cfg.Observability.Metrics {
 		reg = metrics.New()
 	}
 
-	srv := server.New(cfg, authn, store, rtr, log, ledger, reg).HTTPServer()
+	srv := server.New(cfg, authn, store, rtr, log, ledger, reg, shared).HTTPServer()
 
 	// Persist the ledger periodically and once more on the way out, so a
 	// restart does not hand every key a fresh budget.
@@ -110,7 +137,7 @@ func run() error {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := ledger.Flush(); err != nil {
+					if err := localLedger.Flush(); err != nil {
 						log.Warn("flush spend ledger", "error", err)
 					}
 				}
@@ -118,7 +145,7 @@ func run() error {
 		}()
 		defer func() {
 			<-flushDone
-			if err := ledger.Flush(); err != nil {
+			if err := localLedger.Flush(); err != nil {
 				log.Error("final spend ledger flush failed", "error", err)
 			}
 		}()
@@ -133,6 +160,7 @@ func run() error {
 		"key_management", authn.HasMasterKey(),
 		"metrics", cfg.Observability.Metrics,
 		"spend_store", cfg.Observability.SpendStorePath != "",
+		"shared_state", cfg.Redis.Enabled(),
 	)
 
 	errCh := make(chan error, 1)

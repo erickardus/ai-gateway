@@ -30,6 +30,12 @@ const (
 
 	// DefaultSpendFlushInterval paces persistence of the spend ledger.
 	DefaultSpendFlushInterval = 30 * time.Second
+
+	// DefaultRedisKeyPrefix namespaces shared state.
+	DefaultRedisKeyPrefix = "ai-gateway"
+	// DefaultRedisTimeout bounds each Redis call, short enough that an
+	// unhealthy Redis degrades the gateway rather than slowing it.
+	DefaultRedisTimeout = 250 * time.Millisecond
 )
 
 // Strategy names accepted by router.strategy.
@@ -126,5 +132,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Observability.SpendFlushInterval == 0 {
 		c.Observability.SpendFlushInterval = DefaultSpendFlushInterval
+	}
+
+	if c.Redis.KeyPrefix == "" {
+		c.Redis.KeyPrefix = DefaultRedisKeyPrefix
+	}
+	if c.Redis.Timeout == 0 {
+		c.Redis.Timeout = DefaultRedisTimeout
 	}
 }

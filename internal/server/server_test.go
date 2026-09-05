@@ -50,12 +50,14 @@ func (c *captured) get() (http.Header, []byte, string, string) {
 
 // harness builds a gateway in front of a fake upstream.
 type harness struct {
-	ledger   *spend.Ledger
-	metrics  *metrics.Registry
-	gateway  http.Handler
-	upstream *httptest.Server
-	seen     *captured
-	logBuf   *testutil.SyncWriter
+	srv          *Server
+	deploymentID string
+	ledger       *spend.Ledger
+	metrics      *metrics.Registry
+	gateway      http.Handler
+	upstream     *httptest.Server
+	seen         *captured
+	logBuf       *testutil.SyncWriter
 }
 
 type harnessOpts struct {
@@ -157,14 +159,24 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 
 	ledger := spend.New()
 	reg := metrics.New()
+	srv := New(cfg, authn, store, rtr, log, ledger, reg, nil)
 	return &harness{
-		ledger:   ledger,
-		metrics:  reg,
-		gateway:  New(cfg, authn, store, rtr, log, ledger, reg).Handler(),
-		upstream: upstream,
-		seen:     seen,
-		logBuf:   logBuf,
+		srv:          srv,
+		deploymentID: cfg.ModelList[0].ID(),
+		ledger:       ledger,
+		metrics:      reg,
+		gateway:      srv.Handler(),
+		upstream:     upstream,
+		seen:         seen,
+		logBuf:       logBuf,
 	}
+}
+
+// setLedger rebuilds the handler around a different spend store.
+func (h *harness) setLedger(t *testing.T, ledger spend.Store) {
+	t.Helper()
+	h.srv.ledger = ledger
+	h.gateway = h.srv.Handler()
 }
 
 func (h *harness) do(t *testing.T, req *http.Request) *httptest.ResponseRecorder {

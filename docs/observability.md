@@ -127,3 +127,53 @@ No credential ever appears in a scrape; a test asserts it.
 Spend and metrics are recorded together at a single place in the request path,
 because both want the same facts: which key, which deployment, what usage, what
 outcome, how long. Measuring twice would let the two drift apart.
+
+## Running more than one instance
+
+By default every replica keeps its own counters, so a `rpm: 100` limit across
+three replicas admits up to 300 requests a minute, and a key with a $50 budget
+can spend $50 on each instance. Point them at one Redis and the limits become
+what they say:
+
+```yaml
+redis:
+  addr: localhost:6379
+  key_prefix: ai-gateway      # namespaces this gateway; several can share one Redis
+  timeout: 250ms
+```
+
+### What is shared, and what is not
+
+| State | Where | Why |
+|---|---|---|
+| Rate limits (`rpm`/`tpm`) | Redis | A per-process limit is silently multiplied by the replica count. |
+| Cooldowns | Redis | An upstream ejected by one instance should be ejected everywhere. |
+| Spend and budgets | Redis | Otherwise a key spends its whole allowance once per instance. |
+| Latency samples | **local** | Latency measures *this instance's* network path to the upstream. Blending measurements from different network positions makes the signal worse, not better. |
+| In-flight counts | **local** | It describes the load this instance is carrying, and a shared counter would leak permanently whenever an instance died mid-request. |
+
+### Atomicity
+
+Rate-limit reservation, token accumulation, failure counting and spend recording
+each run as a Lua script rather than a sequence of commands. `INCR` followed by
+`EXPIRE` is two round trips, and an instance dying in between leaves a counter
+with no TTL — a deployment permanently at its limit, recoverable only by hand.
+
+### When Redis is down
+
+The gateway **degrades to per-instance state and keeps serving**. Refusing
+requests because a dependency blipped is worse than briefly enforcing limits per
+replica.
+
+Degradation is never silent:
+
+- an error log on the first failure, and an info log on recovery
+- a counter, surfaced as `shared_state_degradations` on `/health/readiness`
+- `shared_state: degraded` on the same endpoint
+
+Readiness still reports **ready** while degraded: the instance serves correctly,
+just with local limits, and pulling it from the load balancer would deepen the
+outage. An unreachable Redis at startup is logged, not fatal.
+
+The local ledger is kept current even when Redis is healthy, so a fallback has
+something to fall back to and `/spend` keeps answering.

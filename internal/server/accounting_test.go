@@ -7,7 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/erickardus/ai-gateway/internal/core"
+	"github.com/erickardus/ai-gateway/internal/metrics"
+	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
 // usageUpstream replies with a realistic Anthropic usage block, including the
@@ -183,4 +189,75 @@ func TestInFlightSettlesToZero(t *testing.T) {
 			t.Errorf("in-flight did not settle: %q", line)
 		}
 	}
+}
+
+// A client that hangs up must still be charged. Accounting runs after the
+// response is relayed, so using the request context would let anyone dodge a
+// budget by disconnecting.
+// Accounting must survive the client hanging up. It runs after the response has
+// been relayed, so if it used the request context a disconnecting client would
+// escape their budget entirely.
+func TestAccountingSurvivesClientDisconnect(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", allowPassthrough: true, upstream: usageUpstream})
+
+	// The local ledger ignores context, so on its own it cannot demonstrate the
+	// bug. A context-honouring ledger — as the Redis one is — makes the failure
+	// visible: on the request context the write is abandoned.
+	strict := &ctxSensitiveLedger{inner: h.ledger}
+	h.setLedger(t, strict)
+
+	// A request whose client has already gone away.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := claudeCodeRequest("/v1/messages", `{"model":"anthropic-claude","messages":[]}`).WithContext(ctx)
+
+	h.srv.record(req, observation{
+		model:      "anthropic-claude",
+		deployment: h.deploymentID,
+		keyHash:    "k1",
+		keyAlias:   "dev",
+		usage:      core.Usage{InputTokens: 1000, OutputTokens: 500},
+		outcome:    metrics.OutcomeSuccess,
+		latency:    time.Millisecond,
+	})
+
+	if n := strict.abandoned.Load(); n > 0 {
+		t.Fatalf("accounting abandoned %d time(s) on a cancelled context: a disconnecting client escapes their budget", n)
+	}
+	if strict.recorded.Load() == 0 {
+		t.Fatal("nothing was recorded")
+	}
+
+	// And the cost actually landed, priced for a billable deployment.
+	keys, _ := h.ledger.Keys(context.Background())
+	if len(keys) == 0 || keys[0].Cost <= 0 {
+		t.Errorf("expected a priced entry, got %+v", keys)
+	}
+}
+
+// ctxSensitiveLedger refuses writes on a cancelled context, the way a
+// network-backed store does.
+type ctxSensitiveLedger struct {
+	inner     spend.Store
+	recorded  atomic.Int64
+	abandoned atomic.Int64
+}
+
+func (l *ctxSensitiveLedger) Record(ctx context.Context, e spend.Entry) error {
+	if err := ctx.Err(); err != nil {
+		l.abandoned.Add(1)
+		return err
+	}
+	l.recorded.Add(1)
+	return l.inner.Record(ctx, e)
+}
+
+func (l *ctxSensitiveLedger) KeySpend(ctx context.Context, h string, w time.Duration) (float64, error) {
+	return l.inner.KeySpend(ctx, h, w)
+}
+func (l *ctxSensitiveLedger) Keys(ctx context.Context) ([]spend.Summary, error) {
+	return l.inner.Keys(ctx)
+}
+func (l *ctxSensitiveLedger) Deployments(ctx context.Context) ([]spend.Summary, error) {
+	return l.inner.Deployments(ctx)
 }

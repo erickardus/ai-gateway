@@ -16,6 +16,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/router"
+	"github.com/erickardus/ai-gateway/internal/rstate"
 	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
@@ -28,6 +29,9 @@ type Server struct {
 	log     *slog.Logger
 	ledger  spend.Store
 	metrics *metrics.Registry
+	// shared is set when state is shared across instances, for readiness
+	// reporting. It is nil in single-instance deployments.
+	shared *rstate.Store
 	// pricing maps a deployment ID to its price and whether the operator pays
 	// it, resolved once at construction rather than searched per request.
 	pricing map[string]deploymentPricing
@@ -43,7 +47,7 @@ type deploymentPricing struct {
 
 // New builds a Server. ledger and reg may be nil, which disables spend
 // accounting and metrics respectively.
-func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr *router.Router, log *slog.Logger, ledger spend.Store, reg *metrics.Registry) *Server {
+func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr *router.Router, log *slog.Logger, ledger spend.Store, reg *metrics.Registry, shared *rstate.Store) *Server {
 	pricing := make(map[string]deploymentPricing, len(cfg.ModelList))
 	for i := range cfg.ModelList {
 		d := &cfg.ModelList[i]
@@ -54,7 +58,7 @@ func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr
 	}
 	return &Server{
 		cfg: cfg, auth: authn, store: store, router: rtr, log: log,
-		ledger: ledger, metrics: reg, pricing: pricing,
+		ledger: ledger, metrics: reg, pricing: pricing, shared: shared,
 	}
 }
 

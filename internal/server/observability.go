@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -73,6 +74,16 @@ func (s *Server) writeSpend(w http.ResponseWriter, r *http.Request, fetch func()
 // registry. It is the gateway's single instrumentation point: everything either
 // wants to know is available here, and nothing else has to be measured twice.
 func (s *Server) record(r *http.Request, obs observation) {
+	// Accounting runs on a context detached from the client's.
+	//
+	// By the time a request is recorded the response has been relayed, and a
+	// client that has hung up leaves r.Context() already cancelled — which would
+	// abandon the write to shared storage and let anyone dodge a budget simply
+	// by disconnecting. The work is bounded and local, so completing it is both
+	// cheap and necessary.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), recordTimeout)
+	defer cancel()
+
 	pricing := s.pricing[obs.deployment]
 	cost := 0.0
 	if pricing.billable {
@@ -89,13 +100,17 @@ func (s *Server) record(r *http.Request, obs observation) {
 			Cost:         cost,
 			Billable:     pricing.billable,
 		}
-		if err := s.ledger.Record(r.Context(), entry); err != nil {
+		if err := s.ledger.Record(ctx, entry); err != nil {
 			s.log.Warn("record spend", "error", err, "request_id", RequestIDFrom(r.Context()))
 		}
 	}
 
 	s.metrics.Observe(obs.toResult(cost))
 }
+
+// recordTimeout bounds accounting so a wedged store cannot pin a handler open
+// after the response has already been delivered.
+const recordTimeout = 5 * time.Second
 
 // observation is what one request produced, gathered at the point it completes.
 type observation struct {

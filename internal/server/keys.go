@@ -7,7 +7,6 @@ import (
 
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/core"
-	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
 // core.Key is already the JSON-tagged wire type and carries no plaintext — the
@@ -147,8 +146,11 @@ func (s *Server) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
 	// Release the key's rate-limit counter and spend record; it can never be
 	// used again, so retaining either would only leak memory and skew reports.
 	s.auth.Limiter().Forget(req.Hash)
-	if l, ok := s.ledger.(*spend.Ledger); ok {
-		l.Forget(req.Hash)
+	// Both ledger implementations expose Forget; the interface deliberately does
+	// not, since dropping a subject is an administrative action rather than
+	// something the accounting path needs.
+	if f, ok := s.ledger.(interface{ Forget(string) }); ok {
+		f.Forget(req.Hash)
 	}
 	s.log.Info("virtual key deleted", "hash", req.Hash)
 	w.Header().Set("Content-Type", "application/json")

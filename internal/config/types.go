@@ -19,7 +19,32 @@ type Config struct {
 	Router        RouterConfig        `yaml:"router"`
 	VirtualKeys   VirtualKeysConfig   `yaml:"virtual_keys"`
 	Observability ObservabilityConfig `yaml:"observability"`
+	Redis         RedisConfig         `yaml:"redis"`
 }
+
+// RedisConfig shares state across gateway instances.
+//
+// Without it every replica enforces its own limits, so a rate limit is silently
+// multiplied by the replica count and a key can spend its whole budget once per
+// instance. Latency and in-flight stay per-instance even when this is set, since
+// both describe one instance's own view.
+type RedisConfig struct {
+	// Addr enables sharing when set, e.g. "localhost:6379".
+	Addr     string `yaml:"addr"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	DB       int    `yaml:"db"`
+	// KeyPrefix namespaces this gateway's keys, so several deployments can
+	// share one Redis without colliding.
+	KeyPrefix string `yaml:"key_prefix"`
+	// Timeout bounds each Redis call. It is short by design: a slow Redis must
+	// degrade the gateway to local state rather than add its latency to every
+	// request.
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// Enabled reports whether state sharing is configured.
+func (r RedisConfig) Enabled() bool { return r.Addr != "" }
 
 // ServerConfig controls the HTTP listener.
 type ServerConfig struct {

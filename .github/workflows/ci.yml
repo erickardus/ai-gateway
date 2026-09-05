@@ -8,8 +8,20 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    # The rstate tests exercise Lua atomicity and expiry semantics against a real
+    # server. They skip themselves when redis-server is absent, so CI installs it
+    # rather than quietly running a smaller suite than it appears to.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install redis-server for integration tests
+        run: sudo apt-get update && sudo apt-get install -y redis-server
 
       - uses: actions/setup-go@v5
         with:

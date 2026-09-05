@@ -161,6 +161,23 @@ virtual_keys:
       # Required before this key may reach a passthrough deployment.
       allow_passthrough: true
 
+# Share state across gateway instances. Without this every replica enforces its
+# own limits, so a rate limit is silently multiplied by the replica count and a
+# key can spend its whole budget once per instance.
+#
+# Rate limits, cooldowns and spend go to Redis because they must be global to be
+# correct. Latency and in-flight stay per-instance by design: latency measures
+# this instance's own network path to the upstream, and a shared in-flight
+# counter would leak permanently whenever an instance died mid-request.
+#
+# If Redis becomes unreachable the gateway keeps serving with per-instance
+# limits rather than failing requests, and says so loudly in the logs and on
+# /health/readiness.
+# redis:
+#   addr: localhost:6379
+#   key_prefix: ai-gateway
+#   timeout: 250ms
+
 observability:
   log_level: info
   # text | json

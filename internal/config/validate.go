@@ -52,6 +52,7 @@ func (c *Config) Validate() error {
 		{"router.backoff.initial", c.Router.Backoff.Initial},
 		{"router.backoff.max", c.Router.Backoff.Max},
 		{"observability.spend_flush_interval", c.Observability.SpendFlushInterval},
+		{"redis.timeout", c.Redis.Timeout},
 	} {
 		if d.value < 0 {
 			errs = append(errs, fmt.Errorf("%s: must not be negative, got %s", d.path, d.value))
@@ -73,6 +74,9 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.Redis.DB < 0 {
+		errs = append(errs, fmt.Errorf("redis.db: must be >= 0, got %d", c.Redis.DB))
+	}
 	if c.Server.MaxBodyBytes <= 0 {
 		errs = append(errs, fmt.Errorf("server.max_body_bytes: must be > 0, got %d", c.Server.MaxBodyBytes))
 	}

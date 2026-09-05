@@ -5,7 +5,8 @@ deployments, authenticates callers with virtual keys, and — the reason it
 exists — lets **Claude Code keep using a claude.ai subscription login while its
 traffic flows through the gateway**.
 
-Standard library only, apart from a YAML parser.
+Standard library only, apart from a YAML parser and — when you run more than one
+instance — a Redis client.
 
 ## Why
 
@@ -94,6 +95,7 @@ interface waiting for it.
 | Spend tracking, cost attribution and budgets | ✅ |
 | Caching, guardrails | ⏳ |
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
+| Multi-instance shared state (Redis) | ✅ |
 | Admin UI, teams, MCP gateway | ⏳ |
 
 There is **no cross-format translation** in v1: an Anthropic ingress routes only
