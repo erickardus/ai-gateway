@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,9 +17,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/provider"
 )
 
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-}
+func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 // fakeExec records which deployments were called and replies per deployment.
 type fakeExec struct {
@@ -63,12 +62,14 @@ func (f *fakeExec) callList() []string {
 func buildRouter(t *testing.T, group string, weights []int, rc config.RouterConfig, exec Executor, state StateStore) (*Router, []*config.Deployment) {
 	t.Helper()
 	cfg := &config.Config{Router: rc}
-	for _, w := range weights {
+	for i, w := range weights {
 		cfg.ModelList = append(cfg.ModelList, config.Deployment{
 			ModelName: group,
 			Weight:    intPtr(w),
 			Params: config.DeploymentParams{
-				Format: core.FormatAnthropic, APIBase: "https://up.example.com",
+				// Distinct hosts: two deployments sharing a model name, base URL
+				// and upstream model are a genuine duplicate and are rejected.
+				Format: core.FormatAnthropic, APIBase: fmt.Sprintf("https://up%d.example.com", i),
 				Model: group, AuthMode: core.AuthModeAPIKey,
 				AuthHeader: "x-api-key", APIKey: "k",
 			},
@@ -117,12 +118,30 @@ func TestWeightedShuffleDistribution(t *testing.T) {
 	}
 }
 
-func TestZeroWeightsFallBackToUniform(t *testing.T) {
+// Weight 0 drains a deployment: it must receive no traffic while a positive-
+// weight peer exists.
+func TestZeroWeightDrainsDeployment(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	rc := config.RouterConfig{Strategy: config.StrategyWeightedShuffle}
+	r, deps := buildRouter(t, "g", []int{0, 5}, rc, exec, nil)
+
+	for range 200 {
+		res, err := r.Route(context.Background(), "g", &provider.Request{}, Overrides{})
+		if err != nil {
+			t.Fatalf("Route: %v", err)
+		}
+		if res.Deployment.ID() == deps[0].ID() {
+			t.Fatal("a deployment with weight 0 received traffic")
+		}
+		res.Response.Body.Close()
+	}
+}
+
+// When every candidate is drained the router still routes rather than failing.
+func TestAllZeroWeightsStillRoutes(t *testing.T) {
 	exec := &fakeExec{replies: map[string]error{}}
 	rc := config.RouterConfig{Strategy: config.StrategyWeightedShuffle}
 	r, _ := buildRouter(t, "g", []int{0, 0}, rc, exec, nil)
-	// Weight 0 is normalized to 1 by defaults, so this simply must not hang or
-	// error; both deployments remain selectable.
 	res, err := r.Route(context.Background(), "g", &provider.Request{}, Overrides{})
 	if err != nil {
 		t.Fatalf("Route: %v", err)
@@ -304,10 +323,22 @@ func TestFallbackToAnotherGroup(t *testing.T) {
 		t.Errorf("AttemptedFallback = %d, want 1", res.AttemptedFallback)
 	}
 
-	// With fallbacks disabled the original failure must surface instead.
+	// With fallbacks disabled the ORIGINAL failure must surface, not the
+	// fallback's — the first failure is what describes the problem.
 	exec.replies[cfg.Groups()["backup"][0].ID()] = upstreamErr(http.StatusTeapot)
-	if _, err := r.Route(context.Background(), "primary", &provider.Request{}, Overrides{DisableFallbacks: true}); err == nil {
-		t.Error("expected an error when fallbacks are disabled")
+	_, err = r.Route(context.Background(), "primary", &provider.Request{}, Overrides{DisableFallbacks: true})
+	var ue *core.UpstreamError
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %v, want an UpstreamError", err)
+	}
+	if ue.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want the original 503 rather than the fallback's", ue.StatusCode)
+	}
+
+	// And when fallbacks run but all fail, the original still wins.
+	_, err = r.Route(context.Background(), "primary", &provider.Request{}, Overrides{})
+	if !errors.As(err, &ue) || ue.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("after an exhausted fallback chain: got %v, want the original 503", err)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
+	"github.com/erickardus/ai-gateway/internal/testutil"
 )
 
 // A base URL that already carries the path's leading segment must not double it.
@@ -72,7 +73,7 @@ func TestPassthroughRelaysRealCredential(t *testing.T) {
 // must still be extracted or every token limit goes unenforced.
 func TestUsageFromNonStreamingBody(t *testing.T) {
 	body := `{"id":"msg_1","type":"message","usage":{"input_tokens":1234,"output_tokens":56}}`
-	rec := &syncWriter{header: http.Header{}}
+	rec := testutil.NewSyncWriter()
 	usage, err := Relay(rec, strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("Relay: %v", err)

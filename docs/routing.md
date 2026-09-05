@@ -96,11 +96,24 @@ set, so a cyclic configuration cannot loop. **If everything fails, the original
 error is returned**, not the last fallback's — the first failure is what
 actually describes the problem.
 
+## Error classification
+
+Context-window overflows and content-policy refusals are signalled only in the
+upstream's error body, and providers word them differently. Classification
+therefore checks the provider's **structured error type first**
+(`error.type`, `error.code`), falling back to substring matching. Both lists are
+package variables — `ContextWindowErrorTypes`, `ContextWindowErrorMarkers`,
+`ContentPolicyErrorTypes`, `ContentPolicyErrorMarkers` — so a deployment against
+a provider with different wording can extend them.
+
 ## Rate limits
 
 `rpm` and `tpm` on a deployment are **enforced limits**, checked before dispatch
 and consumed only by the request actually sent. Virtual keys carry their own
-`rpm_limit` and `tpm_limit`, applied at authentication.
+`rpm_limit` and `tpm_limit`. A key's budget is charged only once the request is
+known to be one the gateway will actually dispatch — after the model is resolved
+and authorized — so a key is never billed for its own rejected requests, and
+model discovery does not consume inference budget.
 
 Windows are monotonic: each counter tracks its own start and rolls over a minute
 later. They are deliberately not keyed on a wall-clock `HH-MM` bucket, which
@@ -119,6 +132,7 @@ Header names match LiteLLM's, so existing tooling works unchanged:
 | `x-litellm-num-retries` | Override `num_retries` for this request (0–10). |
 | `x-litellm-timeout` | Override the request timeout, in seconds. |
 | `x-litellm-stream-timeout` | Override the time-to-first-chunk timeout. Independent of `x-litellm-timeout`. |
+| `x-litellm-tags` | Comma-separated labels recorded for attribution. Consumed by the gateway, never forwarded. |
 
 Both are capped at 30 minutes. A larger value would overflow the conversion to a
 duration and read as no deadline at all.
@@ -158,4 +172,7 @@ behaviour and actual behaviour diverge, these follow neither blindly:
 | Rate-limit window | Wall-clock `HH-MM`, wraps daily | Monotonic |
 | In-flight counter | Can go negative | Clamped; released exactly once, on a context detached from the client's so an aborted request still decrements |
 | Wire format | Not a routing dimension | Enforced: an ingress reaches only deployments of its own format, groups must be homogeneous, and fallbacks may not cross formats |
+| Duplicate deployments | Undetectable, because the ID includes a per-group ordinal | Rejected at load: a duplicate would double that upstream's traffic share and rate limit |
+| Rate-limit charging | At authentication, so rejected requests spend budget | After the model is resolved and authorized |
+| Error classification | Substring matching only | Structured provider error type first, substrings as fallback, both configurable |
 | `InternalServerErrorRetries` | Declared but never read | Every declared policy field is honoured |

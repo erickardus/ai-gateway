@@ -58,11 +58,8 @@ func Parse(raw []byte) (*Config, error) {
 func Finalize(cfg *Config) error {
 	cfg.applyDefaults()
 
-	counts := make(map[string]int)
 	for i := range cfg.ModelList {
-		d := &cfg.ModelList[i]
-		d.setID(counts[d.ModelName])
-		counts[d.ModelName]++
+		cfg.ModelList[i].setID()
 	}
 
 	return cfg.Validate()

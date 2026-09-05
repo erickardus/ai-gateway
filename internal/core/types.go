@@ -142,3 +142,19 @@ type Usage struct {
 
 // Total returns the combined token count.
 func (u Usage) Total() int { return u.InputTokens + u.OutputTokens }
+
+// ControlHeaders are the headers the gateway interprets for its own routing and
+// then consumes. They are listed here rather than in each package that touches
+// them: the reader (router) and the stripper (provider) must agree, and when
+// they drift the gateway forwards its own internal directives to the provider.
+var ControlHeaders = []string{
+	"x-litellm-num-retries",
+	"x-litellm-timeout",
+	"x-litellm-stream-timeout",
+	"x-litellm-tags",
+}
+
+// DefaultKeyHeaderNames are the headers that may carry a virtual key, in
+// precedence order. x-litellm-api-key is accepted so tooling already pointed at
+// a LiteLLM proxy works unchanged.
+var DefaultKeyHeaderNames = []string{"x-gateway-key", "x-litellm-api-key"}

@@ -9,28 +9,10 @@ import (
 	"github.com/erickardus/ai-gateway/internal/core"
 )
 
-// keyView is the safe representation of a key. It never carries the plaintext,
-// which exists only in the response that first issued it.
-type keyView struct {
-	Hash             string     `json:"hash"`
-	Alias            string     `json:"alias,omitempty"`
-	Models           []string   `json:"models,omitempty"`
-	RPMLimit         int        `json:"rpm_limit,omitempty"`
-	TPMLimit         int        `json:"tpm_limit,omitempty"`
-	AllowPassthrough bool       `json:"allow_passthrough"`
-	Blocked          bool       `json:"blocked"`
-	CreatedAt        time.Time  `json:"created_at"`
-	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
-}
-
-func viewOf(k *core.Key) keyView {
-	return keyView{
-		Hash: k.Hash, Alias: k.Alias, Models: k.Models,
-		RPMLimit: k.RPMLimit, TPMLimit: k.TPMLimit,
-		AllowPassthrough: k.AllowPassthrough, Blocked: k.Blocked,
-		CreatedAt: k.CreatedAt, ExpiresAt: k.ExpiresAt,
-	}
-}
+// core.Key is already the JSON-tagged wire type and carries no plaintext — the
+// key itself exists only in the response that issues it — so it is encoded
+// directly. A parallel view struct would have to be updated in lockstep, and a
+// field added to core.Key but forgotten here would silently vanish from the API.
 
 // requireMaster gates the management endpoints on the master key. It reports
 // whether the request may proceed.
@@ -107,7 +89,7 @@ func (s *Server) handleKeyGenerate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"key":  plaintext,
-		"info": viewOf(key),
+		"info": key,
 		"note": "This key is shown once and cannot be recovered. Store it now.",
 	})
 }
@@ -128,7 +110,7 @@ func (s *Server) handleKeyInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(viewOf(key))
+	_ = json.NewEncoder(w).Encode(key)
 }
 
 // handleKeyList returns every stored key's metadata.
@@ -141,12 +123,8 @@ func (s *Server) handleKeyList(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	views := make([]keyView, 0, len(keys))
-	for _, k := range keys {
-		views = append(views, viewOf(k))
-	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"keys": views, "count": len(views)})
+	_ = json.NewEncoder(w).Encode(map[string]any{"keys": keys, "count": len(keys)})
 }
 
 // handleKeyDelete revokes a key.
@@ -165,6 +143,8 @@ func (s *Server) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	// Release the key's rate-limit counter; it can never be used again.
+	s.auth.Limiter().Forget(req.Hash)
 	s.log.Info("virtual key deleted", "hash", req.Hash)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "hash": req.Hash})

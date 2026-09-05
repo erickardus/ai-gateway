@@ -58,12 +58,13 @@ func (d *Deployment) Share() int {
 // metrics all key on it.
 func (d *Deployment) ID() string { return d.id }
 
-// setID derives a stable ID from the public name, the ordinal within the group
-// and the upstream base URL, so reordering unrelated groups does not renumber
-// this deployment.
-func (d *Deployment) setID(ordinal int) {
+// setID derives a stable ID from the public name and the upstream it points at.
+// The ordinal is deliberately excluded: including it would make every entry
+// unique by construction and so make genuine duplicates undetectable, and it
+// would renumber deployments when an unrelated one is inserted above them.
+func (d *Deployment) setID() {
 	sum := sha256.Sum256([]byte(d.Params.APIBase + "|" + d.Params.Model))
-	d.id = fmt.Sprintf("%s#%d-%s", d.ModelName, ordinal, hex.EncodeToString(sum[:4]))
+	d.id = fmt.Sprintf("%s#%s", d.ModelName, hex.EncodeToString(sum[:6]))
 }
 
 // DeploymentParams describes how to reach one upstream.

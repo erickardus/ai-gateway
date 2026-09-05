@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/jsonx"
 	"github.com/erickardus/ai-gateway/internal/provider"
@@ -57,12 +58,30 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "request body is missing the \"model\" field")
 		return
 	}
+	// Annotate the access log with who is calling and what they asked for. The
+	// alias is used where a key has one; otherwise a redacted fingerprint, which
+	// identifies the key across log lines without ever exposing it.
+	if authCtx.Key != nil {
+		label := authCtx.Key.Alias
+		if label == "" {
+			label = auth.Redact(authCtx.Credentials.Key)
+		}
+		AnnotateRequest(ctx, label, fields.Model)
+	}
+
 	if err := s.auth.AuthorizeModel(authCtx, fields.Model); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	if !s.router.HasGroup(fields.Model) {
 		s.fail(w, r, fmt.Errorf("model %q: %w", fields.Model, core.ErrModelNotFound))
+		return
+	}
+
+	// Charge the key's rate limit only now that the request is known to be one
+	// the gateway will actually dispatch.
+	if err := s.auth.Admit(authCtx); err != nil {
+		s.fail(w, r, err)
 		return
 	}
 

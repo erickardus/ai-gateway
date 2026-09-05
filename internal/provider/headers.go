@@ -29,16 +29,16 @@ var hopByHop = map[string]bool{
 	"upgrade":             true,
 }
 
-// gatewayOnly are headers the gateway consumes for its own routing decisions and
-// must not pass on.
-var gatewayOnly = map[string]bool{
-	"x-litellm-num-retries":    true,
-	"x-litellm-timeout":        true,
-	"x-litellm-stream-timeout": true,
-	"x-litellm-tags":           true,
-	"host":                     true,
-	"content-length":           true,
-}
+// gatewayOnly are headers the gateway consumes and must not pass on. The control
+// headers come from core so that the package reading them and this package
+// stripping them cannot drift apart.
+var gatewayOnly = func() map[string]bool {
+	m := map[string]bool{"host": true, "content-length": true}
+	for _, h := range core.ControlHeaders {
+		m[strings.ToLower(h)] = true
+	}
+	return m
+}()
 
 // credentialHeaders are the headers that may carry a caller credential.
 var credentialHeaders = map[string]bool{

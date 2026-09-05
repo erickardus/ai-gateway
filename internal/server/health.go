@@ -3,8 +3,9 @@ package server
 import (
 	"encoding/json"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
+	"strings"
 )
 
 // modelEntry is one row of the /v1/models response. The field names match what
@@ -34,7 +35,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	for name := range groups {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 
 	entries := make([]modelEntry, 0, len(names))
 	for _, name := range names {
@@ -126,7 +127,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			rows = append(rows, row)
 		}
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Deployment < rows[j].Deployment })
+	slices.SortFunc(rows, func(a, b deploymentHealth) int { return strings.Compare(a.Deployment, b.Deployment) })
 
 	code := http.StatusOK
 	overall := "healthy"
@@ -139,6 +140,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":              overall,
+		"strategy":            s.router.Strategy(),
 		"healthy_deployments": healthy,
 		"total_deployments":   len(rows),
 		"deployments":         rows,

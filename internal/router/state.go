@@ -62,16 +62,35 @@ type deploymentState struct {
 // instance; a shared implementation behind the same interface is what makes
 // several instances agree.
 type MemState struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	states map[string]*deploymentState
 	limits *limiter.Limiter
 }
 
-// NewMemState returns an empty in-memory state store.
+// NewMemState returns an in-memory state store.
 func NewMemState() *MemState {
 	return &MemState{states: make(map[string]*deploymentState), limits: limiter.New()}
 }
 
+// Prepare pre-creates state for known deployment IDs so that the read paths —
+// cooldown and in-flight checks, which run once per candidate on every request —
+// never have to insert and can therefore take a shared read lock.
+func (s *MemState) Prepare(ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		if _, ok := s.states[id]; !ok {
+			s.states[id] = &deploymentState{}
+		}
+	}
+}
+
+// readLocked returns a deployment's state for reading, or nil when it has none
+// yet. Callers must hold at least the read lock.
+func (s *MemState) readLocked(id string) *deploymentState { return s.states[id] }
+
+// getLocked returns a deployment's state, creating it if absent. Callers must
+// hold the write lock.
 func (s *MemState) getLocked(id string) *deploymentState {
 	st, ok := s.states[id]
 	if !ok {
@@ -110,17 +129,21 @@ func (s *MemState) EndRequest(_ context.Context, id string, took time.Duration, 
 
 // InFlight implements StateStore.
 func (s *MemState) InFlight(_ context.Context, id string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.getLocked(id).inFlight, nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st := s.readLocked(id)
+	if st == nil {
+		return 0, nil
+	}
+	return st.inFlight, nil
 }
 
 // MeanLatency implements StateStore.
 func (s *MemState) MeanLatency(_ context.Context, id string) (time.Duration, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	st := s.getLocked(id)
-	if len(st.latency) == 0 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st := s.readLocked(id)
+	if st == nil || len(st.latency) == 0 {
 		return 0, false, nil
 	}
 	var total time.Duration
@@ -132,14 +155,25 @@ func (s *MemState) MeanLatency(_ context.Context, id string) (time.Duration, boo
 
 // InCooldown implements StateStore.
 func (s *MemState) InCooldown(_ context.Context, id string, now time.Time) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	st := s.getLocked(id)
-	if st.cooldownUntil.IsZero() {
+	// The common case is "not cooling down", which needs only a read lock.
+	s.mu.RLock()
+	st := s.readLocked(id)
+	if st == nil || st.cooldownUntil.IsZero() {
+		s.mu.RUnlock()
 		return false, nil
 	}
-	if now.Before(st.cooldownUntil) {
+	cooling := now.Before(st.cooldownUntil)
+	s.mu.RUnlock()
+	if cooling {
 		return true, nil
+	}
+
+	// Expired: take the write lock to clear it.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st = s.getLocked(id)
+	if st.cooldownUntil.IsZero() || now.Before(st.cooldownUntil) {
+		return !st.cooldownUntil.IsZero(), nil
 	}
 	// Expired: recovery is by elapsed time, and the failure tally resets with it
 	// so a recovered deployment starts from a clean slate.

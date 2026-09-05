@@ -1,9 +1,11 @@
 package router
 
 import (
+	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +25,9 @@ type Overrides struct {
 	// let a stream setting silently cap non-streaming requests.
 	StreamTimeout    *time.Duration
 	DisableFallbacks bool
+	// Tags label the request for attribution in logs. They are consumed here
+	// and never forwarded upstream.
+	Tags []string
 	// AllowPassthrough reports whether the calling key may use a deployment
 	// that relays its own credential upstream. Keys without it are routed only
 	// to deployments holding a server-side credential.
@@ -44,6 +49,13 @@ func OverridesFromHeaders(h http.Header) Overrides {
 	}
 	if d, ok := parseTimeoutHeader(h.Get("x-litellm-stream-timeout")); ok {
 		o.StreamTimeout = &d
+	}
+	if v := strings.TrimSpace(h.Get("x-litellm-tags")); v != "" {
+		for _, tag := range strings.Split(v, ",") {
+			if tag = strings.TrimSpace(tag); tag != "" {
+				o.Tags = append(o.Tags, tag)
+			}
+		}
 	}
 	return o
 }
@@ -95,38 +107,74 @@ func lookup(rules []config.FallbackRule, model string) []string {
 	return nil
 }
 
-// isContextWindowError reports whether the upstream rejected the request for
-// exceeding the model's context window. Providers signal this only in the error
-// body, so the text is matched rather than a status code.
-func isContextWindowError(err error) bool {
-	var ue *core.UpstreamError
-	if !errors.As(err, &ue) || ue.StatusCode != http.StatusBadRequest {
-		return false
-	}
-	body := strings.ToLower(string(ue.Body))
-	for _, marker := range []string{"context length", "context window", "prompt is too long", "prompt_too_long", "maximum context", "too many tokens"} {
-		if strings.Contains(body, marker) {
-			return true
-		}
-	}
-	return false
+// Error-classification markers.
+//
+// Providers signal these conditions only in the error body, and they word them
+// differently, so classification is necessarily heuristic. Two things reduce the
+// guesswork: the provider's own structured error type is checked first, and both
+// lists are package variables so a deployment against a provider with different
+// wording can extend them without a code change.
+var (
+	// ContextWindowErrorTypes are structured error type values that mean the
+	// prompt exceeded the model's context window.
+	ContextWindowErrorTypes = []string{"context_length_exceeded", "prompt_too_long", "context_window_exceeded"}
+	// ContextWindowErrorMarkers are substrings matched against the error body
+	// when no structured type is recognized.
+	ContextWindowErrorMarkers = []string{"context length", "context window", "prompt is too long", "prompt_too_long", "maximum context", "too many tokens"}
+
+	// ContentPolicyErrorTypes are structured error type values meaning the
+	// request was refused on content grounds.
+	ContentPolicyErrorTypes = []string{"content_policy_violation", "content_filter", "invalid_prompt"}
+	// ContentPolicyErrorMarkers are the substring fallback for the above.
+	ContentPolicyErrorMarkers = []string{"content policy", "content_policy", "content filter", "safety", "blocked by"}
+)
+
+// errorEnvelope covers the shapes Anthropic and OpenAI use for their structured
+// error type. Absent fields decode as empty.
+type errorEnvelope struct {
+	Error struct {
+		Type string `json:"type"`
+		Code string `json:"code"`
+	} `json:"error"`
+	Type string `json:"type"`
 }
 
-// isContentPolicyError reports whether the upstream refused on content policy
-// grounds.
-func isContentPolicyError(err error) bool {
+// classifyUpstream reports whether an upstream error matches a class, preferring
+// the provider's structured error type over body text.
+func classifyUpstream(err error, statuses []int, types, markers []string) bool {
 	var ue *core.UpstreamError
 	if !errors.As(err, &ue) {
 		return false
 	}
-	if ue.StatusCode != http.StatusBadRequest && ue.StatusCode != http.StatusForbidden {
+	if !slices.Contains(statuses, ue.StatusCode) {
 		return false
 	}
-	body := strings.ToLower(string(ue.Body))
-	for _, marker := range []string{"content policy", "content_policy", "content filter", "safety", "blocked by"} {
-		if strings.Contains(body, marker) {
-			return true
+
+	var env errorEnvelope
+	if json.Unmarshal(ue.Body, &env) == nil {
+		for _, candidate := range []string{env.Error.Type, env.Error.Code, env.Type} {
+			if candidate == "" {
+				continue
+			}
+			if slices.ContainsFunc(types, func(t string) bool { return strings.EqualFold(t, candidate) }) {
+				return true
+			}
 		}
 	}
-	return false
+
+	body := strings.ToLower(string(ue.Body))
+	return slices.ContainsFunc(markers, func(m string) bool { return strings.Contains(body, m) })
+}
+
+// isContextWindowError reports whether the upstream rejected the request for
+// exceeding the model's context window.
+func isContextWindowError(err error) bool {
+	return classifyUpstream(err, []int{http.StatusBadRequest, http.StatusRequestEntityTooLarge},
+		ContextWindowErrorTypes, ContextWindowErrorMarkers)
+}
+
+// isContentPolicyError reports whether the upstream refused on content grounds.
+func isContentPolicyError(err error) bool {
+	return classifyUpstream(err, []int{http.StatusBadRequest, http.StatusForbidden},
+		ContentPolicyErrorTypes, ContentPolicyErrorMarkers)
 }

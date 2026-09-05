@@ -32,7 +32,10 @@ type KeyStore interface {
 type MemStore struct {
 	mu   sync.RWMutex
 	keys map[string]*core.Key
-	path string
+	// writeMu serializes persists, which happen outside mu so that a slow disk
+	// cannot block request authentication.
+	writeMu sync.Mutex
+	path    string
 }
 
 // NewMemStore returns a store with no persistence.
@@ -71,17 +74,31 @@ func (s *MemStore) load() error {
 	return nil
 }
 
-// persist writes the store atomically: a temporary file in the same directory
+// snapshotLocked copies the store's contents for serialization. Callers must
+// hold the lock; the returned slice is independent of the store.
+func (s *MemStore) snapshotLocked() []*core.Key {
+	keys := make([]*core.Key, 0, len(s.keys))
+	for _, k := range s.keys {
+		clone := *k
+		keys = append(keys, &clone)
+	}
+	return keys
+}
+
+// persist writes a snapshot atomically: a temporary file in the same directory
 // followed by a rename, so a crash mid-write cannot truncate the real file.
-// Callers must hold at least a read lock.
-func (s *MemStore) persist() error {
+//
+// It must be called WITHOUT the store lock held. Serializing and fsyncing take
+// milliseconds, and Get is on the path of every inference request, so holding
+// the lock across them would stall authentication for the whole process on
+// every key write. A separate write mutex keeps concurrent persists ordered.
+func (s *MemStore) persist(keys []*core.Key) error {
 	if s.path == "" {
 		return nil
 	}
-	keys := make([]*core.Key, 0, len(s.keys))
-	for _, k := range s.keys {
-		keys = append(keys, k)
-	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	raw, err := json.MarshalIndent(keys, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode key store: %w", err)
@@ -137,21 +154,25 @@ func (s *MemStore) Put(_ context.Context, key *core.Key) error {
 		return fmt.Errorf("put key: hash is required")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	clone := *key
 	if clone.CreatedAt.IsZero() {
 		clone.CreatedAt = time.Now().UTC()
 	}
 	s.keys[clone.Hash] = &clone
-	return s.persist()
+	snapshot := s.snapshotLocked()
+	s.mu.Unlock()
+
+	return s.persist(snapshot)
 }
 
 // Delete implements KeyStore.
 func (s *MemStore) Delete(_ context.Context, hash string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.keys, hash)
-	return s.persist()
+	snapshot := s.snapshotLocked()
+	s.mu.Unlock()
+
+	return s.persist(snapshot)
 }
 
 // List implements KeyStore.

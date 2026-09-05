@@ -13,7 +13,8 @@ import (
 // Strategy picks one deployment from a set already filtered for health and
 // capacity. Implementations must tolerate an empty candidate list.
 type Strategy interface {
-	// Name returns the configuration name of the strategy.
+	// Name returns the configuration name of the strategy, for logging and for
+	// the /health response.
 	Name() string
 	// Pick chooses a deployment, or returns ErrNoHealthyDeployment.
 	Pick(ctx context.Context, candidates []*config.Deployment, st StateStore, rnd *rand.Rand) (*config.Deployment, error)
@@ -87,15 +88,28 @@ func (LeastBusy) Name() string { return config.StrategyLeastBusy }
 
 // Pick implements Strategy.
 func (LeastBusy) Pick(ctx context.Context, candidates []*config.Deployment, st StateStore, rnd *rand.Rand) (*config.Deployment, error) {
+	return pickLowest(candidates, rnd, func(d *config.Deployment) (int, error) {
+		return st.InFlight(ctx, d.ID())
+	})
+}
+
+// pickLowest selects the candidate with the lowest score, breaking ties at
+// random.
+//
+// The tie-break matters: without it the first-listed deployment would take all
+// traffic whenever scores are equal, which for a freshly started gateway is
+// every request. Having one implementation means a change to that rule cannot
+// be applied to two strategies and missed on the third.
+func pickLowest(candidates []*config.Deployment, rnd *rand.Rand, score func(*config.Deployment) (int, error)) (*config.Deployment, error) {
 	if len(candidates) == 0 {
 		return nil, core.ErrNoHealthyDeployment
 	}
 	best := make([]*config.Deployment, 0, len(candidates))
 	lowest := -1
 	for _, d := range candidates {
-		n, err := st.InFlight(ctx, d.ID())
+		n, err := score(d)
 		if err != nil {
-			return nil, fmt.Errorf("read in-flight count: %w", err)
+			return nil, fmt.Errorf("score deployment %s: %w", d.ID(), err)
 		}
 		switch {
 		case lowest < 0 || n < lowest:
@@ -116,24 +130,9 @@ func (UsageBased) Name() string { return config.StrategyUsageBased }
 
 // Pick implements Strategy.
 func (UsageBased) Pick(ctx context.Context, candidates []*config.Deployment, st StateStore, rnd *rand.Rand) (*config.Deployment, error) {
-	if len(candidates) == 0 {
-		return nil, core.ErrNoHealthyDeployment
-	}
-	best := make([]*config.Deployment, 0, len(candidates))
-	lowest := -1
-	for _, d := range candidates {
-		tokens, err := st.TokensUsed(ctx, d.ID())
-		if err != nil {
-			return nil, fmt.Errorf("read token usage: %w", err)
-		}
-		switch {
-		case lowest < 0 || tokens < lowest:
-			lowest, best = tokens, append(best[:0], d)
-		case tokens == lowest:
-			best = append(best, d)
-		}
-	}
-	return best[rnd.IntN(len(best))], nil
+	return pickLowest(candidates, rnd, func(d *config.Deployment) (int, error) {
+		return st.TokensUsed(ctx, d.ID())
+	})
 }
 
 // LatencyBased picks among the fastest deployments by mean recent latency.

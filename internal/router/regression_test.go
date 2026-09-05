@@ -3,7 +3,9 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -173,11 +175,11 @@ func TestLatencyBasedDoesNotStarveHealthyDeployment(t *testing.T) {
 	ctx := context.Background()
 	state := NewMemState()
 	cfg := &config.Config{Router: config.RouterConfig{Strategy: config.StrategyLatencyBased, LowestLatencyBuffer: 0.2}}
-	for range 2 {
+	for i := range 2 {
 		cfg.ModelList = append(cfg.ModelList, config.Deployment{
 			ModelName: "g",
 			Params: config.DeploymentParams{
-				Format: core.FormatAnthropic, APIBase: "https://up.example.com", Model: "g",
+				Format: core.FormatAnthropic, APIBase: fmt.Sprintf("https://up%d.example.com", i), Model: "g",
 				AuthMode: core.AuthModeAPIKey, AuthHeader: "x-api-key", APIKey: "k",
 			},
 		})
@@ -210,5 +212,78 @@ func TestLatencyBasedDoesNotStarveHealthyDeployment(t *testing.T) {
 	}
 	if share := float64(counts[deps[0].ID()]) / 1000; share < 0.3 {
 		t.Errorf("healthy deployment took only %.2f of traffic; it should dominate", share)
+	}
+}
+
+// A fully rejected candidate set must report why, not a generic outage. In a
+// mixed group a permission problem was previously reported as "no healthy
+// deployment", sending the operator to debug the wrong thing.
+func TestRejectionReasonIsSpecific(t *testing.T) {
+	cfg := &config.Config{Router: config.RouterConfig{Strategy: config.StrategyWeightedShuffle}}
+	cfg.ModelList = append(cfg.ModelList, config.Deployment{
+		ModelName: "g",
+		Params: config.DeploymentParams{
+			Format: core.FormatAnthropic, APIBase: "https://api.anthropic.com",
+			Model: "g", AuthMode: core.AuthModePassthrough,
+		},
+	})
+	cfg.VirtualKeys.AllowedUpstreamHosts = []string{"api.anthropic.com"}
+	if err := config.Finalize(cfg); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	r, err := New(cfg, NewMemState(), &fakeExec{replies: map[string]error{}}, discardLogger(), Options{Seed: 5})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// A key without passthrough permission gets a permission error, not a 503.
+	_, err = r.Route(context.Background(), "g",
+		&provider.Request{Format: core.FormatAnthropic}, Overrides{AllowPassthrough: false})
+	if !errors.Is(err, core.ErrPassthroughNotAllowed) {
+		t.Errorf("got %v, want ErrPassthroughNotAllowed", err)
+	}
+}
+
+// Structured provider error types classify a failure even when the wording
+// differs from the substring markers.
+func TestErrorClassificationPrefersStructuredType(t *testing.T) {
+	structured := &core.UpstreamError{
+		StatusCode: http.StatusBadRequest,
+		Body:       []byte(`{"type":"error","error":{"type":"context_length_exceeded","message":"nichts passt"}}`),
+	}
+	if !isContextWindowError(structured) {
+		t.Error("a structured context_length_exceeded was not classified")
+	}
+	// The substring fallback still works for providers with no structured type.
+	textual := &core.UpstreamError{
+		StatusCode: http.StatusBadRequest,
+		Body:       []byte(`{"error":{"message":"prompt is too long: 250000 tokens > 200000 maximum"}}`),
+	}
+	if !isContextWindowError(textual) {
+		t.Error("the substring fallback failed")
+	}
+	// An unrelated 400 must not be misclassified.
+	unrelated := &core.UpstreamError{StatusCode: http.StatusBadRequest, Body: []byte(`{"error":{"message":"bad tool schema"}}`)}
+	if isContextWindowError(unrelated) || isContentPolicyError(unrelated) {
+		t.Error("an unrelated 400 was misclassified")
+	}
+}
+
+// A duplicated deployment doubles an upstream's share of traffic and its
+// effective rate limit, so it must be rejected rather than silently accepted.
+func TestDuplicateDeploymentRejected(t *testing.T) {
+	cfg := &config.Config{Router: config.RouterConfig{Strategy: config.StrategyWeightedShuffle}}
+	for range 2 {
+		cfg.ModelList = append(cfg.ModelList, config.Deployment{
+			ModelName: "g",
+			Params: config.DeploymentParams{
+				Format: core.FormatAnthropic, APIBase: "https://api.anthropic.com", Model: "same",
+				AuthMode: core.AuthModeAPIKey, AuthHeader: "x-api-key", APIKey: "k",
+			},
+		})
+	}
+	err := config.Finalize(cfg)
+	if err == nil || !strings.Contains(err.Error(), "duplicate deployment") {
+		t.Fatalf("got %v, want a duplicate-deployment error", err)
 	}
 }

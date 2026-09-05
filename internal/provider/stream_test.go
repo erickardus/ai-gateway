@@ -6,9 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/erickardus/ai-gateway/internal/testutil"
 )
 
 // TestRelayDoesNotBuffer proves chunks reach the client as they arrive. A
@@ -38,7 +39,7 @@ func TestRelayDoesNotBuffer(t *testing.T) {
 
 	// ResponseRecorder is not safe for concurrent access, and this test reads
 	// the output while the relay is still writing.
-	rec := &syncWriter{header: http.Header{}}
+	rec := testutil.NewSyncWriter()
 	done := make(chan error, 1)
 	go func() {
 		_, err := Relay(rec, resp.Body)
@@ -117,44 +118,6 @@ func TestRelayPropagatesUpstreamReadError(t *testing.T) {
 	}
 }
 
-// syncWriter is a minimal http.ResponseWriter whose buffer may be read while
-// another goroutine writes to it.
-type syncWriter struct {
-	mu     sync.Mutex
-	buf    strings.Builder
-	header http.Header
-}
-
-func (w *syncWriter) Header() http.Header { return w.header }
-
-func (w *syncWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.Write(p)
-}
-
-func (w *syncWriter) WriteHeader(int) {}
-
-// Flush makes http.ResponseController's flush succeed without extra work.
-func (w *syncWriter) Flush() {}
-
-func (w *syncWriter) String() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.String()
-}
-
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errors.New("upstream exploded") }
-
-func TestSniffUsageNonStreaming(t *testing.T) {
-	body := []byte(`{"id":"msg_1","content":[],"usage":{"input_tokens":10,"output_tokens":20}}`)
-	if got := SniffUsage(body); got.InputTokens != 10 || got.OutputTokens != 20 {
-		t.Errorf("SniffUsage = %+v, want 10/20", got)
-	}
-	openai := []byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
-	if got := SniffUsage(openai); got.InputTokens != 3 || got.OutputTokens != 4 {
-		t.Errorf("SniffUsage(openai) = %+v, want 3/4", got)
-	}
-}

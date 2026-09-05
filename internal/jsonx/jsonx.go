@@ -6,23 +6,28 @@
 // which only works when the system array arrives exactly as sent, and prompt
 // cache keys are sensitive to the body bytes. Unmarshalling into a map and
 // re-marshalling would reorder object keys and renormalize numbers, so this
-// package never does that: it locates a value with a real JSON scanner and
-// splices the replacement in, leaving every other byte identical.
+// package never does that: it locates a value and splices the replacement in,
+// leaving every other byte identical.
 package jsonx
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 )
 
-// ErrKeyNotFound means the requested top-level key is absent.
-var ErrKeyNotFound = errors.New("top-level key not found")
-
-// ErrNotAString means the requested key exists but does not hold a string.
-var ErrNotAString = errors.New("top-level key is not a string")
+var (
+	// ErrKeyNotFound means the requested top-level key is absent.
+	ErrKeyNotFound = errors.New("top-level key not found")
+	// ErrNotAString means the requested key exists but does not hold a string.
+	ErrNotAString = errors.New("top-level key is not a string")
+	// ErrDuplicateKey means a top-level key appears more than once. JSON parsers
+	// disagree about which occurrence wins, so a body that relies on it would be
+	// read one way here and another way upstream — a discrepancy that could let
+	// an authorization check and the request it authorizes disagree about the
+	// model being called.
+	ErrDuplicateKey = errors.New("duplicate top-level key")
+)
 
 // Fields carries the few request fields the gateway needs in order to route.
 // Everything else stays opaque and is forwarded untouched.
@@ -37,26 +42,40 @@ type Fields struct {
 	HasDisableFallbacks bool
 }
 
-// Peek extracts the top-level "model" and "stream" fields without materializing
-// the rest of the document. Nested occurrences of those names are ignored.
+// member is one key/value pair of the root object.
+type member struct {
+	key string
+	// raw is the value's bytes, exactly as they appear in the document.
+	raw json.RawMessage
+	// start and end bound the value within the original document.
+	start, end int64
+	// keyStart is the offset of the key's opening quote.
+	keyStart int64
+}
+
+// Peek extracts the top-level fields the router needs, without materializing the
+// rest of the document.
 func Peek(body []byte) (Fields, error) {
 	var out Fields
-	err := walkTopLevel(body, func(key string, value json.Token, _, _ int64) (bool, error) {
-		switch key {
+	err := walkTopLevel(body, func(m member) error {
+		switch m.key {
 		case "model":
-			if s, ok := value.(string); ok {
+			var s string
+			if json.Unmarshal(m.raw, &s) == nil {
 				out.Model = s
 			}
 		case "stream":
-			if b, ok := value.(bool); ok {
+			var b bool
+			if json.Unmarshal(m.raw, &b) == nil {
 				out.Stream, out.HasStream = b, true
 			}
 		case "disable_fallbacks":
-			if b, ok := value.(bool); ok {
+			var b bool
+			if json.Unmarshal(m.raw, &b) == nil {
 				out.DisableFallbacks, out.HasDisableFallbacks = b, true
 			}
 		}
-		return false, nil
+		return nil
 	})
 	if err != nil {
 		return Fields{}, fmt.Errorf("peek request body: %w", err)
@@ -66,38 +85,19 @@ func Peek(body []byte) (Fields, error) {
 
 // SetTopLevelString replaces the string value of a top-level key, leaving every
 // other byte of the document identical. Only the root object's own keys are
-// considered, so a nested object that happens to contain the same key name is
-// never touched.
+// considered, so a nested object carrying the same key name is never touched.
 func SetTopLevelString(body []byte, key, value string) ([]byte, error) {
-	var valStart, valEnd int64
-	isString := false
-	found := false
+	var start, end int64
+	found, isString := false, false
 
-	// Do not stop at the first match. encoding/json — and therefore every
-	// upstream and this package's own Peek — resolves a duplicated top-level
-	// key to its LAST occurrence, so rewriting the first would leave the
-	// caller's original value authoritative and silently defeat the rewrite.
-	err := walkTopLevel(body, func(k string, v json.Token, afterKey, end int64) (bool, error) {
-		if k != key {
-			return false, nil
+	err := walkTopLevel(body, func(m member) error {
+		if m.key != key {
+			return nil
 		}
 		found = true
-		if _, ok := v.(string); !ok {
-			isString = false
-			return false, nil
-		}
-		isString = true
-		valEnd = end
-		// Between the end of the key and the start of its value there is only a
-		// colon and optional whitespace, so the first quote after the key opens
-		// the value.
-		rel := bytes.IndexByte(body[afterKey:end], '"')
-		if rel < 0 {
-			isString = false
-			return false, nil
-		}
-		valStart = afterKey + int64(rel)
-		return false, nil
+		start, end = m.start, m.end
+		isString = len(m.raw) > 0 && m.raw[0] == '"'
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("set %q: %w", key, err)
@@ -114,121 +114,26 @@ func SetTopLevelString(body []byte, key, value string) ([]byte, error) {
 		return nil, fmt.Errorf("set %q: encode replacement: %w", key, err)
 	}
 
-	out := make([]byte, 0, len(body)-int(valEnd-valStart)+len(encoded))
-	out = append(out, body[:valStart]...)
+	out := make([]byte, 0, len(body)-int(end-start)+len(encoded))
+	out = append(out, body[:start]...)
 	out = append(out, encoded...)
-	out = append(out, body[valEnd:]...)
+	out = append(out, body[end:]...)
 	return out, nil
 }
 
-// visitFn is called for each key of the root object. value is the decoded scalar
-// value, or nil when the value is a nested object or array. afterKey and valEnd
-// bound the region of the document between the end of the key token and the end
-// of the value, which is where a scalar value's raw bytes lie. Returning true
-// stops the walk.
-type visitFn func(key string, value json.Token, afterKey, valEnd int64) (bool, error)
-
-// walkTopLevel scans a JSON document, invoking visit for each key of the root
-// object. It tracks container nesting itself and reads values itself, so keys
-// inside nested objects and arrays are never mistaken for top-level ones and the
-// nesting state cannot be corrupted by a callback.
-func walkTopLevel(body []byte, visit visitFn) error {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.UseNumber()
-
-	// stack records enclosing containers; expectKey is true when the next token
-	// in the innermost container is an object key rather than a value.
-	var stack []json.Delim
-	expectKey := false
-
-	push := func(d json.Delim) {
-		stack = append(stack, d)
-		expectKey = d == '{'
-	}
-
-	for {
-		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-
-		if d, ok := tok.(json.Delim); ok {
-			switch d {
-			case '{', '[':
-				push(d)
-			case '}', ']':
-				if len(stack) == 0 {
-					return errors.New("malformed JSON: unbalanced delimiter")
-				}
-				stack = stack[:len(stack)-1]
-				expectKey = len(stack) > 0 && stack[len(stack)-1] == '{'
-			}
-			continue
-		}
-
-		inObject := len(stack) > 0 && stack[len(stack)-1] == '{'
-		if !expectKey || !inObject {
-			// A scalar value. Inside an object the next token is a key again.
-			expectKey = inObject
-			continue
-		}
-
-		key, ok := tok.(string)
-		if !ok {
-			return errors.New("malformed JSON: object key is not a string")
-		}
-		afterKey := dec.InputOffset()
-
-		if len(stack) != 1 {
-			// A key in a nested object: skip it and let its value be handled by
-			// the normal value path on the next iteration.
-			expectKey = false
-			continue
-		}
-
-		// Root-level key. Read its value here so that nesting state stays
-		// consistent no matter what the callback does.
-		vtok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		if d, ok := vtok.(json.Delim); ok {
-			push(d)
-			if stop, err := visit(key, nil, afterKey, dec.InputOffset()); err != nil || stop {
-				return err
-			}
-			continue
-		}
-		valEnd := dec.InputOffset()
-		if stop, err := visit(key, vtok, afterKey, valEnd); err != nil || stop {
-			return err
-		}
-		// Back to expecting the next key of the root object.
-		expectKey = true
-	}
-}
-
 // DeleteTopLevelKey removes a top-level key and its value, leaving the rest of
-// the document byte-identical. It is used to strip gateway control fields from a
-// body before it is forwarded upstream.
+// the document byte-identical. It strips gateway control fields from a body
+// before it is forwarded upstream.
 func DeleteTopLevelKey(body []byte, key string) ([]byte, error) {
 	var keyStart, valEnd int64
 	found := false
 
-	err := walkTopLevel(body, func(k string, _ json.Token, afterKey, end int64) (bool, error) {
-		if k != key {
-			return false, nil
+	err := walkTopLevel(body, func(m member) error {
+		if m.key != key {
+			return nil
 		}
-		// Walk back from the key token to its opening quote.
-		rel := bytes.LastIndexByte(body[:afterKey-1], '"')
-		if rel < 0 {
-			return false, nil
-		}
-		keyStart, valEnd, found = int64(rel), end, true
-		return false, nil
+		keyStart, valEnd, found = m.keyStart, m.end, true
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("delete %q: %w", key, err)
@@ -242,10 +147,9 @@ func DeleteTopLevelKey(body []byte, key string) ([]byte, error) {
 	for start > 0 && isJSONSpace(body[start-1]) {
 		start--
 	}
-	switch {
-	case start > 0 && body[start-1] == ',':
+	if start > 0 && body[start-1] == ',' {
 		start--
-	default:
+	} else {
 		for int(end) < len(body) && isJSONSpace(body[end]) {
 			end++
 		}
@@ -258,6 +162,148 @@ func DeleteTopLevelKey(body []byte, key string) ([]byte, error) {
 	out = append(out, body[:start]...)
 	out = append(out, body[end:]...)
 	return out, nil
+}
+
+// walkTopLevel visits each member of the root object in order.
+//
+// Value extents are found by scanning rather than by decoding, so a nested array
+// of messages or tool definitions is stepped over without being copied or
+// tokenized. On a large request body that is the difference between touching a
+// handful of keys and materializing megabytes the gateway never reads.
+//
+// The document is validated up front, which lets the scanner below assume
+// well-formed input and stay simple.
+func walkTopLevel(body []byte, visit func(member) error) error {
+	if !json.Valid(body) {
+		return errors.New("body is not valid JSON")
+	}
+
+	i := skipSpace(body, 0)
+	if i >= len(body) || body[i] != '{' {
+		return errors.New("body is not a JSON object")
+	}
+	i++
+
+	seen := make(map[string]bool)
+	for {
+		i = skipSpace(body, i)
+		if i >= len(body) {
+			return errors.New("unterminated object")
+		}
+		if body[i] == '}' {
+			return nil
+		}
+		if body[i] == ',' {
+			i++
+			continue
+		}
+		if body[i] != '"' {
+			return errors.New("malformed JSON: object key is not a string")
+		}
+
+		keyStart := int64(i)
+		keyEnd, err := scanString(body, i)
+		if err != nil {
+			return err
+		}
+		var key string
+		if err := json.Unmarshal(body[i:keyEnd], &key); err != nil {
+			return fmt.Errorf("decode object key: %w", err)
+		}
+		if seen[key] {
+			return fmt.Errorf("%q: %w", key, ErrDuplicateKey)
+		}
+		seen[key] = true
+
+		i = skipSpace(body, keyEnd)
+		if i >= len(body) || body[i] != ':' {
+			return errors.New("malformed JSON: missing ':' after object key")
+		}
+		i = skipSpace(body, i+1)
+
+		valEnd, err := scanValue(body, i)
+		if err != nil {
+			return err
+		}
+		if err := visit(member{
+			key:      key,
+			raw:      body[i:valEnd],
+			start:    int64(i),
+			end:      int64(valEnd),
+			keyStart: keyStart,
+		}); err != nil {
+			return err
+		}
+		i = valEnd
+	}
+}
+
+// skipSpace advances past JSON insignificant whitespace.
+func skipSpace(b []byte, i int) int {
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
+	}
+	return i
+}
+
+// scanString returns the index just past a string that starts at b[i].
+func scanString(b []byte, i int) (int, error) {
+	if i >= len(b) || b[i] != '"' {
+		return 0, errors.New("malformed JSON: expected a string")
+	}
+	for j := i + 1; j < len(b); j++ {
+		switch b[j] {
+		case '\\':
+			j++ // skip the escaped byte
+		case '"':
+			return j + 1, nil
+		}
+	}
+	return 0, errors.New("malformed JSON: unterminated string")
+}
+
+// scanValue returns the index just past the value starting at b[i]. The document
+// is known to be valid, so this only needs to find the value's extent: it tracks
+// container depth and string state, and steps over everything else.
+func scanValue(b []byte, i int) (int, error) {
+	if i >= len(b) {
+		return 0, errors.New("malformed JSON: missing value")
+	}
+
+	switch b[i] {
+	case '"':
+		return scanString(b, i)
+	case '{', '[':
+		depth := 0
+		for j := i; j < len(b); j++ {
+			switch b[j] {
+			case '"':
+				end, err := scanString(b, j)
+				if err != nil {
+					return 0, err
+				}
+				j = end - 1
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return j + 1, nil
+				}
+			}
+		}
+		return 0, errors.New("malformed JSON: unterminated container")
+	default:
+		// A number, or one of true/false/null: it ends at the first byte that
+		// cannot continue a scalar.
+		for j := i; j < len(b); j++ {
+			switch b[j] {
+			case ',', '}', ']', ' ', '\t', '\n', '\r':
+				return j, nil
+			}
+		}
+		return len(b), nil
+	}
 }
 
 // isJSONSpace reports whether c is JSON insignificant whitespace.

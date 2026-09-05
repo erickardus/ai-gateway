@@ -39,11 +39,10 @@ type Router struct {
 	now func() time.Time
 }
 
-// Options configures a Router. Seed and Now exist so tests can make selection
-// and timing deterministic.
+// Options configures a Router. Seed makes selection deterministic in tests;
+// timing determinism comes from testing/synctest, so there is no clock seam.
 type Options struct {
 	Seed uint64
-	Now  func() time.Time
 }
 
 // New builds a Router from validated configuration.
@@ -51,9 +50,6 @@ func New(cfg *config.Config, state StateStore, exec Executor, log *slog.Logger, 
 	strategy, err := NewStrategy(cfg.Router)
 	if err != nil {
 		return nil, err
-	}
-	if opts.Now == nil {
-		opts.Now = time.Now
 	}
 	seed := opts.Seed
 	if seed == 0 {
@@ -67,7 +63,7 @@ func New(cfg *config.Config, state StateStore, exec Executor, log *slog.Logger, 
 		exec:     exec,
 		log:      log,
 		rnd:      rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)),
-		now:      opts.Now,
+		now:      time.Now,
 	}, nil
 }
 
@@ -78,6 +74,9 @@ func (r *Router) rand() *rand.Rand {
 	defer r.rndMu.Unlock()
 	return rand.New(rand.NewPCG(r.rnd.Uint64(), r.rnd.Uint64()))
 }
+
+// Strategy returns the name of the active routing strategy.
+func (r *Router) Strategy() string { return r.strategy.Name() }
 
 // Groups returns the configured model group names.
 func (r *Router) Groups() map[string][]*config.Deployment { return r.groups }
@@ -161,9 +160,6 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 			if firstErr != nil {
 				return nil, firstErr
 			}
-			if len(failed) == 0 && !overrides.AllowPassthrough && allPassthrough(deployments) {
-				return nil, fmt.Errorf("model %q is served only by passthrough deployments: %w", model, core.ErrPassthroughNotAllowed)
-			}
 			return nil, fmt.Errorf("model %q: %w", model, err)
 		}
 
@@ -199,9 +195,12 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 // only consumed for the deployment actually dispatched to, so filtering never
 // spends budget on candidates that go unused.
 func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) (*config.Deployment, error) {
-	candidates, err := r.candidates(ctx, deployments, failed, overrides, format)
+	candidates, why, err := r.candidates(ctx, deployments, failed, overrides, format)
 	if err != nil {
 		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, why.err()
 	}
 
 	for len(candidates) > 0 {
@@ -229,7 +228,7 @@ func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, fai
 // hasUntried reports whether any deployment outside the failed set could still
 // serve this request. It does not consume capacity.
 func (r *Router) hasUntried(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) bool {
-	candidates, err := r.candidates(ctx, deployments, failed, overrides, format)
+	candidates, _, err := r.candidates(ctx, deployments, failed, overrides, format)
 	return err == nil && len(candidates) > 0
 }
 
@@ -252,46 +251,41 @@ func (r *Router) attempt(ctx context.Context, dep *config.Deployment, req *provi
 	// completion would be severed mid-stream after the status line had already
 	// been sent. A non-streaming request has no such distinction, so its
 	// deadline covers the entire exchange.
-	headerTimeout, bodyTimeout := r.cfg.Timeout, time.Duration(0)
+	deadline := r.cfg.Timeout
 	if req.Stream {
-		headerTimeout, bodyTimeout = r.cfg.StreamTimeout, 0
-	}
-	if overrides.Timeout != nil {
-		bodyTimeout = *overrides.Timeout
-		if !req.Stream {
-			headerTimeout = *overrides.Timeout
+		deadline = r.cfg.StreamTimeout
+		if overrides.StreamTimeout != nil {
+			deadline = *overrides.StreamTimeout
 		}
+	} else if overrides.Timeout != nil {
+		deadline = *overrides.Timeout
 	}
-	if req.Stream && overrides.StreamTimeout != nil {
-		headerTimeout = *overrides.StreamTimeout
-	}
-	_ = bodyTimeout
 
-	// The attempt context lives until the body is closed; a separate timer
-	// enforces the header deadline and is stopped as soon as headers arrive.
+	// The attempt context lives until the body is closed; a timer enforces the
+	// deadline against it. For a streaming response the timer is stopped once
+	// headers arrive so the body may run as long as it needs; for a
+	// non-streaming one it keeps running and so bounds the whole exchange.
 	attemptCtx, cancel := context.WithCancel(ctx)
-	var headerTimer *time.Timer
-	if headerTimeout > 0 {
-		headerTimer = time.AfterFunc(headerTimeout, cancel)
+	var timer *time.Timer
+	if deadline > 0 {
+		timer = time.AfterFunc(deadline, cancel)
 	}
-	stopHeaderTimer := func() {
-		if headerTimer != nil {
-			headerTimer.Stop()
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
 		}
 	}
 
 	if err := r.state.BeginRequest(ctx, dep.ID()); err != nil {
-		stopHeaderTimer()
+		stopTimer()
 		cancel()
 		return nil, fmt.Errorf("begin request: %w", err)
 	}
 	start := r.now()
 
 	resp, err := r.exec.Do(attemptCtx, dep, req)
-	// Headers have either arrived or failed; either way the header deadline no
-	// longer applies.
-	stopHeaderTimer()
 	if err != nil {
+		stopTimer()
 		// The attempt is over, so release both the in-flight slot and the
 		// context before returning.
 		_ = r.state.EndRequest(ctx, dep.ID(), r.now().Sub(start), false)
@@ -309,10 +303,15 @@ func (r *Router) attempt(ctx context.Context, dep *config.Deployment, req *provi
 	// from the client's, so an aborted request still records its completion —
 	// otherwise the in-flight count would drift upward and starve the
 	// deployment under least-busy routing.
+	if req.Stream {
+		// The stream may now run for as long as the completion takes.
+		stopTimer()
+	}
 	release := context.WithoutCancel(ctx)
 	resp.Body = &trackedBody{
 		readCloser: resp.Body,
 		onClose: func() {
+			stopTimer()
 			_ = r.state.EndRequest(release, dep.ID(), r.now().Sub(start), true)
 			cancel()
 		},
@@ -336,16 +335,48 @@ func (r *Router) sleep(ctx context.Context, d time.Duration) error {
 }
 
 // candidates filters a group down to the deployments eligible right now.
-func (r *Router) candidates(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) ([]*config.Deployment, error) {
+// rejection counts why deployments were filtered out, so the caller can report
+// the real cause instead of reconstructing it afterwards. Guessing produced the
+// wrong error in a mixed group: a key without passthrough permission, arriving
+// while the other deployment was cooling down, was told there was no healthy
+// deployment rather than that its key lacked a permission.
+type rejection struct {
+	passthrough int
+	format      int
+	cooldown    int
+	capacity    int
+	total       int
+}
+
+// err returns the most informative error for a fully rejected candidate set.
+func (r rejection) err() error {
+	switch {
+	case r.total == 0:
+		return core.ErrNoHealthyDeployment
+	case r.passthrough == r.total:
+		return fmt.Errorf("every deployment requires passthrough permission: %w", core.ErrPassthroughNotAllowed)
+	case r.format == r.total:
+		return fmt.Errorf("no deployment speaks the requested wire format: %w", core.ErrNoHealthyDeployment)
+	case r.capacity == r.total:
+		return fmt.Errorf("every deployment is at its rate limit: %w", core.ErrRateLimited)
+	default:
+		return core.ErrNoHealthyDeployment
+	}
+}
+
+func (r *Router) candidates(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) ([]*config.Deployment, rejection, error) {
 	now := r.now()
+	var why rejection
 	out := make([]*config.Deployment, 0, len(deployments))
 	for _, d := range deployments {
 		if failed[d.ID()] {
 			continue
 		}
+		why.total++
 		// A passthrough deployment forwards the caller's own credential, so it
 		// is only offered to keys explicitly permitted to use one.
 		if d.Params.AuthMode == core.AuthModePassthrough && !overrides.AllowPassthrough {
+			why.passthrough++
 			continue
 		}
 		// The gateway does not translate between wire formats, so an ingress
@@ -353,27 +384,30 @@ func (r *Router) candidates(ctx context.Context, deployments []*config.Deploymen
 		// could relay an Anthropic body — and, on a passthrough deployment, the
 		// caller's Anthropic credential — to a different vendor's host.
 		if format != "" && d.Params.Format != format {
+			why.format++
 			continue
 		}
 		cooling, err := r.state.InCooldown(ctx, d.ID(), now)
 		if err != nil {
-			return nil, fmt.Errorf("check cooldown: %w", err)
+			return nil, why, fmt.Errorf("check cooldown: %w", err)
 		}
 		if cooling {
+			why.cooldown++
 			continue
 		}
 		if d.RPM > 0 || d.TPM > 0 {
 			ok, err := r.state.Allow(ctx, d.ID(), d.RPM, d.TPM)
 			if err != nil {
-				return nil, fmt.Errorf("check capacity: %w", err)
+				return nil, why, fmt.Errorf("check capacity: %w", err)
 			}
 			if !ok {
+				why.capacity++
 				continue
 			}
 		}
 		out = append(out, d)
 	}
-	return out, nil
+	return out, why, nil
 }
 
 // RecordUsage attributes token usage to the deployment that served a request.
@@ -495,15 +529,4 @@ func (r *Router) DeploymentStatus(ctx context.Context, id string) (cooling bool,
 		r.log.Warn("read in-flight for health", "deployment", id, "error", err)
 	}
 	return cooling, inFlight
-}
-
-// allPassthrough reports whether every deployment in a group relays the caller's
-// own credential.
-func allPassthrough(deployments []*config.Deployment) bool {
-	for _, d := range deployments {
-		if d.Params.AuthMode != core.AuthModePassthrough {
-			return false
-		}
-	}
-	return len(deployments) > 0
 }

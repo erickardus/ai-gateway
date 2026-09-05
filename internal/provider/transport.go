@@ -56,7 +56,11 @@ type Client struct {
 
 // NewClient builds a Client. allowedHosts bounds where a passthrough deployment
 // may relay a caller credential.
-func NewClient(keyHeaderNames, allowedHosts []string, timeout time.Duration) *Client {
+//
+// There is deliberately no timeout parameter: a client-level timeout would apply
+// to the whole exchange including a streaming body, so deadlines are carried on
+// the per-attempt request context instead.
+func NewClient(keyHeaderNames, allowedHosts []string) *Client {
 	allowed := make(map[string]bool, len(allowedHosts))
 	for _, h := range allowedHosts {
 		allowed[config.NormalizeHost(h)] = true

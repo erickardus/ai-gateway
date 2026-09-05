@@ -165,30 +165,53 @@ func FuzzSetTopLevelString(f *testing.F) {
 	})
 }
 
-// encoding/json resolves a duplicated top-level key to its LAST occurrence, so
-// Peek and SetTopLevelString must both agree on that one, or the rewrite is
-// silently defeated by the caller's original value.
-func TestDuplicateKeyLastOccurrenceWins(t *testing.T) {
-	in := []byte(`{"model":"public-a","max_tokens":1,"model":"public-b"}`)
+// A duplicated top-level key is rejected outright. Parsers disagree about which
+// occurrence wins, so a body relying on it could be authorized against one model
+// and executed against another.
+func TestDuplicateTopLevelKeyRejected(t *testing.T) {
+	in := []byte(`{"model":"allowed","max_tokens":1,"model":"forbidden"}`)
 
-	f, err := Peek(in)
-	if err != nil {
-		t.Fatalf("Peek: %v", err)
+	if _, err := Peek(in); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("Peek: got %v, want ErrDuplicateKey", err)
 	}
-	if f.Model != "public-b" {
-		t.Fatalf("Peek returned %q, want the last occurrence", f.Model)
+	if _, err := SetTopLevelString(in, "model", "x"); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("SetTopLevelString: got %v, want ErrDuplicateKey", err)
+	}
+	if _, err := DeleteTopLevelKey(in, "model"); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("DeleteTopLevelKey: got %v, want ErrDuplicateKey", err)
 	}
 
-	out, err := SetTopLevelString(in, "model", "upstream-x")
+	// A duplicate nested inside a value is ordinary data and must be allowed.
+	nested := []byte(`{"messages":[{"model":"a","model":"b"}],"model":"real"}`)
+	f, err := Peek(nested)
 	if err != nil {
-		t.Fatalf("SetTopLevelString: %v", err)
+		t.Fatalf("nested duplicate should be fine: %v", err)
 	}
-	var check map[string]any
-	if err := json.Unmarshal(out, &check); err != nil {
-		t.Fatalf("result is not valid JSON: %v", err)
+	if f.Model != "real" {
+		t.Errorf("Model = %q, want real", f.Model)
 	}
-	if check["model"] != "upstream-x" {
-		t.Errorf("upstream would see model=%v, want upstream-x", check["model"])
+}
+
+// Nested containers are skipped in bulk rather than tokenized, so a large body
+// costs little more than a small one.
+func BenchmarkPeekLargeBody(b *testing.B) {
+	var buf bytes.Buffer
+	buf.WriteString(`{"model":"claude-sonnet","stream":true,"messages":[`)
+	for i := range 20000 {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(`{"role":"user","content":"some reasonably long message content here"}`)
+	}
+	buf.WriteString(`]}`)
+	body := buf.Bytes()
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := Peek(body); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

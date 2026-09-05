@@ -6,10 +6,44 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
 type requestIDKey struct{}
+
+type infoKey struct{}
+
+// requestInfo is a mutable holder planted by the outermost middleware and filled
+// in by the handler. A handler cannot pass values back through its own
+// r.WithContext, because that replaces only its local copy of the request, so
+// the access log would never see them.
+type requestInfo struct {
+	mu       sync.Mutex
+	keyLabel string
+	model    string
+}
+
+func (i *requestInfo) set(keyLabel, model string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.keyLabel, i.model = keyLabel, model
+}
+
+func (i *requestInfo) get() (string, string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.keyLabel, i.model
+}
+
+// AnnotateRequest records who is calling and what they asked for, so the access
+// log can attribute a request without the credential itself reaching a log line.
+// It is a no-op when the middleware chain is not installed.
+func AnnotateRequest(ctx context.Context, keyLabel, model string) {
+	if info, ok := ctx.Value(infoKey{}).(*requestInfo); ok {
+		info.set(keyLabel, model)
+	}
+}
 
 // RequestIDFrom returns the request ID assigned by the middleware.
 func RequestIDFrom(ctx context.Context) string {
@@ -60,7 +94,9 @@ func (s *Server) withRequestID(next http.Handler) http.Handler {
 			id = "req-" + hex.EncodeToString(buf)
 		}
 		w.Header().Set("x-gateway-request-id", id)
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
+		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
+		ctx = context.WithValue(ctx, infoKey{}, &requestInfo{})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -95,12 +131,23 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 
+		// r.Context() is read after the handler runs, so values the handler
+		// added — the key label in particular — are visible here.
+		ctx := r.Context()
 		attrs := []any{
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
 			"duration_ms", time.Since(start).Milliseconds(),
-			"request_id", RequestIDFrom(r.Context()),
+			"request_id", RequestIDFrom(ctx),
+		}
+		if info, ok := ctx.Value(infoKey{}).(*requestInfo); ok {
+			if label, model := info.get(); label != "" {
+				attrs = append(attrs, "key", label)
+				if model != "" {
+					attrs = append(attrs, "model", model)
+				}
+			}
 		}
 		level := slog.LevelInfo
 		if rec.status >= 500 {
@@ -108,6 +155,6 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 		} else if rec.status >= 400 {
 			level = slog.LevelWarn
 		}
-		s.log.Log(r.Context(), level, "request", attrs...)
+		s.log.Log(ctx, level, "request", attrs...)
 	})
 }

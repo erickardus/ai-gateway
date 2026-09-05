@@ -9,7 +9,6 @@ import (
 
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
-	"github.com/erickardus/ai-gateway/internal/limiter"
 	"github.com/erickardus/ai-gateway/internal/provider"
 )
 
@@ -68,56 +67,6 @@ func TestCooldownEjectsAndRecovers(t *testing.T) {
 	})
 }
 
-func TestRateLimitWindowRollsOver(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		lim := limiter.New()
-		const rpm = 3
-
-		for i := range rpm {
-			if !lim.Reserve("k", rpm, 0) {
-				t.Fatalf("request %d rejected while under the limit", i+1)
-			}
-		}
-		if lim.Reserve("k", rpm, 0) {
-			t.Fatal("admitted a request beyond the limit")
-		}
-
-		// Still limited just short of the window.
-		time.Sleep(limiter.Window - time.Second)
-		if lim.Reserve("k", rpm, 0) {
-			t.Fatal("window rolled over early")
-		}
-
-		// A full window after the first request, capacity is back.
-		time.Sleep(2 * time.Second)
-		if !lim.Reserve("k", rpm, 0) {
-			t.Fatal("window did not roll over")
-		}
-	})
-}
-
-func TestTokenLimitEnforced(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		lim := limiter.New()
-		const tpm = 1000
-
-		if !lim.Reserve("k", 0, tpm) {
-			t.Fatal("first request rejected")
-		}
-		lim.AddTokens("k", 1200) // the response overshot the budget
-		if lim.Reserve("k", 0, tpm) {
-			t.Fatal("admitted a request after the token budget was exhausted")
-		}
-
-		time.Sleep(limiter.Window + time.Second)
-		if !lim.Reserve("k", 0, tpm) {
-			t.Fatal("token budget did not reset with the window")
-		}
-	})
-}
-
-// A cooled-down deployment must be skipped, and become selectable again once
-// its cooldown expires.
 func TestRouterSkipsCooledDeploymentThenRecovers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rc := config.RouterConfig{

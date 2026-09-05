@@ -134,13 +134,3 @@ func (s *usageSniffer) scanLine(line []byte) {
 		s.usage.OutputTokens = out
 	}
 }
-
-// SniffUsage extracts usage from a complete, non-streaming response body.
-func SniffUsage(body []byte) core.Usage {
-	s := newUsageSniffer()
-	s.scanLine(bytes.TrimSpace(body))
-	return s.usage
-}
-
-// observedUsage exposes what a sniffer has seen, for tests.
-func (s *usageSniffer) observedUsage() core.Usage { return s.usage }

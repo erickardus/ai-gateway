@@ -1,6 +1,11 @@
 package config
 
-import "time"
+import (
+	"slices"
+	"time"
+
+	"github.com/erickardus/ai-gateway/internal/core"
+)
 
 // Default values. Several deliberately differ from LiteLLM: its effective
 // cooldown of 5s is too twitchy for real upstreams, and its rpm/tpm fields are
@@ -83,9 +88,7 @@ func (c *Config) applyDefaults() {
 
 	v := &c.VirtualKeys
 	if len(v.HeaderNames) == 0 {
-		// x-litellm-api-key is accepted for drop-in compatibility with tooling
-		// already configured for a LiteLLM proxy.
-		v.HeaderNames = []string{"x-gateway-key", "x-litellm-api-key"}
+		v.HeaderNames = slices.Clone(core.DefaultKeyHeaderNames)
 	}
 	if v.Store.Kind == "" {
 		v.Store.Kind = "memory"

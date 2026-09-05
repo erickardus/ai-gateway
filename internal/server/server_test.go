@@ -17,6 +17,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/provider"
 	"github.com/erickardus/ai-gateway/internal/router"
+	"github.com/erickardus/ai-gateway/internal/testutil"
 )
 
 const testVirtualKey = "sk-vk-TESTKEY"
@@ -50,24 +51,7 @@ type harness struct {
 	gateway  http.Handler
 	upstream *httptest.Server
 	seen     *captured
-	logBuf   *lockedBuffer
-}
-
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
+	logBuf   *testutil.SyncWriter
 }
 
 type harnessOpts struct {
@@ -76,6 +60,7 @@ type harnessOpts struct {
 	upstream         http.HandlerFunc
 	masterKey        string
 	maxBodyBytes     int64
+	rpmLimit         int
 }
 
 func intPtr(n int) *int { return &n }
@@ -127,7 +112,8 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 			HeaderNames:          []string{"x-gateway-key", "x-litellm-api-key"},
 			AllowedUpstreamHosts: []string{config.HostOf(upstream.URL)},
 			Keys: []config.KeySpec{{
-				Key: testVirtualKey, Alias: "test-key", AllowPassthrough: opts.allowPassthrough,
+				Key: testVirtualKey, Alias: "test-key",
+				AllowPassthrough: opts.allowPassthrough, RPMLimit: opts.rpmLimit,
 			}},
 		},
 	}
@@ -141,7 +127,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		cfg.Server.MaxBodyBytes = opts.maxBodyBytes
 	}
 
-	logBuf := &lockedBuffer{}
+	logBuf := testutil.NewSyncWriter()
 	log := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	store := auth.NewMemStore()
@@ -149,7 +135,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
-	client := provider.NewClient(cfg.VirtualKeys.HeaderNames, cfg.VirtualKeys.AllowedUpstreamHosts, 0)
+	client := provider.NewClient(cfg.VirtualKeys.HeaderNames, cfg.VirtualKeys.AllowedUpstreamHosts)
 	rtr, err := router.New(cfg, router.NewMemState(), client, log, router.Options{Seed: 1})
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
@@ -507,5 +493,56 @@ func TestOversizedBodyIsRejected(t *testing.T) {
 	}
 	if n := len(h.seen.body); n != 0 {
 		t.Error("an oversized body was forwarded upstream")
+	}
+}
+
+// Rate limit must be charged only to requests the gateway will actually
+// dispatch, or a key is billed for its own rejected requests.
+func TestRateLimitNotChargedForRejectedRequests(t *testing.T) {
+	h := newHarness(t, harnessOpts{allowPassthrough: true, rpmLimit: 3})
+
+	// Requests for an unknown model must not consume the key's budget.
+	for range 10 {
+		rec := h.do(t, claudeCodeRequest("/v1/messages", `{"model":"no-such-model","messages":[]}`))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+	}
+	// Model discovery must not consume it either.
+	for range 5 {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("x-gateway-key", testVirtualKey)
+		if rec := h.do(t, req); rec.Code != http.StatusOK {
+			t.Fatalf("/v1/models = %d", rec.Code)
+		}
+	}
+
+	// The full budget must still be available for real requests.
+	for i := range 3 {
+		rec := h.do(t, claudeCodeRequest("/v1/messages", `{"model":"anthropic-claude","messages":[]}`))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("dispatched request %d = %d, want 200; budget was consumed by rejected requests", i+1, rec.Code)
+		}
+	}
+	// And the limit still applies.
+	if rec := h.do(t, claudeCodeRequest("/v1/messages", `{"model":"anthropic-claude","messages":[]}`)); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429 once the budget is spent", rec.Code)
+	}
+}
+
+// The access log must identify the calling key without the credential itself
+// ever appearing in a log line.
+func TestAccessLogIdentifiesKeyWithoutLeakingIt(t *testing.T) {
+	h := newHarness(t, harnessOpts{allowPassthrough: true})
+	h.do(t, claudeCodeRequest("/v1/messages", `{"model":"anthropic-claude","messages":[]}`))
+
+	logs := h.logBuf.String()
+	if !strings.Contains(logs, "test-key") {
+		t.Errorf("the access log does not identify the calling key:\n%s", logs)
+	}
+	for _, secret := range []string{testVirtualKey, "sk-ant-oat01-SUBSCRIPTION"} {
+		if strings.Contains(logs, secret) {
+			t.Errorf("a credential leaked into the logs: %q", secret)
+		}
 	}
 }

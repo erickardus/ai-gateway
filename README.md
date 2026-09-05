@@ -67,7 +67,7 @@ claude    # /login → "Claude account with subscription"
 | `POST /v1/chat/completions` | OpenAI Chat Completions API. |
 | `GET /v1/models` | Model discovery. Served directly — never redirects. |
 | `HEAD /api/hello` | Connection-warming probe. |
-| `GET /health` | Per-deployment status. Requires a key: it discloses upstream hosts. |
+| `GET /health` | Per-deployment status and the active strategy. Requires a key: it discloses upstream hosts. |
 | `GET /health/liveliness`, `/health/readiness` | Probes, unauthenticated. |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | Key management, master-key only. |
 

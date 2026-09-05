@@ -26,7 +26,6 @@ type Authenticator struct {
 	headerNames []string
 	masterKey   string
 	limits      *limiter.Limiter
-	now         func() time.Time
 }
 
 // NewAuthenticator builds an Authenticator and seeds the store with the keys
@@ -38,7 +37,6 @@ func NewAuthenticator(ctx context.Context, store KeyStore, cfg config.VirtualKey
 		headerNames: cfg.HeaderNames,
 		masterKey:   cfg.MasterKey,
 		limits:      limiter.New(),
-		now:         time.Now,
 	}
 	for i, spec := range cfg.Keys {
 		k := &core.Key{
@@ -96,13 +94,24 @@ func (a *Authenticator) Authenticate(ctx context.Context, h http.Header) (*Conte
 	if err != nil {
 		return nil, core.ErrKeyInvalid
 	}
-	if err := key.Usable(a.now()); err != nil {
+	if err := key.Usable(time.Now()); err != nil {
 		return nil, err
 	}
-	if !a.limits.Reserve(key.Hash, key.RPMLimit, key.TPMLimit) {
-		return nil, core.ErrRateLimited
-	}
 	return &Context{Key: key, Credentials: creds}, nil
+}
+
+// Admit charges one request against the key's rate limits. It is deliberately
+// separate from Authenticate: charging at authentication time would bill a key
+// for requests the gateway then rejects for an unknown or forbidden model, and
+// would let model discovery consume inference budget.
+func (a *Authenticator) Admit(ac *Context) error {
+	if ac == nil || ac.Key == nil {
+		return core.ErrKeyInvalid
+	}
+	if !a.limits.Reserve(ac.Key.Hash, ac.Key.RPMLimit, ac.Key.TPMLimit) {
+		return core.ErrRateLimited
+	}
+	return nil
 }
 
 // AuthorizeModel checks that the authenticated key may call the named model

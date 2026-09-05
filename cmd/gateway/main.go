@@ -70,8 +70,15 @@ func run() error {
 		return fmt.Errorf("initialize authentication: %w", err)
 	}
 
+	state := router.NewMemState()
+	ids := make([]string, 0, len(cfg.ModelList))
+	for i := range cfg.ModelList {
+		ids = append(ids, cfg.ModelList[i].ID())
+	}
+	state.Prepare(ids)
+
 	client := newUpstreamClient(cfg)
-	rtr, err := router.New(cfg, router.NewMemState(), client, log, router.Options{})
+	rtr, err := router.New(cfg, state, client, log, router.Options{})
 	if err != nil {
 		return fmt.Errorf("initialize router: %w", err)
 	}
@@ -133,11 +140,7 @@ func newKeyStore(cfg config.VirtualKeysConfig) (auth.KeyStore, error) {
 
 // newUpstreamClient builds the HTTP client used for every upstream call.
 func newUpstreamClient(cfg *config.Config) *provider.Client {
-	return provider.NewClient(
-		cfg.VirtualKeys.HeaderNames,
-		cfg.VirtualKeys.AllowedUpstreamHosts,
-		cfg.Router.Timeout,
-	)
+	return provider.NewClient(cfg.VirtualKeys.HeaderNames, cfg.VirtualKeys.AllowedUpstreamHosts)
 }
 
 // newLogger builds the process logger. Credentials are never logged, so no
