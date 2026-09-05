@@ -106,9 +106,12 @@ unchanged, and translation is the opposite of that.
 
 ## Documentation
 
+- **[docs/architecture.md](docs/architecture.md)** — how it works and why
 - **[docs/claude-code.md](docs/claude-code.md)** — subscription passthrough setup
+- **[docs/configuration.md](docs/configuration.md)** — every config key, endpoint and status code
 - **[docs/routing.md](docs/routing.md)** — strategies, retries, cooldowns, fallbacks
-- **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics
+- **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics, caching
+- **[docs/roadmap.md](docs/roadmap.md)** — what is not built, and what is unverified
 
 ## Development
 
