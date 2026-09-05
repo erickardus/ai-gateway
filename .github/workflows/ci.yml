@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # The rstate tests exercise Lua atomicity and expiry semantics against a real
+    # server. They skip themselves when redis-server is absent, so CI installs it
+    # rather than quietly running a smaller suite than it appears to.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install redis-server for integration tests
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+      - name: Fuzz the JSON splicer briefly
+        run: go test ./internal/jsonx -run Fuzz -fuzz FuzzSetTopLevelString -fuzztime 30s

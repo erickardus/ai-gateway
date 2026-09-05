@@ -1,0 +1,336 @@
+package rstate
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"testing"
+	"time"
+
+	"github.com/erickardus/ai-gateway/internal/core"
+	"github.com/erickardus/ai-gateway/internal/router"
+	"github.com/erickardus/ai-gateway/internal/spend"
+)
+
+var redisAddr string
+
+// TestMain starts a real redis-server rather than a mock. The behaviour under
+// test is largely Lua atomicity and expiry semantics, which is exactly what a
+// mock reimplements approximately and where a divergence would hide a bug.
+func TestMain(m *testing.M) {
+	bin, err := exec.LookPath("redis-server")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "redis-server not found; skipping rstate integration tests")
+		os.Exit(0)
+	}
+
+	port := "6399"
+	cmd := exec.Command(bin, "--port", port, "--save", "", "--appendonly", "no")
+	cmd.Stdout, cmd.Stderr = nil, nil
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "could not start redis-server: %v\n", err)
+		os.Exit(0)
+	}
+	redisAddr = "127.0.0.1:" + port
+
+	// Wait for it to accept connections.
+	ready := false
+	for range 100 {
+		s := newStore(nil, "probe")
+		if s.Ping(context.Background()) == nil {
+			s.Close()
+			ready = true
+			break
+		}
+		s.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !ready {
+		cmd.Process.Kill()
+		fmt.Fprintln(os.Stderr, "redis-server did not become ready")
+		os.Exit(0)
+	}
+
+	code := m.Run()
+	cmd.Process.Kill()
+	cmd.Wait()
+	os.Exit(code)
+}
+
+func discard() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
+func newStore(t *testing.T, prefix string) *Store {
+	s := New(Options{Addr: redisAddr, KeyPrefix: prefix, Timeout: 2 * time.Second}, router.NewMemState(), discard())
+	if t != nil {
+		t.Cleanup(func() { s.Close() })
+	}
+	return s
+}
+
+// uniquePrefix keeps tests from colliding in the shared server.
+func uniquePrefix(t *testing.T) string {
+	return fmt.Sprintf("test:%s:%d", t.Name(), time.Now().UnixNano())
+}
+
+// The whole point: two instances must share one budget of requests.
+func TestRateLimitSharedAcrossInstances(t *testing.T) {
+	prefix := uniquePrefix(t)
+	a, b := newStore(t, prefix), newStore(t, prefix)
+	ctx := context.Background()
+
+	const rpm = 10
+	admitted := 0
+	for i := range 20 {
+		store := a
+		if i%2 == 1 {
+			store = b
+		}
+		ok, err := store.Reserve(ctx, "dep-1", rpm, 0)
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+		if ok {
+			admitted++
+		}
+	}
+	if admitted != rpm {
+		t.Errorf("admitted %d of 20 across two instances, want exactly %d: the limit is not shared", admitted, rpm)
+	}
+}
+
+// Allow must not consume budget, even across instances.
+func TestAllowDoesNotConsumeAcrossInstances(t *testing.T) {
+	prefix := uniquePrefix(t)
+	a, b := newStore(t, prefix), newStore(t, prefix)
+	ctx := context.Background()
+
+	for range 50 {
+		if ok, err := a.Allow(ctx, "dep-1", 5, 0); err != nil || !ok {
+			t.Fatalf("Allow = %v, %v", ok, err)
+		}
+	}
+	admitted := 0
+	for range 10 {
+		if ok, _ := b.Reserve(ctx, "dep-1", 5, 0); ok {
+			admitted++
+		}
+	}
+	if admitted != 5 {
+		t.Errorf("admitted %d, want 5: Allow consumed budget", admitted)
+	}
+}
+
+// A cooldown set by one instance must eject the deployment everywhere.
+func TestCooldownSharedAcrossInstances(t *testing.T) {
+	prefix := uniquePrefix(t)
+	a, b := newStore(t, prefix), newStore(t, prefix)
+	ctx, now := context.Background(), time.Now()
+
+	const allowed = 2
+	for range allowed + 1 {
+		if err := a.RecordFailure(ctx, "dep-1", now, allowed, 5*time.Second); err != nil {
+			t.Fatalf("RecordFailure: %v", err)
+		}
+	}
+
+	cooling, err := b.InCooldown(ctx, "dep-1", now)
+	if err != nil {
+		t.Fatalf("InCooldown: %v", err)
+	}
+	if !cooling {
+		t.Error("the second instance does not see the ejection")
+	}
+}
+
+// The counter must carry a TTL, or a crash between INCR and EXPIRE would leave
+// a deployment permanently at its limit.
+func TestRateLimitKeyExpires(t *testing.T) {
+	prefix := uniquePrefix(t)
+	s := newStore(t, prefix)
+	ctx := context.Background()
+
+	if _, err := s.Reserve(ctx, "dep-ttl", 5, 0); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	ttl, err := s.Client().TTL(ctx, s.windowKey("rpm", "dep-ttl")).Result()
+	if err != nil {
+		t.Fatalf("TTL: %v", err)
+	}
+	if ttl <= 0 || ttl > windowSeconds*time.Second {
+		t.Errorf("TTL = %v, want a positive value no greater than the window", ttl)
+	}
+}
+
+// Reserve must be atomic: concurrent callers cannot both take the last slot.
+func TestReserveIsAtomicUnderConcurrency(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	const limit = 25
+	stores := []*Store{newStore(t, prefix), newStore(t, prefix), newStore(t, prefix)}
+
+	results := make(chan bool, 300)
+	for i := range 300 {
+		go func(i int) {
+			ok, _ := stores[i%len(stores)].Reserve(ctx, "dep-race", limit, 0)
+			results <- ok
+		}(i)
+	}
+	admitted := 0
+	for range 300 {
+		if <-results {
+			admitted++
+		}
+	}
+	if admitted != limit {
+		t.Errorf("admitted %d of 300 concurrent requests, want exactly %d", admitted, limit)
+	}
+}
+
+// Budgets must hold across instances, or a key spends its allowance once per
+// replica — the failure this whole package exists to prevent.
+func TestBudgetSharedAcrossInstances(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	sa, sb := newStore(t, prefix), newStore(t, prefix)
+	la := NewLedger(sa, spend.New(), prefix, discard(), 2*time.Second)
+	lb := NewLedger(sb, spend.New(), prefix, discard(), 2*time.Second)
+
+	entry := spend.Entry{
+		KeyHash: "k1", KeyAlias: "dev", DeploymentID: "dep-1",
+		Usage: core.Usage{InputTokens: 100, OutputTokens: 50}, Cost: 1.25, Billable: true,
+	}
+	for range 4 {
+		if err := la.Record(ctx, entry); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+
+	spent, err := lb.KeySpend(ctx, "k1", time.Hour)
+	if err != nil {
+		t.Fatalf("KeySpend: %v", err)
+	}
+	if spent < 4.99 || spent > 5.01 {
+		t.Errorf("second instance sees %v spent, want ~5.00", spent)
+	}
+}
+
+func TestSpendSummariesFromRedis(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	s := newStore(t, prefix)
+	l := NewLedger(s, spend.New(), prefix, discard(), 2*time.Second)
+
+	l.Record(ctx, spend.Entry{
+		KeyHash: "k1", KeyAlias: "dev-laptop", DeploymentID: "dep-1",
+		Usage: core.Usage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 100},
+		Cost:  0.5, Billable: true,
+	})
+	// Passthrough traffic: usage but no cost.
+	l.Record(ctx, spend.Entry{
+		KeyHash: "k1", DeploymentID: "dep-2",
+		Usage: core.Usage{InputTokens: 7}, Cost: 0, Billable: false,
+	})
+
+	keys, err := l.Keys(ctx)
+	if err != nil {
+		t.Fatalf("Keys: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("got %d key summaries, want 1", len(keys))
+	}
+	got := keys[0]
+	if got.Requests != 2 || got.BillableRequests != 1 {
+		t.Errorf("requests = %d/%d, want 2/1", got.Requests, got.BillableRequests)
+	}
+	if got.InputTokens != 17 || got.CacheReadTokens != 100 {
+		t.Errorf("tokens = %d input, %d cache read; want 17 and 100", got.InputTokens, got.CacheReadTokens)
+	}
+	if got.Alias != "dev-laptop" {
+		t.Errorf("alias = %q", got.Alias)
+	}
+
+	deps, err := l.Deployments(ctx)
+	if err != nil {
+		t.Fatalf("Deployments: %v", err)
+	}
+	if len(deps) != 2 {
+		t.Errorf("got %d deployment summaries, want 2", len(deps))
+	}
+}
+
+func TestForgetRemovesRedisRecord(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	s := newStore(t, prefix)
+	l := NewLedger(s, spend.New(), prefix, discard(), 2*time.Second)
+
+	l.Record(ctx, spend.Entry{KeyHash: "doomed", DeploymentID: "d", Cost: 3, Billable: true})
+	l.Forget("doomed")
+	if spent, _ := l.KeySpend(ctx, "doomed", 0); spent != 0 {
+		t.Errorf("spend = %v, want 0 after Forget", spent)
+	}
+}
+
+// An unreachable Redis must degrade to local state rather than fail requests —
+// and the degradation must be visible, not silent.
+func TestDegradesToLocalWhenRedisUnavailable(t *testing.T) {
+	local := router.NewMemState()
+	s := New(Options{
+		Addr:      "127.0.0.1:1", // nothing listening
+		KeyPrefix: "test", Timeout: 100 * time.Millisecond,
+	}, local, discard())
+	defer s.Close()
+	ctx := context.Background()
+
+	// Requests still flow, enforced locally.
+	admitted := 0
+	for range 10 {
+		ok, err := s.Reserve(ctx, "dep-1", 4, 0)
+		if err != nil {
+			t.Fatalf("Reserve returned an error instead of degrading: %v", err)
+		}
+		if ok {
+			admitted++
+		}
+	}
+	if admitted != 4 {
+		t.Errorf("admitted %d, want 4 from the local fallback", admitted)
+	}
+	if s.Degradations() == 0 {
+		t.Error("degradation was not counted; a silent fallback is the trap this guards against")
+	}
+
+	// Cooldowns and tokens degrade too, rather than erroring.
+	if err := s.RecordFailure(ctx, "dep-1", time.Now(), 1, time.Second); err != nil {
+		t.Errorf("RecordFailure: %v", err)
+	}
+	if _, err := s.InCooldown(ctx, "dep-1", time.Now()); err != nil {
+		t.Errorf("InCooldown: %v", err)
+	}
+	if err := s.AddTokens(ctx, "dep-1", 10); err != nil {
+		t.Errorf("AddTokens: %v", err)
+	}
+}
+
+// Latency and in-flight are deliberately local; confirm they do not reach Redis.
+func TestLatencyAndInFlightStayLocal(t *testing.T) {
+	prefix := uniquePrefix(t)
+	a, b := newStore(t, prefix), newStore(t, prefix)
+	ctx := context.Background()
+
+	a.BeginRequest(ctx, "dep-1")
+	a.EndRequest(ctx, "dep-1", 50*time.Millisecond, true)
+	a.BeginRequest(ctx, "dep-1")
+
+	if n, _ := a.InFlight(ctx, "dep-1"); n != 1 {
+		t.Errorf("instance A in-flight = %d, want 1", n)
+	}
+	if n, _ := b.InFlight(ctx, "dep-1"); n != 0 {
+		t.Errorf("instance B in-flight = %d, want 0: in-flight is per-instance by design", n)
+	}
+	if _, seen, _ := b.MeanLatency(ctx, "dep-1"); seen {
+		t.Error("instance B sees A's latency samples; latency is per-instance by design")
+	}
+}
