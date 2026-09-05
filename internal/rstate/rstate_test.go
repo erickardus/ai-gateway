@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"reflect"
 	"testing"
 	"time"
 
@@ -224,8 +225,10 @@ func TestSpendSummariesFromRedis(t *testing.T) {
 
 	l.Record(ctx, spend.Entry{
 		KeyHash: "k1", KeyAlias: "dev-laptop", DeploymentID: "dep-1",
-		Usage: core.Usage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 100},
-		Cost:  0.5, Billable: true,
+		Usage:        core.Usage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 100},
+		Cost:         0.5,
+		CacheSavings: 0.27,
+		Billable:     true,
 	})
 	// Passthrough traffic: usage but no cost.
 	l.Record(ctx, spend.Entry{
@@ -246,6 +249,9 @@ func TestSpendSummariesFromRedis(t *testing.T) {
 	}
 	if got.InputTokens != 17 || got.CacheReadTokens != 100 {
 		t.Errorf("tokens = %d input, %d cache read; want 17 and 100", got.InputTokens, got.CacheReadTokens)
+	}
+	if got.CacheSavings < 0.269 || got.CacheSavings > 0.271 {
+		t.Errorf("cache_savings = %v, want ~0.27", got.CacheSavings)
 	}
 	if got.Alias != "dev-laptop" {
 		t.Errorf("alias = %q", got.Alias)
@@ -332,5 +338,143 @@ func TestLatencyAndInFlightStayLocal(t *testing.T) {
 	}
 	if _, seen, _ := b.MeanLatency(ctx, "dep-1"); seen {
 		t.Error("instance B sees A's latency samples; latency is per-instance by design")
+	}
+}
+
+// A prompt-prefix pin has to be shared. Behind a load balancer the next turn of
+// a conversation lands on a different replica, and a per-instance pin would send
+// it to a different upstream — the exact thing the pin exists to prevent.
+func TestAffinitySharedAcrossInstances(t *testing.T) {
+	prefix := uniquePrefix(t)
+	a, b := newStore(t, prefix), newStore(t, prefix)
+	ctx := context.Background()
+
+	if _, ok, err := b.Affinity(ctx, "fp-1"); err != nil || ok {
+		t.Fatalf("unset pin: ok = %v, err = %v; want a clean miss", ok, err)
+	}
+	if err := a.SetAffinity(ctx, "fp-1", "dep-1", time.Minute); err != nil {
+		t.Fatalf("SetAffinity: %v", err)
+	}
+
+	got, ok, err := b.Affinity(ctx, "fp-1")
+	if err != nil {
+		t.Fatalf("Affinity: %v", err)
+	}
+	if !ok || got != "dep-1" {
+		t.Errorf("the other instance read %q, %v; want dep-1, true", got, ok)
+	}
+
+	// A pin is refreshed on every success, so it follows a failover rather than
+	// holding a conversation on a deployment that stopped serving it.
+	if err := b.SetAffinity(ctx, "fp-1", "dep-2", time.Minute); err != nil {
+		t.Fatalf("SetAffinity: %v", err)
+	}
+	if got, _, _ := a.Affinity(ctx, "fp-1"); got != "dep-2" {
+		t.Errorf("pin = %q after re-pinning, want dep-2", got)
+	}
+}
+
+func TestAffinityExpiresInRedis(t *testing.T) {
+	s := newStore(t, uniquePrefix(t))
+	ctx := context.Background()
+
+	if err := s.SetAffinity(ctx, "fp-ttl", "dep-1", time.Second); err != nil {
+		t.Fatalf("SetAffinity: %v", err)
+	}
+	ttl, err := s.Client().TTL(ctx, s.key("affinity", "fp-ttl")).Result()
+	if err != nil {
+		t.Fatalf("TTL: %v", err)
+	}
+	if ttl <= 0 || ttl > time.Second {
+		t.Errorf("ttl = %v, want a positive value no greater than 1s — a pin with no expiry would outlive the cache it points at", ttl)
+	}
+}
+
+// Losing a pin costs a cache write, not a request.
+func TestAffinityDegradesWithoutRedis(t *testing.T) {
+	s := New(Options{
+		Addr:      "127.0.0.1:1", // nothing listening
+		KeyPrefix: "test", Timeout: 100 * time.Millisecond,
+	}, router.NewMemState(), discard())
+	defer s.Close()
+	ctx := context.Background()
+
+	if err := s.SetAffinity(ctx, "fp", "dep-1", time.Minute); err != nil {
+		t.Fatalf("SetAffinity returned an error instead of degrading: %v", err)
+	}
+	if _, _, err := s.Affinity(ctx, "fp"); err != nil {
+		t.Fatalf("Affinity returned an error instead of degrading: %v", err)
+	}
+}
+
+// The Redis ledger stores its totals field by field in a Lua script, so a field
+// added to spend.Totals is only reported once it is added in three places. Miss
+// one and the endpoint answers 0 — which reads as "nothing happened" rather than
+// as missing data, beside sibling figures that are correct.
+//
+// So this compares the two implementations rather than checking known fields:
+// one entry through each, every numeric total expected to agree. A new field
+// that only lands in the local ledger fails here.
+func TestRedisLedgerMatchesTheLocalLedgerFieldForField(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	s := newStore(t, prefix)
+
+	local := spend.New()
+	shared := NewLedger(s, spend.New(), prefix, discard(), 2*time.Second)
+
+	// Every field that feeds Totals is non-zero, so a dropped one is visible as
+	// a difference rather than as two matching zeros.
+	entry := spend.Entry{
+		KeyHash: "k1", KeyAlias: "dev", DeploymentID: "dep-1",
+		Usage: core.Usage{
+			InputTokens: 11, OutputTokens: 22,
+			CacheReadTokens: 33, CacheWriteTokens: 44,
+		},
+		Cost:         1.5,
+		CacheSavings: 2.75,
+		Billable:     true,
+	}
+	if err := local.Record(ctx, entry); err != nil {
+		t.Fatalf("local Record: %v", err)
+	}
+	if err := shared.Record(ctx, entry); err != nil {
+		t.Fatalf("shared Record: %v", err)
+	}
+
+	localRows, err := local.Keys(ctx)
+	if err != nil {
+		t.Fatalf("local Keys: %v", err)
+	}
+	sharedRows, err := shared.Keys(ctx)
+	if err != nil {
+		t.Fatalf("shared Keys: %v", err)
+	}
+	if len(localRows) != 1 || len(sharedRows) != 1 {
+		t.Fatalf("got %d local and %d shared summaries, want 1 of each", len(localRows), len(sharedRows))
+	}
+
+	wantTotals := reflect.ValueOf(localRows[0].Totals)
+	gotTotals := reflect.ValueOf(sharedRows[0].Totals)
+	fields := wantTotals.Type()
+
+	for i := range fields.NumField() {
+		name := fields.Field(i).Name
+		if name == "WindowStart" {
+			continue // set from the clock, not from the entry
+		}
+		want, got := wantTotals.Field(i), gotTotals.Field(i)
+		switch want.Kind() {
+		case reflect.Int:
+			if got.Int() != want.Int() {
+				t.Errorf("%s = %d via Redis, %d locally", name, got.Int(), want.Int())
+			}
+		case reflect.Float64:
+			if diff := got.Float() - want.Float(); diff > 1e-9 || diff < -1e-9 {
+				t.Errorf("%s = %v via Redis, %v locally", name, got.Float(), want.Float())
+			}
+		default:
+			t.Errorf("%s has kind %s, which this comparison does not cover — extend it", name, want.Kind())
+		}
 	}
 }

@@ -15,12 +15,20 @@ Every request walks this pipeline in order:
 4. **Filter deployments already tried** on this request, so a retry makes
    progress rather than landing back on the one that just failed.
 5. **Filter over-capacity deployments** using a non-consuming check.
-6. **Strategy picks** one survivor.
-7. **Reserve capacity** on the chosen deployment only. Budget is never spent on
+6. **Prefer the prompt-prefix pin**, if the request has one and the pinned
+   deployment is among the survivors. See
+   [prompt-caching.md](prompt-caching.md#prefix-affinity).
+7. **Strategy picks** one survivor, when no pin decided it.
+8. **Reserve capacity** on the chosen deployment only. Budget is never spent on
    candidates that go unused.
 
 If nothing survives, the request fails with `503` and
 `no healthy deployment available`.
+
+Note the order: the pin is consulted **after** every filter, so it can only ever
+choose among deployments that were already eligible. A pinned deployment that is
+cooling down, unauthorized, already failed, or at its rate limit is passed over
+exactly as if there were no pin.
 
 ## Strategies
 
@@ -156,6 +164,7 @@ A `"disable_fallbacks": true` field in the request body skips fallbacks entirely
 | `x-gateway-attempted-retries` | Retries used within the final group. |
 | `x-gateway-attempted-fallbacks` | Fallback hops taken. |
 | `x-gateway-request-id` | Correlates with the access log. |
+| `x-gateway-prompt-affinity` | `hit`, `miss`, or `new` when a prompt-prefix pin was consulted; absent otherwise. |
 
 ## Differences from LiteLLM
 
@@ -173,6 +182,7 @@ behaviour and actual behaviour diverge, these follow neither blindly:
 | In-flight counter | Can go negative | Clamped; released exactly once, on a context detached from the client's so an aborted request still decrements |
 | Wire format | Not a routing dimension | Enforced: an ingress reaches only deployments of its own format, groups must be homogeneous, and fallbacks may not cross formats |
 | Duplicate deployments | Undetectable, because the ID includes a per-group ordinal | Rejected at load: a duplicate would double that upstream's traffic share and rate limit |
+| Provider prompt cache | Not a routing dimension | Conversations are pinned to the upstream holding their warm prefix, so balancing does not turn every cache read into a cache write |
 | Rate-limit charging | At authentication, so rejected requests spend budget | After the model is resolved and authorized |
 | Error classification | Substring matching only | Structured provider error type first, substrings as fallback, both configurable |
 | `InternalServerErrorRetries` | Declared but never read | Every declared policy field is honoured |

@@ -34,6 +34,9 @@ type Entry struct {
 	// zero because no pricing was configured", which are different facts and
 	// look identical in a bare float.
 	Billable bool
+	// CacheSavings is what the provider's prompt cache took off this request's
+	// bill, relative to the same tokens charged as ordinary input.
+	CacheSavings float64
 }
 
 // Totals is accumulated consumption over a window.
@@ -46,8 +49,12 @@ type Totals struct {
 	Cost             float64 `json:"cost"`
 	// BillableRequests counts requests the operator paid for, so a key serving
 	// only subscription traffic is visibly distinct from an idle one.
-	BillableRequests int       `json:"billable_requests"`
-	WindowStart      time.Time `json:"window_start"`
+	BillableRequests int `json:"billable_requests"`
+	// CacheSavings is what the provider's prompt cache took off the bill over
+	// this window. It sits beside Cost rather than inside it: Cost is what was
+	// charged, and this is what was not.
+	CacheSavings float64   `json:"cache_savings"`
+	WindowStart  time.Time `json:"window_start"`
 }
 
 func (t *Totals) add(e Entry) {
@@ -59,6 +66,7 @@ func (t *Totals) add(e Entry) {
 	if e.Billable {
 		t.BillableRequests++
 		t.Cost += e.Cost
+		t.CacheSavings += e.CacheSavings
 	}
 }
 

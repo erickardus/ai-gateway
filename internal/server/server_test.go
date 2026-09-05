@@ -52,15 +52,16 @@ func (c *captured) get() (http.Header, []byte, string, string) {
 
 // harness builds a gateway in front of a fake upstream.
 type harness struct {
-	srv          *Server
-	store        auth.KeyStore
-	deploymentID string
-	ledger       *spend.Ledger
-	metrics      *metrics.Registry
-	gateway      http.Handler
-	upstream     *httptest.Server
-	seen         *captured
-	logBuf       *testutil.SyncWriter
+	srv           *Server
+	store         auth.KeyStore
+	deploymentID  string
+	deploymentIDs []string
+	ledger        *spend.Ledger
+	metrics       *metrics.Registry
+	gateway       http.Handler
+	upstream      *httptest.Server
+	seen          *captured
+	logBuf        *testutil.SyncWriter
 }
 
 type harnessOpts struct {
@@ -73,6 +74,10 @@ type harnessOpts struct {
 	maxBudget        float64
 	cache            bool
 	cacheScope       cache.Scope
+	// extraDeployments adds further upstreams to the same model group, which is
+	// what gives prompt-prefix affinity something to choose between.
+	extraDeployments int
+	promptCache      config.PromptCacheConfig
 }
 
 func intPtr(n int) *int { return &n }
@@ -117,13 +122,26 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	}
 
 	deployment := config.Deployment{ModelName: "anthropic-claude", Params: params, Weight: intPtr(1)}
+	deployments := []config.Deployment{deployment}
+	for i := 0; i < opts.extraDeployments; i++ {
+		extra := httptest.NewServer(handler)
+		t.Cleanup(extra.Close)
+		extraParams := params
+		extraParams.APIBase = extra.URL
+		deployments = append(deployments, config.Deployment{
+			ModelName: "anthropic-claude", Params: extraParams, Weight: intPtr(1),
+		})
+	}
 	if mode == "api_key" {
 		// Priced so cost accounting has something to compute.
-		deployment.Cost = core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
+		for i := range deployments {
+			deployments[i].Cost = core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
+		}
 	}
 	cfg := &config.Config{
-		ModelList: []config.Deployment{deployment},
-		Router:    config.RouterConfig{Strategy: config.StrategyWeightedShuffle},
+		ModelList:   deployments,
+		PromptCache: opts.promptCache,
+		Router:      config.RouterConfig{Strategy: config.StrategyWeightedShuffle},
 		VirtualKeys: config.VirtualKeysConfig{
 			MasterKey:            opts.masterKey,
 			HeaderNames:          []string{"x-gateway-key", "x-litellm-api-key"},
@@ -178,16 +196,21 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	}
 
 	srv := New(cfg, authn, store, rtr, log, ledger, reg, nil, responses)
+	ids := make([]string, 0, len(cfg.ModelList))
+	for i := range cfg.ModelList {
+		ids = append(ids, cfg.ModelList[i].ID())
+	}
 	return &harness{
-		srv:          srv,
-		store:        store,
-		deploymentID: cfg.ModelList[0].ID(),
-		ledger:       ledger,
-		metrics:      reg,
-		gateway:      srv.Handler(),
-		upstream:     upstream,
-		seen:         seen,
-		logBuf:       logBuf,
+		srv:           srv,
+		store:         store,
+		deploymentID:  cfg.ModelList[0].ID(),
+		deploymentIDs: ids,
+		ledger:        ledger,
+		metrics:       reg,
+		gateway:       srv.Handler(),
+		upstream:      upstream,
+		seen:          seen,
+		logBuf:        logBuf,
 	}
 }
 

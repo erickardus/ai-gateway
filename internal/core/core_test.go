@@ -108,3 +108,50 @@ func TestUsageTotal(t *testing.T) {
 		t.Errorf("Total = %d, want 42", got)
 	}
 }
+
+func TestPricingCacheSavings(t *testing.T) {
+	p := Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
+
+	tests := []struct {
+		name  string
+		price Pricing
+		usage Usage
+		want  float64
+	}{
+		{
+			name:  "cache reads are the difference from ordinary input",
+			price: p,
+			usage: Usage{InputTokens: 100, CacheReadTokens: 1_000_000},
+			want:  2.7,
+		},
+		{
+			// A cache write costs a premium and saves nothing; only reads do.
+			name:  "cache writes save nothing",
+			price: p,
+			usage: Usage{CacheWriteTokens: 1_000_000},
+			want:  0,
+		},
+		{
+			name:  "an unpriced deployment saves nothing it can report",
+			price: Pricing{},
+			usage: Usage{CacheReadTokens: 1_000_000},
+			want:  0,
+		},
+		{
+			// Pricing a cache read above input is a configuration mistake, not
+			// a loss to report.
+			name:  "a cache read priced above input is not a negative saving",
+			price: Pricing{InputPer1M: 1, CacheReadPer1M: 5},
+			usage: Usage{CacheReadTokens: 1_000_000},
+			want:  0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.price.CacheSavings(tt.usage)
+			if diff := got - tt.want; diff > 1e-12 || diff < -1e-12 {
+				t.Errorf("CacheSavings = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

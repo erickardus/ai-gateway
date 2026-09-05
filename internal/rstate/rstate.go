@@ -281,6 +281,50 @@ func (s *Store) TokensUsed(ctx context.Context, id string) (int, error) {
 	return n, nil
 }
 
+// Affinity implements router.StateStore. Prompt-prefix pins are shared, unlike
+// latency and in-flight: the point of a pin is that every replica sends a
+// conversation to the deployment holding its warm prompt cache, and a
+// per-instance pin behind a load balancer would send the same conversation to a
+// different upstream on every turn.
+//
+// Falling back to the local store while Redis is down usually means no pin at
+// all, since pins are only written to Redis while it is healthy. That degrades
+// to ordinary load balancing — more cache writes, no incorrect routing — which
+// is the right way to lose this particular feature.
+func (s *Store) Affinity(ctx context.Context, fingerprint string) (string, bool, error) {
+	rctx, cancel := s.ctx(ctx)
+	defer cancel()
+
+	id, err := s.client.Get(rctx, s.key("affinity", fingerprint)).Result()
+	if errors.Is(err, redis.Nil) {
+		s.recovered()
+		return "", false, nil
+	}
+	if s.degrade(err, "affinity") {
+		return s.local.Affinity(ctx, fingerprint)
+	}
+	s.recovered()
+	return id, id != "", nil
+}
+
+// SetAffinity implements router.StateStore. The TTL is refreshed on every
+// success, so a pin lives as long as the conversation is active and lapses
+// once it stops — which is how the upstream's own cache entry behaves.
+func (s *Store) SetAffinity(ctx context.Context, fingerprint, id string, ttl time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	rctx, cancel := s.ctx(ctx)
+	defer cancel()
+
+	err := s.client.Set(rctx, s.key("affinity", fingerprint), id, ttl).Err()
+	if s.degrade(err, "set_affinity") {
+		return s.local.SetAffinity(ctx, fingerprint, id, ttl)
+	}
+	s.recovered()
+	return nil
+}
+
 // InCooldown implements router.StateStore.
 func (s *Store) InCooldown(ctx context.Context, id string, now time.Time) (bool, error) {
 	rctx, cancel := s.ctx(ctx)

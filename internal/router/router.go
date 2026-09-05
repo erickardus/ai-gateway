@@ -24,6 +24,7 @@ type Executor interface {
 // Router resolves a model name to a deployment and drives retries and fallbacks.
 type Router struct {
 	cfg      config.RouterConfig
+	prompt   config.PromptCacheConfig
 	groups   map[string][]*config.Deployment
 	strategy Strategy
 	state    StateStore
@@ -57,6 +58,7 @@ func New(cfg *config.Config, state StateStore, exec Executor, log *slog.Logger, 
 	}
 	return &Router{
 		cfg:      cfg.Router,
+		prompt:   cfg.PromptCache,
 		groups:   cfg.Groups(),
 		strategy: strategy,
 		state:    state,
@@ -93,7 +95,38 @@ type Result struct {
 	Deployment        *config.Deployment
 	AttemptedRetries  int
 	AttemptedFallback int
+	// PromptAffinity reports what the prompt-prefix pin did for this request.
+	// It is what makes a cache-affinity regression visible before it shows up
+	// as a bill.
+	PromptAffinity string
 }
+
+// Prompt-affinity outcomes reported on a Result.
+//
+// AffinityNew and AffinityMiss are deliberately distinct. Both mean the request
+// did not land on a pinned deployment, but only a miss is a problem: a new
+// prefix has no pin to honour yet, and folding the two together would put every
+// opening turn into the miss count. That is the figure an operator alerts on,
+// and it would then never approach zero however well affinity was working.
+const (
+	// AffinityOff means no pin was in play: affinity is disabled, the request
+	// has no cacheable prefix, or the group holds a single deployment.
+	AffinityOff = ""
+	// AffinityNew means this prefix had no pin. It has one now.
+	AffinityNew = "new"
+	// AffinityHit means the pinned deployment served the request, so the
+	// upstream's prompt cache was there to be read.
+	AffinityHit = "hit"
+	// AffinityMiss means a pin existed and something else served the request
+	// anyway — the pinned deployment was cooling down, at its limit, carrying
+	// too much of the group's load, or had already failed this request.
+	//
+	// It describes where the request landed, not what the router intended: a
+	// pin passed over for load that the strategy then chose anyway still
+	// reports a hit, because the request did reach the warm upstream, which is
+	// what the metric is for.
+	AffinityMiss = "miss"
+)
 
 // Route serves a request, retrying within the requested model group and then
 // falling back to other groups.
@@ -148,6 +181,25 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 		maxRetries = *overrides.NumRetries
 	}
 
+	// A pin is only worth consulting where there is a choice to bias. In a
+	// single-deployment group every request already lands on the same upstream,
+	// so a lookup and a write would buy nothing.
+	affinityKey := ""
+	if r.prompt.AffinityEnabled() && overrides.PromptPrefix != "" && len(deployments) > 1 {
+		affinityKey = model + "\x00" + overrides.PromptPrefix
+	}
+	pinned := ""
+	if affinityKey != "" {
+		id, ok, err := r.state.Affinity(ctx, affinityKey)
+		if err != nil {
+			// A pin is an optimization. Losing it costs a cache write, not a
+			// request, so the request goes on without one.
+			r.log.Warn("read prompt affinity", "model", model, "error", err)
+		} else if ok {
+			pinned = id
+		}
+	}
+
 	// Deployments that have already failed this request are excluded from
 	// re-selection, so a retry makes progress instead of possibly landing back
 	// on the deployment that just failed.
@@ -155,7 +207,7 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 	var firstErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		dep, err := r.pick(ctx, deployments, failed, overrides, req.Format)
+		dep, err := r.pick(ctx, deployments, failed, overrides, req.Format, pinned)
 		if err != nil {
 			if firstErr != nil {
 				return nil, firstErr
@@ -165,7 +217,31 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 
 		resp, attemptErr := r.attempt(ctx, dep, req, overrides)
 		if attemptErr == nil {
-			return &Result{Response: resp, Deployment: dep, AttemptedRetries: attempt, AttemptedFallback: hop}, nil
+			affinity := AffinityOff
+			if affinityKey != "" {
+				switch {
+				case pinned == "":
+					affinity = AffinityNew
+				case dep.ID() == pinned:
+					affinity = AffinityHit
+				default:
+					affinity = AffinityMiss
+				}
+				// Written on every success, not only on a new pin: refreshing
+				// the TTL keeps an active conversation pinned for as long as it
+				// runs, and lets it lapse once it stops — the same lifetime the
+				// upstream gives the cache entry itself.
+				if err := r.state.SetAffinity(ctx, affinityKey, dep.ID(), r.prompt.AffinityTTL); err != nil {
+					r.log.Warn("record prompt affinity", "deployment", dep.ID(), "error", err)
+				}
+			}
+			return &Result{
+				Response:          resp,
+				Deployment:        dep,
+				AttemptedRetries:  attempt,
+				AttemptedFallback: hop,
+				PromptAffinity:    affinity,
+			}, nil
 		}
 		if firstErr == nil {
 			firstErr = attemptErr
@@ -194,7 +270,7 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 // pick chooses a deployment and consumes its rate-limit budget. Capacity is
 // only consumed for the deployment actually dispatched to, so filtering never
 // spends budget on candidates that go unused.
-func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) (*config.Deployment, error) {
+func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format, pinned string) (*config.Deployment, error) {
 	candidates, why, err := r.candidates(ctx, deployments, failed, overrides, format)
 	if err != nil {
 		return nil, err
@@ -203,18 +279,52 @@ func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, fai
 		return nil, why.err()
 	}
 
+	// A prompt-prefix pin biases the choice; it never constrains it. The pinned
+	// deployment has already been through the same health, format, permission
+	// and capacity filters as every other candidate, and if it did not survive
+	// them — or is carrying too much of the group's load, or loses the race for
+	// its last slot — selection carries on exactly as it would with no pin at
+	// all. Nothing is reserved on the way past, because a failed reservation
+	// consumes nothing.
+	if pinned != "" {
+		for _, c := range candidates {
+			if c.ID() != pinned {
+				continue
+			}
+			overloaded, err := r.pinYieldsToLoad(ctx, candidates, c)
+			if err != nil {
+				return nil, err
+			}
+			if overloaded {
+				break
+			}
+			reserved, err := r.reserve(ctx, c)
+			if err != nil {
+				return nil, err
+			}
+			if reserved {
+				return c, nil
+			}
+			// It filled between the capacity check and now. Drop it so the
+			// strategy does not spend a second round trip discovering the same
+			// thing.
+			candidates = without(candidates, c)
+			break
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, core.ErrNoHealthyDeployment
+	}
+
 	for len(candidates) > 0 {
 		dep, err := r.strategy.Pick(ctx, candidates, r.state, r.rand())
 		if err != nil {
 			return nil, err
 		}
 
-		if dep.RPM <= 0 && dep.TPM <= 0 {
-			return dep, nil
-		}
-		reserved, err := r.state.Reserve(ctx, dep.ID(), dep.RPM, dep.TPM)
+		reserved, err := r.reserve(ctx, dep)
 		if err != nil {
-			return nil, fmt.Errorf("reserve capacity: %w", err)
+			return nil, err
 		}
 		if reserved {
 			return dep, nil
@@ -223,6 +333,70 @@ func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, fai
 		candidates = without(candidates, dep)
 	}
 	return nil, core.ErrNoHealthyDeployment
+}
+
+// pinYieldsToLoad reports whether the pinned deployment is carrying so much more
+// work than the best alternative that honouring the pin would cost more in
+// contention than it saves in cache reads.
+//
+// Load rather than traffic share is the test, because concentration is only a
+// problem when there is something to contend for. A fingerprint covers a
+// request's prefix, not a conversation, so traffic that shares a system prompt,
+// its tools and its opening turns shares one pin — and where that is one busy
+// conversation among idle peers, sending it all to one deployment is the feature
+// working. Where it is the whole workload, the lead builds immediately and each
+// request that yields brings it back down, so the group settles with most
+// requests still reaching a warm cache.
+//
+// In-flight is per-instance even when the rest of routing state is shared, so
+// this costs no round trip: it reads the load this instance is itself carrying,
+// which is also the load it is in a position to redistribute.
+func (r *Router) pinYieldsToLoad(ctx context.Context, candidates []*config.Deployment, pinned *config.Deployment) (bool, error) {
+	if len(candidates) < 2 {
+		return false, nil // nowhere else to send it
+	}
+	lead := r.prompt.MaxInFlightLead()
+
+	pinnedLoad, err := r.state.InFlight(ctx, pinned.ID())
+	if err != nil {
+		// Without the signal, keep the pin. Losing cache hits is the more
+		// expensive way to be wrong.
+		r.log.Warn("read in-flight for prompt affinity", "deployment", pinned.ID(), "error", err)
+		return false, nil
+	}
+	if pinnedLoad <= lead {
+		// Cannot be more than lead ahead of anything, so there is nothing to
+		// check and no reason to read every other candidate.
+		return false, nil
+	}
+
+	for _, c := range candidates {
+		if c.ID() == pinned.ID() {
+			continue
+		}
+		load, err := r.state.InFlight(ctx, c.ID())
+		if err != nil {
+			r.log.Warn("read in-flight for prompt affinity", "deployment", c.ID(), "error", err)
+			continue
+		}
+		if pinnedLoad-load > lead {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// reserve consumes one request's capacity on a deployment, reporting whether it
+// fit. A deployment with no limits always fits and costs no round trip.
+func (r *Router) reserve(ctx context.Context, dep *config.Deployment) (bool, error) {
+	if dep.RPM <= 0 && dep.TPM <= 0 {
+		return true, nil
+	}
+	reserved, err := r.state.Reserve(ctx, dep.ID(), dep.RPM, dep.TPM)
+	if err != nil {
+		return false, fmt.Errorf("reserve capacity: %w", err)
+	}
+	return reserved, nil
 }
 
 // hasUntried reports whether any deployment outside the failed set could still

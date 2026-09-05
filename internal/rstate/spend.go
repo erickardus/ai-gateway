@@ -30,6 +30,7 @@ redis.call('HINCRBY', key, 'cache_read_tokens', ARGV[6])
 redis.call('HINCRBY', key, 'cache_write_tokens', ARGV[7])
 redis.call('HINCRBY', key, 'billable_requests', ARGV[8])
 redis.call('HINCRBYFLOAT', key, 'cost', ARGV[9])
+redis.call('HINCRBYFLOAT', key, 'cache_savings', ARGV[10])
 if created == 1 and ttl > 0 then
   redis.call('EXPIRE', key, ttl)
 end
@@ -97,6 +98,7 @@ func (l *Ledger) Record(ctx context.Context, e spend.Entry) error {
 			1, e.Usage.InputTokens, e.Usage.OutputTokens,
 			e.Usage.CacheReadTokens, e.Usage.CacheWriteTokens,
 			billable, strconv.FormatFloat(e.Cost, 'f', -1, 64),
+			strconv.FormatFloat(e.CacheSavings, 'f', -1, 64),
 		).Err()
 		if l.degraded.degrade(err, "spend_record") {
 			return nil // already recorded locally
@@ -189,6 +191,9 @@ func summaryFrom(subject string, fields map[string]string) spend.Summary {
 	s.BillableRequests = parseInt(fields["billable_requests"])
 	if v, err := strconv.ParseFloat(fields["cost"], 64); err == nil {
 		s.Cost = v
+	}
+	if v, err := strconv.ParseFloat(fields["cache_savings"], 64); err == nil {
+		s.CacheSavings = v
 	}
 	if started := parseInt(fields["window_start"]); started > 0 {
 		s.WindowStart = time.Unix(int64(started), 0).UTC()

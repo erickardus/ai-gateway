@@ -120,6 +120,24 @@ Off by default. See [observability.md](observability.md#response-caching).
 
 `scope: shared` is **refused at load** while any passthrough deployment exists.
 
+## `prompt_cache`
+
+The **provider's** cache of a request's leading tokens, as distinct from
+`cache`, which stores whole responses here. See
+[prompt-caching.md](prompt-caching.md).
+
+| Key | Default | Notes |
+|---|---|---|
+| `affinity` | `true` | Pin requests sharing a cacheable prefix to the deployment that last served one. A preference, never a constraint. Inert in a group with one deployment. |
+| `affinity_ttl` | `5m` | How long a pin survives without use. Matches the lifetime of an ephemeral prompt-cache entry. |
+| `affinity_max_in_flight_lead` | `4` | A pin is passed over once the pinned deployment carries this many more in-flight requests than the idlest deployment that could serve it instead. `0` yields to any idler peer. |
+| `inject` | `false` | Place cache breakpoints on the tools and system prompt of an Anthropic request that carries none of its own. |
+| `inject_min_bytes` | `4096` | Prefixes smaller than this are left unmarked; a provider would ignore the breakpoint anyway. |
+
+`inject: true` is **refused at load** while any passthrough deployment exists,
+and while any deployment speaks a format other than `anthropic`. Injection edits
+the request body, and passthrough exists to forward one unchanged.
+
 ## `observability`
 
 | Key | Default | Notes |
@@ -171,7 +189,8 @@ capability disabled.
 | `x-gateway-deployment` | Deployment that served it. |
 | `x-gateway-attempted-retries` | Retries used within the final group. |
 | `x-gateway-attempted-fallbacks` | Fallback hops taken. |
-| `x-gateway-cache` | `hit` or `miss`, when caching is on. |
+| `x-gateway-cache` | `hit` or `miss`, when response caching is on. |
+| `x-gateway-prompt-affinity` | `hit`, `miss`, or `new`, when a prompt-prefix pin was consulted. Absent otherwise. |
 
 ## Per-request overrides
 

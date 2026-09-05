@@ -46,6 +46,26 @@ const (
 	DefaultCacheMaxEntries = 1000
 	// DefaultCacheMaxEntryBytes refuses outsized responses.
 	DefaultCacheMaxEntryBytes = 1 << 20
+
+	// DefaultAffinityTTL matches the lifetime of an Anthropic ephemeral prompt
+	// cache entry. A pin that outlived the cache it points at would keep
+	// concentrating a conversation on one deployment after the reason for doing
+	// so had expired.
+	DefaultAffinityTTL = 5 * time.Minute
+	// DefaultAffinityMaxInFlightLead is how far ahead of its idlest peer a
+	// pinned deployment may run before pins stop being honoured for it.
+	//
+	// It is deliberately loose. A handful of concurrent Claude Code sessions
+	// never reaches it, which is the point: those should stay pinned. Traffic
+	// that has genuinely collapsed onto one deployment passes it almost at
+	// once, and each request that yields lowers the lead, so the group settles
+	// with most requests still hitting a warm cache.
+	DefaultAffinityMaxInFlightLead = 4
+	// DefaultInjectMinBytes is roughly the smallest prefix Anthropic will cache
+	// — its minimum is 1024 tokens on the models this gateway fronts, and JSON
+	// prompt text runs about four bytes to the token. Below it a breakpoint is
+	// ignored upstream, so placing one only adds bytes to the request.
+	DefaultInjectMinBytes = 4096
 )
 
 // Strategy names accepted by router.strategy.
@@ -164,5 +184,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Cache.MaxEntryBytes == 0 {
 		c.Cache.MaxEntryBytes = DefaultCacheMaxEntryBytes
+	}
+
+	if c.PromptCache.AffinityTTL == 0 {
+		c.PromptCache.AffinityTTL = DefaultAffinityTTL
+	}
+	if c.PromptCache.InjectMinBytes == 0 {
+		c.PromptCache.InjectMinBytes = DefaultInjectMinBytes
 	}
 }

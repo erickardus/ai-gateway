@@ -83,6 +83,11 @@ Both are **master-key only** — they disclose what every developer spent.
 | `GET /spend/keys` | Consumption per virtual key, with alias. |
 | `GET /spend/deployments` | Consumption per deployment. |
 
+Both carry `cache_savings` beside `cost`: what the provider's prompt cache took
+off the bill, against the same tokens charged as ordinary input. It sits beside
+cost rather than inside it — cost is what was charged, and this is what was not.
+See [prompt-caching.md](prompt-caching.md#seeing-whether-it-works).
+
 Revoking a key drops its ledger record and its rate-limit counter.
 
 ## Metrics
@@ -107,6 +112,9 @@ the project's only dependency is a YAML parser.
 | `gateway_rejections_total` | counter | model, outcome (reason) |
 | `gateway_in_flight` | gauge | model, deployment |
 | `gateway_request_duration_seconds` | histogram | model, deployment |
+| `gateway_prompt_cache_tokens_total` | counter | model, deployment, outcome (`read`, `write`) |
+| `gateway_prompt_cache_requests_total` | counter | model, deployment, outcome (`hit`, `miss`) |
+| `gateway_prompt_affinity_total` | counter | model, deployment, outcome (`hit`, `miss`, `new`) |
 | `gateway_uptime_seconds` | gauge | — |
 
 `outcome` is `success`, `upstream_error`, `gateway_error` or `rejected`.
@@ -149,6 +157,7 @@ redis:
 | Rate limits (`rpm`/`tpm`) | Redis | A per-process limit is silently multiplied by the replica count. |
 | Cooldowns | Redis | An upstream ejected by one instance should be ejected everywhere. |
 | Spend and budgets | Redis | Otherwise a key spends its whole allowance once per instance. |
+| Prompt-prefix pins | Redis | Behind a load balancer the next turn of a conversation arrives at a different replica; a per-instance pin would send it to a different upstream, which is the thing the pin exists to prevent. |
 | Latency samples | **local** | Latency measures *this instance's* network path to the upstream. Blending measurements from different network positions makes the signal worse, not better. |
 | In-flight counts | **local** | It describes the load this instance is carrying, and a shared counter would leak permanently whenever an instance died mid-request. |
 
@@ -236,3 +245,11 @@ Responses carry `x-gateway-cache: hit` or `miss`.
 
 `POST /cache/purge` empties the cache; master-key only, since it affects every
 caller.
+
+## The provider's prompt cache
+
+Separate from all of the above, and covered in
+**[prompt-caching.md](prompt-caching.md)**: Anthropic's own cache of a request's
+leading tokens, which load balancing quietly destroys unless conversations are
+pinned to the upstream holding their prefix. The symptom is a bill, not an
+error, so the metrics above exist to make it visible first.

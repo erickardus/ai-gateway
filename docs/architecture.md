@@ -43,21 +43,26 @@ policy, and what may be cached — and each of those is called out below.
         │                                    limit charged, no spend recorded
         ├─ 7  budget check            refuse before incurring further cost
         ├─ 8  admit                   charge the key's rate limit
+        ├─ 9  fingerprint prefix      hash the part of the body that survives a
+        │                             turn, for prompt-cache affinity
+        ├─ 10 mark cacheable prefix   opt-in, Anthropic only, never alongside a
+        │                             passthrough deployment
         │
-        ├─ 9  route ──────────────────┐
+        ├─ 11 route ──────────────────┐
         │     filter cooldowns        │  retry excludes already-failed
         │     filter passthrough      │  deployments; backoff only when
         │     filter format           │  nothing untried remains
         │     filter capacity         │
-        │     strategy picks          │  fallback to another group once the
-        │     reserve capacity        │  first is exhausted
-        │                             │
-        ├─ 10 relay ──────────────────┘  byte-for-byte, flushed per chunk
-        ├─ 11 store in cache             complete successful responses only
-        └─ 12 record                     spend + metrics, on a detached context
+        │     prefer the prefix pin   │  a preference among survivors, never
+        │     strategy picks          │  a constraint
+        │     reserve capacity        │  fallback to another group once the
+        │                             │  first is exhausted
+        ├─ 12 relay ──────────────────┘  byte-for-byte, flushed per chunk
+        ├─ 13 store in cache             complete successful responses only
+        └─ 14 record                     spend + metrics, on a detached context
 ```
 
-Steps 6 and 12 are where several subtle decisions live; see below.
+Steps 6 and 14 are where several subtle decisions live; see below.
 
 ## Packages
 
@@ -74,6 +79,7 @@ Steps 6 and 12 are where several subtle decisions live; see below.
 | `spend` | Usage and cost ledger with windowed budgets. |
 | `metrics` | Prometheus text exposition, hand-rolled. |
 | `cache` | Response cache with per-key or shared scope. |
+| `promptcache` | Fingerprints a request's cacheable prefix, and marks one where the caller marked none. About the *provider's* cache, not this gateway's. |
 | `rstate` | Redis-backed routing state and ledger, with local fallback. |
 | `testutil` | Shared test helpers. |
 
@@ -133,6 +139,16 @@ bare cost of `0` could not distinguish from idle.
 The key hash is part of the cache key under the default per-key scope, so one
 caller cannot be served another's completion. Sharing is opt-in, and refused
 while any passthrough deployment exists.
+
+### The provider's prompt cache is a routing input
+
+A prompt cache lives on one upstream account, so load balancing a conversation
+across deployments turns every cache read into a cache write — a premium instead
+of a discount, with no error and no latency signal to notice it by. The router
+pins a request's cacheable prefix to the deployment that served it, and yields
+that pin to every health, permission and capacity filter. Affinity can cost some
+balance; it can never cost a request. See
+[prompt-caching.md](prompt-caching.md).
 
 ### Shared state is a deliberate subset
 

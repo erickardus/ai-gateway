@@ -14,6 +14,12 @@ import (
 // cacheHeader tells the caller whether their response came from the cache.
 const cacheHeader = "x-gateway-cache"
 
+// promptAffinityHeader reports whether the request reached the deployment
+// already holding its prompt prefix. It describes routing, not the response, so
+// it is deliberately separate from cacheHeader, which is about this gateway's
+// own stored responses.
+const promptAffinityHeader = "x-gateway-prompt-affinity"
+
 // cacheKeyFor derives the key for a request, or reports false when caching is
 // off for it.
 //

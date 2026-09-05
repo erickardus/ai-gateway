@@ -55,6 +55,7 @@ func (c *Config) Validate() error {
 		{"observability.spend_flush_interval", c.Observability.SpendFlushInterval},
 		{"redis.timeout", c.Redis.Timeout},
 		{"cache.ttl", c.Cache.TTL},
+		{"prompt_cache.affinity_ttl", c.PromptCache.AffinityTTL},
 	} {
 		if d.value < 0 {
 			errs = append(errs, fmt.Errorf("%s: must not be negative, got %s", d.path, d.value))
@@ -104,6 +105,36 @@ func (c *Config) Validate() error {
 						cache.ScopeShared, i))
 					break
 				}
+			}
+		}
+	}
+
+	if l := c.PromptCache.AffinityMaxInFlightLead; l != nil && *l < 0 {
+		errs = append(errs, fmt.Errorf("prompt_cache.affinity_max_in_flight_lead: must be >= 0, got %d", *l))
+	}
+	if c.PromptCache.InjectMinBytes < 0 {
+		errs = append(errs, fmt.Errorf("prompt_cache.inject_min_bytes: must be >= 0, got %d", c.PromptCache.InjectMinBytes))
+	}
+	if c.PromptCache.Inject {
+		// Injection edits the request body. The passthrough path exists to
+		// forward a body unchanged — Anthropic's gateway rules require it, and
+		// the endpoint strips Claude Code's attribution block positionally — so
+		// the combination is refused at load rather than left to surprise an
+		// operator whose subscription traffic starts being rewritten.
+		for i := range c.ModelList {
+			if c.ModelList[i].Params.AuthMode == core.AuthModePassthrough {
+				errs = append(errs, fmt.Errorf(
+					"prompt_cache.inject: cannot be enabled while model_list[%d] is a passthrough deployment; injection rewrites the request body and a passthrough deployment must forward it unchanged",
+					i))
+				break
+			}
+		}
+		for i := range c.ModelList {
+			if c.ModelList[i].Params.Format != core.FormatAnthropic {
+				errs = append(errs, fmt.Errorf(
+					"prompt_cache.inject: model_list[%d] speaks %q; cache breakpoints are an Anthropic construct and are only placed on anthropic deployments",
+					i, c.ModelList[i].Params.Format))
+				break
 			}
 		}
 	}

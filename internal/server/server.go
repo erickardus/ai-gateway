@@ -38,6 +38,11 @@ type Server struct {
 	// pricing maps a deployment ID to its price and whether the operator pays
 	// it, resolved once at construction rather than searched per request.
 	pricing map[string]deploymentPricing
+	// balanced reports whether any model group holds more than one deployment.
+	// Prompt-prefix fingerprinting is skipped when none does: with a single
+	// upstream per group every request already lands on the same prompt cache,
+	// so hashing the prefix of every request would buy nothing.
+	balanced bool
 }
 
 // deploymentPricing is what one deployment costs the operator.
@@ -59,9 +64,17 @@ func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr
 			billable: d.Params.AuthMode != core.AuthModePassthrough,
 		}
 	}
+	balanced := false
+	for _, group := range cfg.Groups() {
+		if len(group) > 1 {
+			balanced = true
+			break
+		}
+	}
 	return &Server{
 		cfg: cfg, auth: authn, store: store, router: rtr, log: log,
 		ledger: ledger, metrics: reg, pricing: pricing, shared: shared, cache: responses,
+		balanced: balanced,
 	}
 }
 

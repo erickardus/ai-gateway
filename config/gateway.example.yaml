@@ -195,6 +195,40 @@ virtual_keys:
 #   max_entry_bytes: 1048576
 #   shared: false         # store in Redis so a hit on one instance serves all
 
+# The provider's own prompt cache — the one Anthropic keeps of a request's
+# leading tokens — as distinct from the response cache above.
+#
+# affinity is the part that matters behind a load balancer. A prompt cache lives
+# on one upstream account, so spreading a conversation's turns across
+# deployments turns every cache read into a cache write: a premium instead of a
+# discount. Affinity pins requests that share a cacheable prefix to the
+# deployment that last served one. It is a preference, never a constraint — a
+# pinned deployment that is cooling down or at its rate limit is passed over as
+# if there were no pin — and it does nothing at all in a group with a single
+# deployment. On by default.
+#
+# inject places cache breakpoints on the stable prefix of an Anthropic request —
+# the tools and the system prompt — for callers that do not place their own.
+# Off by default, and refused at load while any passthrough deployment is
+# configured: injection edits the request body, and the passthrough path exists
+# to forward one unchanged. Claude Code places its own breakpoints, so a body
+# that already carries one is never touched.
+prompt_cache:
+  affinity: true
+  affinity_ttl: 5m
+  # Bounds how far a pin may concentrate load: it is passed over once the pinned
+  # deployment carries this many more in-flight requests than the idlest
+  # deployment that could serve the request instead. A load comparison rather
+  # than a share quota, because concentration only hurts when there is
+  # contention — one busy conversation among idle peers is the feature working.
+  # 0 yields to any idler peer.
+  affinity_max_in_flight_lead: 4
+  inject: false
+  # Prefixes smaller than this are left unmarked. Anthropic ignores a breakpoint
+  # below its own minimum rather than rejecting it, so this is an economy rather
+  # than a correctness rule.
+  inject_min_bytes: 4096
+
 observability:
   log_level: info
   # text | json
