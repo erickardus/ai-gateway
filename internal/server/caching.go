@@ -43,7 +43,7 @@ func (s *Server) cacheKeyFor(authCtx *auth.Context, format core.Format, model st
 // A streamed response is replayed as the bytes that were originally relayed. The
 // timing is not reproduced — the whole point is that it arrives at once — but
 // the event sequence the client parses is identical.
-func (s *Server) serveFromCache(w http.ResponseWriter, entry *cache.Entry, model string) {
+func (s *Server) serveFromCache(w http.ResponseWriter, entry *cache.Entry, model string, format core.Format) {
 	for name, values := range entry.Header {
 		if strings.EqualFold(name, "Content-Length") {
 			// The body is written directly, so let net/http size it.
@@ -60,7 +60,10 @@ func (s *Server) serveFromCache(w http.ResponseWriter, entry *cache.Entry, model
 	if entry.Streaming {
 		// Replay through the same relay path, so flushing behaves as it does
 		// for a live stream and a client reading incrementally is not stalled.
-		_, _ = provider.Relay(w, bytes.NewReader(entry.Body))
+		// The usage the replay reports is discarded: the entry already carries
+		// what the original request consumed, and a cache hit calls no upstream,
+		// so counting its tokens again would bill one answer twice.
+		_, _ = provider.Relay(w, bytes.NewReader(entry.Body), format)
 		return
 	}
 	_, _ = w.Write(entry.Body)

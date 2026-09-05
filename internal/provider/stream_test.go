@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/testutil"
 )
 
@@ -42,7 +43,7 @@ func TestRelayDoesNotBuffer(t *testing.T) {
 	rec := testutil.NewSyncWriter()
 	done := make(chan error, 1)
 	go func() {
-		_, err := Relay(rec, resp.Body)
+		_, err := Relay(rec, resp.Body, core.FormatAnthropic)
 		done <- err
 	}()
 
@@ -73,7 +74,7 @@ func TestRelayDoesNotBuffer(t *testing.T) {
 func TestRelayPreservesPingsAndComments(t *testing.T) {
 	in := "event: ping\ndata: {\"type\":\"ping\"}\n\n: this is a comment keep-alive\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	rec := httptest.NewRecorder()
-	if _, err := Relay(rec, strings.NewReader(in)); err != nil {
+	if _, err := Relay(rec, strings.NewReader(in), core.FormatAnthropic); err != nil {
 		t.Fatalf("Relay: %v", err)
 	}
 	if got := rec.Body.String(); got != in {
@@ -92,7 +93,7 @@ func TestRelayExtractsUsage(t *testing.T) {
 	}, "\n")
 
 	rec := httptest.NewRecorder()
-	usage, err := Relay(rec, strings.NewReader(in))
+	usage, err := Relay(rec, strings.NewReader(in), core.FormatAnthropic)
 	if err != nil {
 		t.Fatalf("Relay: %v", err)
 	}
@@ -109,7 +110,7 @@ func TestRelayExtractsUsage(t *testing.T) {
 
 func TestRelayPropagatesUpstreamReadError(t *testing.T) {
 	rec := httptest.NewRecorder()
-	_, err := Relay(rec, io.MultiReader(strings.NewReader("partial"), errReader{}))
+	_, err := Relay(rec, io.MultiReader(strings.NewReader("partial"), errReader{}), core.FormatAnthropic)
 	if err == nil {
 		t.Fatal("expected the upstream read error to surface")
 	}

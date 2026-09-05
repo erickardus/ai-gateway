@@ -50,6 +50,17 @@ func (c *captured) get() (http.Header, []byte, string, string) {
 	return c.header, c.body, c.path, c.query
 }
 
+// record wraps an upstream handler so the harness can inspect what it received,
+// leaving the body readable by the handler itself.
+func record(seen *captured, inner http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seen.set(r, body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		inner(w, r)
+	}
+}
+
 // harness builds a gateway in front of a fake upstream.
 type harness struct {
 	srv           *Server
@@ -78,6 +89,40 @@ type harnessOpts struct {
 	// what gives prompt-prefix affinity something to choose between.
 	extraDeployments int
 	promptCache      config.PromptCacheConfig
+	// format selects the wire protocol of the deployments, defaulting to
+	// anthropic. An openai group is reachable at /v1/chat/completions and is
+	// named separately, since a group's deployments must share one format.
+	format core.Format
+	// pricing overrides the cost model applied to every api_key deployment.
+	pricing *core.Pricing
+	// upstreams, when set, gives each deployment its own handler — the first
+	// entry serves the primary deployment and the rest serve the extras. It is
+	// what lets a test model several independent providers, each holding its
+	// own prompt cache, rather than one fake shared by every deployment.
+	upstreams []http.HandlerFunc
+}
+
+// modelGroup is the group name the harness registers for a format. The two are
+// separate because a group's deployments must all speak one protocol.
+func (o harnessOpts) modelGroup() string {
+	if o.format == core.FormatOpenAI {
+		return "openai-gpt"
+	}
+	return "anthropic-claude"
+}
+
+// defaultPricing is a realistic cost model for the harness's format, so a test
+// asserting on dollars is asserting against the shape of a real bill.
+func (o harnessOpts) defaultPricing() core.Pricing {
+	if o.pricing != nil {
+		return *o.pricing
+	}
+	if o.format == core.FormatOpenAI {
+		// OpenAI-compatible providers cache automatically and charge nothing to
+		// write, so there is no write price to configure.
+		return core.Pricing{InputPer1M: 1.25, OutputPer1M: 10, CacheReadPer1M: 0.125}
+	}
+	return core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
 }
 
 func intPtr(n int) *int { return &n }
@@ -87,6 +132,9 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	seen := &captured{}
 
 	handler := opts.upstream
+	if len(opts.upstreams) > 0 {
+		handler = opts.upstreams[0]
+	}
 	if handler == nil {
 		handler = func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
@@ -95,13 +143,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 			io.WriteString(w, `{"id":"msg_1","type":"message","usage":{"input_tokens":5,"output_tokens":9}}`)
 		}
 	} else {
-		inner := handler
-		handler = func(w http.ResponseWriter, r *http.Request) {
-			body, _ := io.ReadAll(r.Body)
-			seen.set(r, body)
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			inner(w, r)
-		}
+		handler = record(seen, handler)
 	}
 	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
@@ -110,10 +152,14 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	if mode == "" {
 		mode = "passthrough"
 	}
+	format := opts.format
+	if format == "" {
+		format = core.FormatAnthropic
+	}
 	params := config.DeploymentParams{
-		Format:   core.FormatAnthropic,
+		Format:   format,
 		APIBase:  upstream.URL,
-		Model:    "anthropic-claude",
+		Model:    opts.modelGroup(),
 		AuthMode: core.AuthMode(mode),
 	}
 	if mode == "api_key" {
@@ -121,21 +167,25 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		params.APIKey = "sk-ant-api03-SERVERSIDE"
 	}
 
-	deployment := config.Deployment{ModelName: "anthropic-claude", Params: params, Weight: intPtr(1)}
+	deployment := config.Deployment{ModelName: opts.modelGroup(), Params: params, Weight: intPtr(1)}
 	deployments := []config.Deployment{deployment}
 	for i := 0; i < opts.extraDeployments; i++ {
-		extra := httptest.NewServer(handler)
+		extraHandler := handler
+		if i+1 < len(opts.upstreams) {
+			extraHandler = record(seen, opts.upstreams[i+1])
+		}
+		extra := httptest.NewServer(extraHandler)
 		t.Cleanup(extra.Close)
 		extraParams := params
 		extraParams.APIBase = extra.URL
 		deployments = append(deployments, config.Deployment{
-			ModelName: "anthropic-claude", Params: extraParams, Weight: intPtr(1),
+			ModelName: opts.modelGroup(), Params: extraParams, Weight: intPtr(1),
 		})
 	}
 	if mode == "api_key" {
 		// Priced so cost accounting has something to compute.
 		for i := range deployments {
-			deployments[i].Cost = core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
+			deployments[i].Cost = opts.defaultPricing()
 		}
 	}
 	cfg := &config.Config{

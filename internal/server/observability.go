@@ -107,6 +107,7 @@ func (s *Server) record(r *http.Request, obs observation) {
 	if pricing.billable {
 		cost = pricing.price.Cost(obs.usage)
 		savings = pricing.price.CacheSavings(obs.usage)
+		s.warnUnpricedCacheTier(obs, pricing.price)
 	}
 
 	if s.ledger != nil && obs.deployment != "" {
@@ -159,8 +160,36 @@ func (o observation) toResult(cost float64) metrics.Result {
 		Fallbacks:    o.fallbacks,
 		RejectReason: o.rejectReason,
 
-		CacheReadTokens:  o.usage.CacheReadTokens,
-		CacheWriteTokens: o.usage.CacheWriteTokens,
-		PromptAffinity:   o.promptAffinity,
+		CacheReadTokens:    o.usage.CacheReadTokens,
+		CacheWriteTokens:   o.usage.CacheWriteTokens,
+		CacheWrite1hTokens: o.usage.CacheWrite1hTokens,
+		PromptAffinity:     o.promptAffinity,
 	}
+}
+
+// warnUnpricedCacheTier reports, once per deployment, that an upstream billed a
+// tier this deployment has no price for.
+//
+// A one-hour cache write costs twice base input where the default five-minute
+// write costs 1.25x. A cost model that omits the longer price falls back to the
+// shorter one, which is right until a caller asks for the longer TTL and then
+// under-reports every write it makes by more than a third. Nothing else would
+// say so: the request succeeds, the tokens are counted, and only the total is
+// wrong.
+//
+// It is a log line rather than a refusal because the traffic is already served
+// and the fallback is a defensible default — but it is a log line the operator
+// can act on, naming the deployment and the key to add.
+func (s *Server) warnUnpricedCacheTier(obs observation, price core.Pricing) {
+	if obs.usage.CacheWrite1hTokens == 0 || price.CacheWrite1hPer1M > 0 {
+		return
+	}
+	if _, seen := s.mispriced.LoadOrStore(obs.deployment, true); seen {
+		return
+	}
+	s.log.Warn("upstream reported one-hour cache writes at a deployment priced only for five-minute ones; cost is understated until cost.cache_write_1h_per_1m is set",
+		"deployment", obs.deployment,
+		"model", obs.model,
+		"cache_write_1h_tokens", obs.usage.CacheWrite1hTokens,
+		"cache_write_per_1m", price.CacheWritePer1M)
 }

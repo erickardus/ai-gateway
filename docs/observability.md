@@ -38,12 +38,20 @@ model_list:
 **The cache figures are not optional detail.** Claude Code leans heavily on
 prompt caching, and a cache read costs roughly a tenth of ordinary input while a
 cache write costs a premium. A cost model using only input and output would be
-wrong by a wide margin on exactly the traffic this gateway exists to carry. The
-gateway reads Anthropic's `cache_read_input_tokens` and
-`cache_creation_input_tokens` from the response, including from the
-`message_start` event on a streamed reply.
+wrong by a wide margin on exactly the traffic this gateway exists to carry, so
+one that prices input without pricing the cache is
+[refused at load](configuration.md#a-partial-cost-model-is-refused-at-load)
+rather than quietly serving traffic it cannot cost.
 
-A deployment with no `cost` block accrues usage but no cost.
+The gateway reads Anthropic's `cache_read_input_tokens` and
+`cache_creation_input_tokens` from the response, including from the
+`message_start` event on a streamed reply, and the OpenAI-compatible
+`prompt_tokens_details.cached_tokens` — which, unlike Anthropic's counters, is
+part of the input count it is reported beside. See
+[prompt-caching.md](prompt-caching.md#openai-compatible-deployments) for why that
+difference is the expensive one to get wrong.
+
+A deployment with no `cost` block at all accrues usage but no cost.
 
 ## Budgets
 

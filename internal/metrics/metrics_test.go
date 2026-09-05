@@ -215,3 +215,24 @@ func TestPromptCacheHitRateExcludesRequestsThatNeverDispatched(t *testing.T) {
 		t.Errorf("undispatched requests were counted:\n%s", b.String())
 	}
 }
+
+// The long-TTL tier is reported as its own series because it is priced as its
+// own tier. A dashboard that could only see the write total would show a bill
+// rising with no counter moving to explain it.
+func TestLongTTLWritesAreTheirOwnSeries(t *testing.T) {
+	r := New()
+	r.Observe(Result{
+		Model: "claude", Deployment: "d1", Outcome: OutcomeSuccess,
+		CacheWriteTokens: 4096, CacheWrite1hTokens: 3072,
+	})
+
+	out := render(r)
+	for _, want := range []string{
+		`gateway_prompt_cache_tokens_total{model="claude",deployment="d1",outcome="write"} 4096`,
+		`gateway_prompt_cache_tokens_total{model="claude",deployment="d1",outcome="write_1h"} 3072`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing series %s in:\n%s", want, out)
+		}
+	}
+}

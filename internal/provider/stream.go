@@ -2,7 +2,6 @@ package provider
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,10 +24,13 @@ const relayBufferSize = 4 << 10
 // traffic during long thinking pauses. So nothing here filters, coalesces or
 // reinterprets the stream: bytes are passed straight through.
 //
-// It returns any usage reported by the upstream, for token accounting.
-func Relay(w http.ResponseWriter, body io.Reader) (core.Usage, error) {
+// It returns any usage reported by the upstream, for token accounting. The
+// format decides how those counters are read: the two disagree about whether a
+// reported input figure includes the tokens that came from the prompt cache,
+// and reading one with the other's rule bills cached tokens twice.
+func Relay(w http.ResponseWriter, body io.Reader, format core.Format) (core.Usage, error) {
 	rc := http.NewResponseController(w)
-	sniffer := newUsageSniffer()
+	sniffer := newUsageSniffer(format)
 	buf := make([]byte, relayBufferSize)
 
 	for {
@@ -68,11 +70,14 @@ const maxSnifferBuffer = 64 << 10
 // without altering or delaying it. It is best-effort: a stream shape it does not
 // recognize simply yields zero usage.
 type usageSniffer struct {
-	buf   bytes.Buffer
-	usage core.Usage
+	buf    bytes.Buffer
+	usage  core.Usage
+	format core.Format
 }
 
-func newUsageSniffer() *usageSniffer { return &usageSniffer{} }
+func newUsageSniffer(format core.Format) *usageSniffer {
+	return &usageSniffer{format: format}
+}
 
 // observe feeds a relayed chunk to the sniffer. The chunk has already been
 // written to the client, so nothing here can affect what the caller receives.
@@ -94,26 +99,6 @@ func (s *usageSniffer) observe(chunk []byte) {
 	}
 }
 
-// usageEnvelope covers both the Anthropic and OpenAI shapes; absent fields
-// decode as zero.
-type usageEnvelope struct {
-	Usage *usageFields `json:"usage"`
-	// Anthropic reports usage on message_start nested under "message".
-	Message *struct {
-		Usage *usageFields `json:"usage"`
-	} `json:"message"`
-}
-
-type usageFields struct {
-	InputTokens      int `json:"input_tokens"`
-	OutputTokens     int `json:"output_tokens"`
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	// Anthropic prompt-caching counters.
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-}
-
 // flush scans whatever partial line remains once the stream ends.
 func (s *usageSniffer) flush() {
 	if s.buf.Len() > 0 {
@@ -130,24 +115,7 @@ func (s *usageSniffer) scanLine(line []byte) {
 	if len(payload) == 0 || payload[0] != '{' || !bytes.Contains(payload, []byte(`"usage"`)) {
 		return
 	}
-	var env usageEnvelope
-	if err := json.Unmarshal(payload, &env); err != nil {
-		return
+	if reported, ok := UsageFromBody(payload, s.format); ok {
+		mergeUsage(&s.usage, reported)
 	}
-	u := env.Usage
-	if u == nil && env.Message != nil {
-		u = env.Message.Usage
-	}
-	if u == nil {
-		return
-	}
-
-	// Streaming responses report usage incrementally, and the cache counters
-	// arrive on message_start while output arrives on message_delta. Keeping the
-	// largest seen for each field means the final tally is correct regardless of
-	// which event carried which counter.
-	s.usage.InputTokens = max(s.usage.InputTokens, u.InputTokens, u.PromptTokens)
-	s.usage.OutputTokens = max(s.usage.OutputTokens, u.OutputTokens, u.CompletionTokens)
-	s.usage.CacheReadTokens = max(s.usage.CacheReadTokens, u.CacheReadInputTokens)
-	s.usage.CacheWriteTokens = max(s.usage.CacheWriteTokens, u.CacheCreationInputTokens)
 }

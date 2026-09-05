@@ -31,11 +31,17 @@ import (
 // lives about five minutes, refreshed on each read.
 var cacheControl = []byte(`{"type":"ephemeral"}`)
 
-// controlMarker is what an already-annotated body contains. A caller that
+// controlKey is the member an already-annotated body carries. A caller that
 // places its own breakpoints — Claude Code does — knows its prompt better than
 // the gateway does, and the API caps how many breakpoints one request may carry,
 // so the gateway adds none where any are already present.
-var controlMarker = []byte(`"cache_control"`)
+const controlKey = "cache_control"
+
+// controlMarker is the same name as it appears in an encoded document. It is a
+// prefilter, not the test: finding these bytes only means the document might
+// carry the member, since prompt text mentioning cache_control contains them
+// too.
+var controlMarker = []byte(`"` + controlKey + `"`)
 
 // prefixLead is how many leading messages join the fingerprint.
 //
@@ -110,7 +116,9 @@ func Fingerprint(format core.Format, model string, fields jsonx.Fields) (string,
 // would reorder keys and renormalize numbers, which changes the very prefix
 // bytes the upstream cache keys on.
 func Inject(body []byte, minBytes int) ([]byte, bool, error) {
-	if bytes.Contains(body, controlMarker) {
+	if marked, err := alreadyMarked(body); err != nil {
+		return body, false, err
+	} else if marked {
 		return body, false, nil
 	}
 
@@ -203,4 +211,24 @@ func markLastElement(array []byte) ([]byte, bool, error) {
 	out = append(out, marked...)
 	out = append(out, array[last[1]:]...)
 	return out, true, nil
+}
+
+// alreadyMarked reports whether the caller placed a breakpoint of its own.
+//
+// A substring search answers a different question than the one being asked. The
+// bytes of "cache_control" appear in any conversation that discusses prompt
+// caching — a developer reading these docs through Claude Code, a diff touching
+// this file — and reading that as "the caller manages its own breakpoints" turns
+// injection off for the rest of that conversation. The result is a silently
+// larger bill on exactly the traffic that talks about caching.
+//
+// So the cheap scan is only a prefilter: bytes absent means the member is
+// certainly absent, and bytes present buys a structural walk that distinguishes
+// a member name from prompt text. The walk costs a pass over the body, which is
+// why it runs on the small fraction of requests that get past the prefilter.
+func alreadyMarked(body []byte) (bool, error) {
+	if !bytes.Contains(body, controlMarker) {
+		return false, nil
+	}
+	return jsonx.ContainsObjectKey(body, controlKey)
 }

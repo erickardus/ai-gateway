@@ -212,6 +212,8 @@ func (c *Config) Validate() error {
 				p, core.AuthModeAPIKey, core.AuthModePassthrough, d.Params.AuthMode))
 		}
 
+		errs = append(errs, validatePricing(p, d)...)
+
 		if d.Weight != nil && *d.Weight < 0 {
 			errs = append(errs, fmt.Errorf("%s.weight: must be >= 0, got %d", p, *d.Weight))
 		}
@@ -302,4 +304,80 @@ func HostOf(rawURL string) string {
 		return ""
 	}
 	return NormalizeHost(u.Hostname())
+}
+
+// validatePricing refuses a cost model that would misreport what prompt caching
+// costs.
+//
+// The failure this prevents is quiet. A deployment priced with input and output
+// alone loads, serves traffic and reports a cost — one that charges every cached
+// token as if it were ordinary input, and reports savings of exactly zero on the
+// traffic prompt caching exists for. Nothing errors and nothing looks wrong
+// until the provider's invoice disagrees with the gateway's own reports, which
+// is the point at which the number is too late to be useful.
+//
+// So a partially specified cost model fails at load, in the same way injection
+// alongside passthrough does. A deployment with no cost block at all is
+// untouched: "unpriced" is a coherent state, and it is the one passthrough
+// requires.
+func validatePricing(path string, d *Deployment) []error {
+	var errs []error
+	cost := d.Cost
+	if cost.Zero() {
+		return nil
+	}
+
+	for _, f := range []struct {
+		name  string
+		value float64
+	}{
+		{"input_per_1m", cost.InputPer1M},
+		{"output_per_1m", cost.OutputPer1M},
+		{"cache_read_per_1m", cost.CacheReadPer1M},
+		{"cache_write_per_1m", cost.CacheWritePer1M},
+		{"cache_write_1h_per_1m", cost.CacheWrite1hPer1M},
+	} {
+		if f.value < 0 {
+			errs = append(errs, fmt.Errorf("%s.cost.%s: must be >= 0, got %v", path, f.name, f.value))
+		}
+	}
+
+	if cost.InputPer1M <= 0 {
+		// Without an input price there is nothing to price cache reads against,
+		// and a cost model that charges output alone is a deliberate enough
+		// oddity to leave alone.
+		return errs
+	}
+
+	if cost.CacheReadPer1M <= 0 {
+		errs = append(errs, fmt.Errorf(
+			"%s.cost.cache_read_per_1m: required once input_per_1m is set; leaving it zero prices every cached token as free, which overstates this deployment's savings and understates its cost by the whole of its cache traffic",
+			path))
+	} else if cost.CacheReadPer1M >= cost.InputPer1M {
+		errs = append(errs, fmt.Errorf(
+			"%s.cost.cache_read_per_1m: must be below input_per_1m (got %v against %v); a cache read costing as much as fresh input means prompt caching saves nothing, which no provider charges and a gateway cannot report",
+			path, cost.CacheReadPer1M, cost.InputPer1M))
+	}
+
+	// A cache write is an Anthropic construct: it is charged at a premium over
+	// input and reported as its own counter. OpenAI-compatible providers cache
+	// automatically and charge nothing to write, so requiring a price there
+	// would be inventing one.
+	if d.Params.Format == core.FormatAnthropic {
+		if cost.CacheWritePer1M <= 0 {
+			errs = append(errs, fmt.Errorf(
+				"%s.cost.cache_write_per_1m: required on an anthropic deployment once input_per_1m is set; a cache write costs a premium over input, and pricing it at zero hides the one cost that makes bad cache routing expensive",
+				path))
+		} else if cost.CacheWritePer1M <= cost.InputPer1M {
+			errs = append(errs, fmt.Errorf(
+				"%s.cost.cache_write_per_1m: must exceed input_per_1m (got %v against %v); writing the cache is charged at a premium, and a price at or below input makes a cache miss look free",
+				path, cost.CacheWritePer1M, cost.InputPer1M))
+		}
+		if h := cost.CacheWrite1hPer1M; h > 0 && h < cost.CacheWritePer1M {
+			errs = append(errs, fmt.Errorf(
+				"%s.cost.cache_write_1h_per_1m: must be at least cache_write_per_1m (got %v against %v); the longer-lived cache is the more expensive one to write",
+				path, h, cost.CacheWritePer1M))
+		}
+	}
+	return errs
 }

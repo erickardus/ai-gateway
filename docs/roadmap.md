@@ -107,6 +107,20 @@ every request — the same objection that keeps in-flight and latency local.
 `gateway_prompt_affinity_total{outcome="miss"}` alongside `gateway_in_flight`
 shows the bound firing.
 
+### 🟡 Cache-write tiers are priced, not verified
+
+The gateway reads Anthropic's `cache_creation` breakdown and prices the
+one-hour tier separately from the five-minute one. Where a deployment has no
+`cache_write_1h_per_1m` it falls back to the five-minute price and logs a
+warning naming the deployment, once, on the first response that reports a long
+write.
+
+That is the right default and an honest signal, but it is still a fallback: the
+window between the first long write and an operator reading that line is billed
+at the lower rate. Refusing the request instead would be worse — the traffic is
+already served — and refusing the config would demand a price from every
+operator whose callers never use the longer TTL.
+
 ### 🟡 Budget windows reset lazily
 
 A key's budget window resets on its **first request after** the window elapses,
@@ -137,6 +151,24 @@ guarantee that makes the passthrough path work.
 If it is wanted, the shape is a `Transformer` between ingress and `provider`,
 applied only to deployments whose format differs from the ingress, never on the
 passthrough path.
+
+### 🔴 OpenAI's `prompt_cache_key` is not sent
+
+An OpenAI-compatible provider caches automatically, keyed on the prefix itself.
+`prompt_cache_key` is an optional field that biases that provider's own internal
+routing, and it earns its keep for a caller sending one prefix at high rates —
+which is what a company standardizing on one system prompt looks like.
+
+The gateway does not send it. Doing so means editing the request body, and body
+rewrites carry the constraints that already keep breakpoint injection off the
+passthrough path: the response-cache key, retry and fallback all assume one set
+of bytes per request, and an OpenAI-*compatible* server that is strict about
+unknown fields would 400 rather than ignore it.
+
+The seam is the same one injection wants: a per-deployment body transform
+carried on `provider.Request` and applied by `Client.Do`. Prefix affinity
+already gives the gateway the fingerprint such a key would be derived from, so
+the work is the plumbing rather than the value.
 
 ### 🔴 No cache-hit-rate signal per prefix
 
@@ -215,6 +247,8 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | `anthropic-beta` | forwarded verbatim | LiteLLM validates against a pinned list, which breaks on new Claude Code releases |
 | Cache scope | per-key by default | shared-by-default leaks completions across tenants |
 | Provider prompt cache | routed for | LiteLLM balances without regard to it, so every hop pays a cache write instead of a read |
+| OpenAI cached tokens | carved out of `prompt_tokens` | they are reported *inside* the input count, so adding them beside it bills every cached token twice |
+| Anthropic cache-write tiers | priced apart | the one-hour cache costs 2x base input against the five-minute tier's 1.25x |
 | Passthrough cost | not billed to the operator | it is billed to the caller's subscription |
 
 ---
