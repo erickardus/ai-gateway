@@ -37,6 +37,8 @@ var (
 	ErrUpstreamHostNotAllowed = errors.New("upstream host not in allowlist")
 	// ErrBodyTooLarge means the request body exceeded the configured limit.
 	ErrBodyTooLarge = errors.New("request body too large")
+	// ErrBudgetExceeded means the key has spent its budget for the window.
+	ErrBudgetExceeded = errors.New("budget exceeded")
 )
 
 // StatusFor maps a gateway error to the HTTP status the client should see.
@@ -57,6 +59,10 @@ func StatusFor(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, ErrRateLimited):
 		return http.StatusTooManyRequests
+	case errors.Is(err, ErrBudgetExceeded):
+		// 402 rather than 429: the caller is not going too fast, they are out of
+		// money, and retrying later will not help until the window rolls over.
+		return http.StatusPaymentRequired
 	case errors.Is(err, ErrNoHealthyDeployment):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrBodyTooLarge):

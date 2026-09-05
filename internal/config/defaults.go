@@ -27,6 +27,9 @@ const (
 	DefaultBackoffMax      = 8 * time.Second
 	DefaultBackoffJitter   = 0.75
 	DefaultMaxFallbackHops = 5
+
+	// DefaultSpendFlushInterval paces persistence of the spend ledger.
+	DefaultSpendFlushInterval = 30 * time.Second
 )
 
 // Strategy names accepted by router.strategy.
@@ -120,5 +123,8 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Observability.LogFormat == "" {
 		c.Observability.LogFormat = "text"
+	}
+	if c.Observability.SpendFlushInterval == 0 {
+		c.Observability.SpendFlushInterval = DefaultSpendFlushInterval
 	}
 }

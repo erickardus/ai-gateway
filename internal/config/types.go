@@ -41,6 +41,10 @@ type Deployment struct {
 	Weight *int `yaml:"weight"`
 	RPM    int  `yaml:"rpm"`
 	TPM    int  `yaml:"tpm"`
+	// Cost prices this deployment's tokens. It is meaningless on a passthrough
+	// deployment, where the upstream bills the caller's own subscription rather
+	// than the operator, and is rejected there.
+	Cost core.Pricing `yaml:"cost"`
 
 	// id is derived at load time and is stable for a given config.
 	id string
@@ -195,12 +199,25 @@ type KeySpec struct {
 	AllowPassthrough bool       `yaml:"allow_passthrough"`
 	Blocked          bool       `yaml:"blocked"`
 	ExpiresAt        *time.Time `yaml:"expires_at"`
+	// MaxBudget caps what this key may spend within BudgetDuration. Zero means
+	// unlimited. Only billable traffic counts toward it.
+	MaxBudget float64 `yaml:"max_budget"`
+	// BudgetDuration is the window MaxBudget applies over. Zero means the key's
+	// whole lifetime.
+	BudgetDuration time.Duration `yaml:"budget_duration"`
 }
 
-// ObservabilityConfig controls logging.
+// ObservabilityConfig controls logging, metrics and spend persistence.
 type ObservabilityConfig struct {
 	LogLevel  string `yaml:"log_level"`
 	LogFormat string `yaml:"log_format"`
+	// Metrics enables GET /metrics in the Prometheus text format.
+	Metrics bool `yaml:"metrics"`
+	// SpendStorePath persists the spend ledger so budgets survive a restart.
+	// Empty keeps it in memory only.
+	SpendStorePath string `yaml:"spend_store_path"`
+	// SpendFlushInterval is how often the ledger is written to disk.
+	SpendFlushInterval time.Duration `yaml:"spend_flush_interval"`
 }
 
 // Groups returns deployments indexed by public model name, preserving

@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/jsonx"
+	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/provider"
 	"github.com/erickardus/ai-gateway/internal/router"
 )
@@ -36,28 +38,36 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // read the body once, route, relay.
 func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstreamPath string, format core.Format) {
 	ctx := r.Context()
+	started := time.Now()
+	obs := observation{}
 
 	authCtx, err := s.auth.Authenticate(ctx, r.Header)
 	if err != nil {
+		s.reject(r, &obs, "unauthenticated", started)
 		s.fail(w, r, err)
 		return
 	}
+	obs.keyHash, obs.keyAlias = authCtx.Key.Hash, authCtx.Key.Alias
 
 	body, err := s.readBody(r)
 	if err != nil {
+		s.reject(r, &obs, "body_too_large", started)
 		s.fail(w, r, err)
 		return
 	}
 
 	fields, err := jsonx.Peek(body)
 	if err != nil {
+		s.reject(r, &obs, "malformed_body", started)
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
 		return
 	}
 	if fields.Model == "" {
+		s.reject(r, &obs, "missing_model", started)
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "request body is missing the \"model\" field")
 		return
 	}
+	obs.model = fields.Model
 	// Annotate the access log with who is calling and what they asked for. The
 	// alias is used where a key has one; otherwise a redacted fingerprint, which
 	// identifies the key across log lines without ever exposing it.
@@ -70,17 +80,27 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	}
 
 	if err := s.auth.AuthorizeModel(authCtx, fields.Model); err != nil {
+		s.reject(r, &obs, "model_forbidden", started)
 		s.fail(w, r, err)
 		return
 	}
 	if !s.router.HasGroup(fields.Model) {
+		s.reject(r, &obs, "model_unknown", started)
 		s.fail(w, r, fmt.Errorf("model %q: %w", fields.Model, core.ErrModelNotFound))
+		return
+	}
+
+	// Refuse a key that has already spent its budget before incurring more cost.
+	if err := s.auth.CheckBudget(ctx, authCtx, s.ledger); err != nil {
+		s.reject(r, &obs, "budget_exceeded", started)
+		s.fail(w, r, err)
 		return
 	}
 
 	// Charge the key's rate limit only now that the request is known to be one
 	// the gateway will actually dispatch.
 	if err := s.auth.Admit(authCtx); err != nil {
+		s.reject(r, &obs, "rate_limited", started)
 		s.fail(w, r, err)
 		return
 	}
@@ -111,10 +131,22 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	result, err := s.router.Route(ctx, fields.Model, req, overrides)
 	if err != nil {
+		obs.outcome = metrics.OutcomeGateway
+		var upstream *core.UpstreamError
+		if errors.As(err, &upstream) {
+			obs.outcome, obs.deployment = metrics.OutcomeUpstream, upstream.Deployment
+		}
+		obs.latency = time.Since(started)
+		s.record(r, obs)
 		s.fail(w, r, err)
 		return
 	}
 	defer result.Response.Body.Close()
+
+	obs.deployment = result.Deployment.ID()
+	obs.retries, obs.fallbacks = result.AttemptedRetries, result.AttemptedFallback
+	s.metrics.InFlightAdd(obs.model, obs.deployment, 1)
+	defer s.metrics.InFlightAdd(obs.model, obs.deployment, -1)
 
 	provider.SanitizeResponseHeaders(w.Header(), result.Response.Header)
 	w.Header().Set("x-gateway-model-id", fields.Model)
@@ -136,6 +168,23 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	if authCtx.Key != nil {
 		s.auth.Limiter().AddTokens(authCtx.Key.Hash, usage.Total())
 	}
+
+	obs.usage = usage
+	obs.outcome = metrics.OutcomeSuccess
+	if relayErr != nil {
+		obs.outcome = metrics.OutcomeUpstream
+	}
+	obs.latency = time.Since(started)
+	s.record(r, obs)
+}
+
+// reject records a request refused before dispatch. Such a request consumed no
+// upstream capacity, so it carries a reason rather than a deployment.
+func (s *Server) reject(r *http.Request, obs *observation, reason string, started time.Time) {
+	obs.outcome = metrics.OutcomeRejected
+	obs.rejectReason = reason
+	obs.latency = time.Since(started)
+	s.metrics.Observe(obs.toResult(0))
 }
 
 // readBody reads the request body under the configured size limit.
@@ -213,6 +262,10 @@ func classify(err error, status int) (kind, message string) {
 		return "not_found_error", "no such model"
 	case errors.Is(err, core.ErrRateLimited):
 		return "rate_limit_error", "rate limit exceeded"
+	case errors.Is(err, core.ErrBudgetExceeded):
+		// Say what happened without disclosing the figures, which belong to the
+		// operator rather than the caller.
+		return "budget_error", "this key has exhausted its budget for the current window"
 	case errors.Is(err, core.ErrNoHealthyDeployment):
 		return "api_error", "no healthy deployment available for this model"
 	case errors.Is(err, core.ErrBodyTooLarge):

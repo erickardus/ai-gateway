@@ -13,21 +13,49 @@ import (
 
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/config"
+	"github.com/erickardus/ai-gateway/internal/core"
+	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/router"
+	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
 // Server wires the gateway's dependencies to its HTTP handlers.
 type Server struct {
-	cfg    *config.Config
-	auth   *auth.Authenticator
-	store  auth.KeyStore
-	router *router.Router
-	log    *slog.Logger
+	cfg     *config.Config
+	auth    *auth.Authenticator
+	store   auth.KeyStore
+	router  *router.Router
+	log     *slog.Logger
+	ledger  spend.Store
+	metrics *metrics.Registry
+	// pricing maps a deployment ID to its price and whether the operator pays
+	// it, resolved once at construction rather than searched per request.
+	pricing map[string]deploymentPricing
 }
 
-// New builds a Server.
-func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr *router.Router, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, auth: authn, store: store, router: rtr, log: log}
+// deploymentPricing is what one deployment costs the operator.
+type deploymentPricing struct {
+	price core.Pricing
+	// billable is false for a passthrough deployment, where the caller's own
+	// subscription is charged rather than the operator's account.
+	billable bool
+}
+
+// New builds a Server. ledger and reg may be nil, which disables spend
+// accounting and metrics respectively.
+func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr *router.Router, log *slog.Logger, ledger spend.Store, reg *metrics.Registry) *Server {
+	pricing := make(map[string]deploymentPricing, len(cfg.ModelList))
+	for i := range cfg.ModelList {
+		d := &cfg.ModelList[i]
+		pricing[d.ID()] = deploymentPricing{
+			price:    d.Cost,
+			billable: d.Params.AuthMode != core.AuthModePassthrough,
+		}
+	}
+	return &Server{
+		cfg: cfg, auth: authn, store: store, router: rtr, log: log,
+		ledger: ledger, metrics: reg, pricing: pricing,
+	}
 }
 
 // Handler returns the fully wired HTTP handler.
@@ -51,6 +79,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/hello", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+
+	// Observability.
+	if s.cfg.Observability.Metrics {
+		mux.HandleFunc("GET /metrics", s.handleMetrics)
+	}
+	mux.HandleFunc("GET /spend/keys", s.handleSpendKeys)
+	mux.HandleFunc("GET /spend/deployments", s.handleSpendDeployments)
 
 	// Health.
 	mux.HandleFunc("GET /health", s.handleHealth)

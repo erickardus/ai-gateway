@@ -15,8 +15,10 @@ import (
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
+	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/provider"
 	"github.com/erickardus/ai-gateway/internal/router"
+	"github.com/erickardus/ai-gateway/internal/spend"
 	"github.com/erickardus/ai-gateway/internal/testutil"
 )
 
@@ -48,6 +50,8 @@ func (c *captured) get() (http.Header, []byte, string, string) {
 
 // harness builds a gateway in front of a fake upstream.
 type harness struct {
+	ledger   *spend.Ledger
+	metrics  *metrics.Registry
 	gateway  http.Handler
 	upstream *httptest.Server
 	seen     *captured
@@ -61,6 +65,7 @@ type harnessOpts struct {
 	masterKey        string
 	maxBodyBytes     int64
 	rpmLimit         int
+	maxBudget        float64
 }
 
 func intPtr(n int) *int { return &n }
@@ -104,8 +109,13 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		params.APIKey = "sk-ant-api03-SERVERSIDE"
 	}
 
+	deployment := config.Deployment{ModelName: "anthropic-claude", Params: params, Weight: intPtr(1)}
+	if mode == "api_key" {
+		// Priced so cost accounting has something to compute.
+		deployment.Cost = core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
+	}
 	cfg := &config.Config{
-		ModelList: []config.Deployment{{ModelName: "anthropic-claude", Params: params, Weight: intPtr(1)}},
+		ModelList: []config.Deployment{deployment},
 		Router:    config.RouterConfig{Strategy: config.StrategyWeightedShuffle},
 		VirtualKeys: config.VirtualKeysConfig{
 			MasterKey:            opts.masterKey,
@@ -116,6 +126,10 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 				AllowPassthrough: opts.allowPassthrough, RPMLimit: opts.rpmLimit,
 			}},
 		},
+	}
+	cfg.Observability.Metrics = true
+	if opts.maxBudget > 0 {
+		cfg.VirtualKeys.Keys[0].MaxBudget = opts.maxBudget
 	}
 	if opts.maxBodyBytes > 0 {
 		cfg.Server.MaxBodyBytes = opts.maxBodyBytes
@@ -141,8 +155,12 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		t.Fatalf("router.New: %v", err)
 	}
 
+	ledger := spend.New()
+	reg := metrics.New()
 	return &harness{
-		gateway:  New(cfg, authn, store, rtr, log).Handler(),
+		ledger:   ledger,
+		metrics:  reg,
+		gateway:  New(cfg, authn, store, rtr, log, ledger, reg).Handler(),
 		upstream: upstream,
 		seen:     seen,
 		logBuf:   logBuf,
@@ -411,7 +429,7 @@ func TestPanicAfterCommitDoesNotCorruptResponse(t *testing.T) {
 	})
 	_ = srv
 
-	s := &Server{cfg: &config.Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s := &Server{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
 	rec := httptest.NewRecorder()
 	s.withMiddleware(inner).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
 
@@ -426,7 +444,7 @@ func TestPanicAfterCommitDoesNotCorruptResponse(t *testing.T) {
 
 // A panic before anything is written must still produce a clean 500.
 func TestPanicBeforeCommitReturns500(t *testing.T) {
-	s := &Server{cfg: &config.Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s := &Server{cfg: &config.Config{}, log: slog.New(slog.DiscardHandler)}
 	inner := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom early") })
 
 	rec := httptest.NewRecorder()

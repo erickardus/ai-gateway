@@ -87,6 +87,11 @@ type Key struct {
 	Blocked          bool       `json:"blocked,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	// MaxBudget caps billable spend within BudgetDuration. Zero is unlimited.
+	MaxBudget float64 `json:"max_budget,omitempty"`
+	// BudgetDuration is the window MaxBudget applies over; zero means the key's
+	// whole lifetime.
+	BudgetDuration time.Duration `json:"budget_duration,omitempty"`
 }
 
 // Expired reports whether the key's expiry has passed as of now.
@@ -135,13 +140,50 @@ func matchPattern(pattern, s string) bool {
 
 // Usage records token consumption reported by an upstream response. Fields are
 // zero when the upstream did not report them.
+//
+// The cache fields matter for cost rather than volume: a cache read is priced at
+// a fraction of ordinary input and a cache write at a premium, and Claude Code
+// leans on prompt caching heavily, so a cost computed from input and output
+// alone would be wrong by a wide margin on exactly the traffic this gateway is
+// built for.
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
+	InputTokens      int
+	OutputTokens     int
+	CacheReadTokens  int
+	CacheWriteTokens int
 }
 
-// Total returns the combined token count.
-func (u Usage) Total() int { return u.InputTokens + u.OutputTokens }
+// Total returns every token the upstream reported, for rate limiting.
+func (u Usage) Total() int {
+	return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens
+}
+
+// Empty reports whether the upstream reported no usage at all.
+func (u Usage) Empty() bool { return u.Total() == 0 }
+
+// Pricing is a deployment's per-token cost, expressed per million tokens because
+// that is how providers publish it and because per-token figures are small
+// enough to lose precision when written by hand.
+type Pricing struct {
+	InputPer1M      float64 `yaml:"input_per_1m"`
+	OutputPer1M     float64 `yaml:"output_per_1m"`
+	CacheReadPer1M  float64 `yaml:"cache_read_per_1m"`
+	CacheWritePer1M float64 `yaml:"cache_write_per_1m"`
+}
+
+// Zero reports whether no pricing was configured.
+func (p Pricing) Zero() bool {
+	return p.InputPer1M == 0 && p.OutputPer1M == 0 && p.CacheReadPer1M == 0 && p.CacheWritePer1M == 0
+}
+
+// Cost returns what a request cost, in the currency the pricing was written in.
+func (p Pricing) Cost(u Usage) float64 {
+	const perMillion = 1_000_000.0
+	return float64(u.InputTokens)*p.InputPer1M/perMillion +
+		float64(u.OutputTokens)*p.OutputPer1M/perMillion +
+		float64(u.CacheReadTokens)*p.CacheReadPer1M/perMillion +
+		float64(u.CacheWriteTokens)*p.CacheWritePer1M/perMillion
+}
 
 // ControlHeaders are the headers the gateway interprets for its own routing and
 // then consumes. They are listed here rather than in each package that touches

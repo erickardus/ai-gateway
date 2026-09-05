@@ -35,6 +35,9 @@ model_list:
       auth_mode: passthrough
     weight: 10
     rpm: 1000
+    # No `cost` here, and none is allowed: a passthrough deployment bills the
+    # caller's own subscription, so pricing it would invent a charge the
+    # operator never receives. Its traffic is reported as usage with no cost.
 
   # Deployment 2 — same public name, but billed to a server-side API key.
   # Requests overflow here when deployment 1 is rate limited or ejected.
@@ -48,6 +51,14 @@ model_list:
       api_key: ${ANTHROPIC_API_KEY}
     weight: 1
     rpm: 500
+    # Priced per million tokens, as providers publish it. The cache figures
+    # matter: Claude Code leans on prompt caching, and a cache read costs about
+    # a tenth of ordinary input, so a cost model without them is badly wrong.
+    cost:
+      input_per_1m: 3.00
+      output_per_1m: 15.00
+      cache_read_per_1m: 0.30
+      cache_write_per_1m: 3.75
 
   # A cheaper group to fall back to.
   - model_name: anthropic-claude-haiku
@@ -59,6 +70,11 @@ model_list:
       auth_header: x-api-key
       api_key: ${ANTHROPIC_API_KEY}
     weight: 1
+    cost:
+      input_per_1m: 1.00
+      output_per_1m: 5.00
+      cache_read_per_1m: 0.10
+      cache_write_per_1m: 1.25
 
   # An OpenAI-format deployment, reachable at /v1/chat/completions. There is no
   # cross-format translation: an Anthropic ingress routes only to anthropic
@@ -138,6 +154,10 @@ virtual_keys:
       models: ["anthropic-claude", "anthropic-claude-haiku"]
       rpm_limit: 200
       tpm_limit: 400000
+      # Spend cap for the window below. Only billable traffic counts, so
+      # subscription passthrough never consumes it.
+      max_budget: 50.0
+      budget_duration: 720h
       # Required before this key may reach a passthrough deployment.
       allow_passthrough: true
 
@@ -145,3 +165,12 @@ observability:
   log_level: info
   # text | json
   log_format: text
+
+  # Serve GET /metrics in the Prometheus text format. Unauthenticated, like the
+  # liveness probe, but exposes only counters — no hostnames or auth modes.
+  metrics: true
+
+  # Persist the spend ledger so budgets survive a restart. Without it every
+  # restart hands each key a fresh allowance.
+  spend_store_path: ./data/spend.json
+  spend_flush_interval: 30s

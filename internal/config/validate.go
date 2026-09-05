@@ -51,6 +51,7 @@ func (c *Config) Validate() error {
 		{"router.cooldown.period", c.Router.Cooldown.Period},
 		{"router.backoff.initial", c.Router.Backoff.Initial},
 		{"router.backoff.max", c.Router.Backoff.Max},
+		{"observability.spend_flush_interval", c.Observability.SpendFlushInterval},
 	} {
 		if d.value < 0 {
 			errs = append(errs, fmt.Errorf("%s: must not be negative, got %s", d.path, d.value))
@@ -121,6 +122,10 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("%s.params.auth_header: required when auth_mode is api_key", p))
 			}
 		case core.AuthModePassthrough:
+			if !d.Cost.Zero() {
+				errs = append(errs, fmt.Errorf(
+					"%s.cost: must be empty when auth_mode is passthrough; the upstream bills the caller's own subscription rather than the operator, so a price here would invent a charge nobody receives", p))
+			}
 			if d.Params.APIKey != "" {
 				errs = append(errs, fmt.Errorf("%s.params.api_key: must be empty when auth_mode is passthrough (the caller's own credential is relayed)", p))
 			}
@@ -188,6 +193,12 @@ func (c *Config) Validate() error {
 
 	for i, k := range c.VirtualKeys.Keys {
 		p := fmt.Sprintf("virtual_keys.keys[%d]", i)
+		if k.MaxBudget < 0 {
+			errs = append(errs, fmt.Errorf("%s.max_budget: must be >= 0, got %v", p, k.MaxBudget))
+		}
+		if k.BudgetDuration < 0 {
+			errs = append(errs, fmt.Errorf("%s.budget_duration: must not be negative, got %s", p, k.BudgetDuration))
+		}
 		if k.Key == "" {
 			errs = append(errs, fmt.Errorf("%s.key: required (unset or empty ${ENV} reference?)", p))
 		}

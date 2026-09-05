@@ -9,6 +9,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/limiter"
+	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
 // Context carries the authenticated caller through a request. It is returned
@@ -49,6 +50,8 @@ func NewAuthenticator(ctx context.Context, store KeyStore, cfg config.VirtualKey
 			Blocked:          spec.Blocked,
 			CreatedAt:        time.Now().UTC(),
 			ExpiresAt:        spec.ExpiresAt,
+			MaxBudget:        spec.MaxBudget,
+			BudgetDuration:   spec.BudgetDuration,
 		}
 		if err := store.Put(ctx, k); err != nil {
 			return nil, fmt.Errorf("seed virtual_keys.keys[%d]: %w", i, err)
@@ -98,6 +101,27 @@ func (a *Authenticator) Authenticate(ctx context.Context, h http.Header) (*Conte
 		return nil, err
 	}
 	return &Context{Key: key, Credentials: creds}, nil
+}
+
+// CheckBudget reports whether the key has spend remaining for its window.
+//
+// It is a pre-call check, so a key that has already overspent is refused before
+// the gateway incurs any further cost. Only billable traffic counts: requests
+// served by a passthrough deployment bill the caller's own subscription and so
+// never consume a budget the operator set.
+func (a *Authenticator) CheckBudget(ctx context.Context, ac *Context, ledger spend.Store) error {
+	if ac == nil || ac.Key == nil || ac.Key.MaxBudget <= 0 || ledger == nil {
+		return nil
+	}
+	spent, err := ledger.KeySpend(ctx, ac.Key.Hash, ac.Key.BudgetDuration)
+	if err != nil {
+		return fmt.Errorf("read key spend: %w", err)
+	}
+	if spent >= ac.Key.MaxBudget {
+		return fmt.Errorf("key %q has spent %.4f of its %.4f budget: %w",
+			ac.Key.Alias, spent, ac.Key.MaxBudget, core.ErrBudgetExceeded)
+	}
+	return nil
 }
 
 // Admit charges one request against the key's rate limits. It is deliberately

@@ -70,6 +70,8 @@ claude    # /login → "Claude account with subscription"
 | `GET /health` | Per-deployment status and the active strategy. Requires a key: it discloses upstream hosts. |
 | `GET /health/liveliness`, `/health/readiness` | Probes, unauthenticated. |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | Key management, master-key only. |
+| `GET /spend/keys`, `GET /spend/deployments` | Usage and cost reports, master-key only. |
+| `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. |
 
 ## Scope
 
@@ -89,7 +91,7 @@ interface waiting for it.
 | Credential isolation + subscription passthrough | ✅ |
 | Streaming (SSE) | ✅ |
 | Health checks, timeouts | ✅ |
-| Spend tracking / budgets | ⏳ |
+| Spend tracking, cost attribution and budgets | ✅ |
 | Caching, guardrails | ⏳ |
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
 | Admin UI, teams, MCP gateway | ⏳ |
@@ -103,6 +105,7 @@ unchanged, and translation is the opposite of that.
 
 - **[docs/claude-code.md](docs/claude-code.md)** — subscription passthrough setup
 - **[docs/routing.md](docs/routing.md)** — strategies, retries, cooldowns, fallbacks
+- **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics
 
 ## Development
 

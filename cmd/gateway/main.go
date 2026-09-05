@@ -14,12 +14,15 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/config"
+	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/provider"
 	"github.com/erickardus/ai-gateway/internal/router"
 	"github.com/erickardus/ai-gateway/internal/server"
+	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -83,7 +86,43 @@ func run() error {
 		return fmt.Errorf("initialize router: %w", err)
 	}
 
-	srv := server.New(cfg, authn, store, rtr, log).HTTPServer()
+	ledger, err := newSpendLedger(cfg.Observability)
+	if err != nil {
+		return err
+	}
+	var reg *metrics.Registry
+	if cfg.Observability.Metrics {
+		reg = metrics.New()
+	}
+
+	srv := server.New(cfg, authn, store, rtr, log, ledger, reg).HTTPServer()
+
+	// Persist the ledger periodically and once more on the way out, so a
+	// restart does not hand every key a fresh budget.
+	if cfg.Observability.SpendStorePath != "" {
+		flushDone := make(chan struct{})
+		go func() {
+			defer close(flushDone)
+			ticker := time.NewTicker(cfg.Observability.SpendFlushInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := ledger.Flush(); err != nil {
+						log.Warn("flush spend ledger", "error", err)
+					}
+				}
+			}
+		}()
+		defer func() {
+			<-flushDone
+			if err := ledger.Flush(); err != nil {
+				log.Error("final spend ledger flush failed", "error", err)
+			}
+		}()
+	}
 
 	log.Info("starting gateway",
 		"version", version,
@@ -92,6 +131,8 @@ func run() error {
 		"model_groups", len(cfg.Groups()),
 		"deployments", len(cfg.ModelList),
 		"key_management", authn.HasMasterKey(),
+		"metrics", cfg.Observability.Metrics,
+		"spend_store", cfg.Observability.SpendStorePath != "",
 	)
 
 	errCh := make(chan error, 1)
@@ -122,6 +163,18 @@ func run() error {
 	}
 	log.Info("gateway stopped")
 	return nil
+}
+
+// newSpendLedger builds the spend ledger, persisted when a path is configured.
+func newSpendLedger(cfg config.ObservabilityConfig) (*spend.Ledger, error) {
+	if cfg.SpendStorePath == "" {
+		return spend.New(), nil
+	}
+	ledger, err := spend.NewFileLedger(cfg.SpendStorePath)
+	if err != nil {
+		return nil, fmt.Errorf("open spend ledger: %w", err)
+	}
+	return ledger, nil
 }
 
 // newKeyStore builds the configured key store.

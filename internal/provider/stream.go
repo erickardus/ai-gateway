@@ -97,12 +97,21 @@ func (s *usageSniffer) observe(chunk []byte) {
 // usageEnvelope covers both the Anthropic and OpenAI shapes; absent fields
 // decode as zero.
 type usageEnvelope struct {
-	Usage *struct {
-		InputTokens      int `json:"input_tokens"`
-		OutputTokens     int `json:"output_tokens"`
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
+	Usage *usageFields `json:"usage"`
+	// Anthropic reports usage on message_start nested under "message".
+	Message *struct {
+		Usage *usageFields `json:"usage"`
+	} `json:"message"`
+}
+
+type usageFields struct {
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	// Anthropic prompt-caching counters.
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 }
 
 // flush scans whatever partial line remains once the stream ends.
@@ -122,15 +131,23 @@ func (s *usageSniffer) scanLine(line []byte) {
 		return
 	}
 	var env usageEnvelope
-	if err := json.Unmarshal(payload, &env); err != nil || env.Usage == nil {
+	if err := json.Unmarshal(payload, &env); err != nil {
 		return
 	}
-	// Streaming responses report usage incrementally; keep the largest seen so
-	// the final tally wins regardless of event ordering.
-	if in := max(env.Usage.InputTokens, env.Usage.PromptTokens); in > s.usage.InputTokens {
-		s.usage.InputTokens = in
+	u := env.Usage
+	if u == nil && env.Message != nil {
+		u = env.Message.Usage
 	}
-	if out := max(env.Usage.OutputTokens, env.Usage.CompletionTokens); out > s.usage.OutputTokens {
-		s.usage.OutputTokens = out
+	if u == nil {
+		return
 	}
+
+	// Streaming responses report usage incrementally, and the cache counters
+	// arrive on message_start while output arrives on message_delta. Keeping the
+	// largest seen for each field means the final tally is correct regardless of
+	// which event carried which counter.
+	s.usage.InputTokens = max(s.usage.InputTokens, u.InputTokens, u.PromptTokens)
+	s.usage.OutputTokens = max(s.usage.OutputTokens, u.OutputTokens, u.CompletionTokens)
+	s.usage.CacheReadTokens = max(s.usage.CacheReadTokens, u.CacheReadInputTokens)
+	s.usage.CacheWriteTokens = max(s.usage.CacheWriteTokens, u.CacheCreationInputTokens)
 }
