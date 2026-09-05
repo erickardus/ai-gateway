@@ -95,18 +95,31 @@ type Result struct {
 	Deployment        *config.Deployment
 	AttemptedRetries  int
 	AttemptedFallback int
-	// PromptAffinity reports what the prompt-prefix pin did for this request:
-	// AffinityHit when the pinned deployment served it, AffinityMiss when a pin
-	// was consulted and something else served it anyway, and AffinityOff when
-	// no pin was in play. It is what makes a cache-affinity regression visible
-	// before it shows up as a bill.
+	// PromptAffinity reports what the prompt-prefix pin did for this request.
+	// It is what makes a cache-affinity regression visible before it shows up
+	// as a bill.
 	PromptAffinity string
 }
 
 // Prompt-affinity outcomes reported on a Result.
+//
+// AffinityNew and AffinityMiss are deliberately distinct. Both mean the request
+// did not land on a pinned deployment, but only a miss is a problem: a new
+// prefix has no pin to honour yet, and folding the two together would put every
+// opening turn into the miss count. That is the figure an operator alerts on,
+// and it would then never approach zero however well affinity was working.
 const (
-	AffinityOff  = ""
-	AffinityHit  = "hit"
+	// AffinityOff means no pin was in play: affinity is disabled, the request
+	// has no cacheable prefix, or the group holds a single deployment.
+	AffinityOff = ""
+	// AffinityNew means this prefix had no pin. It has one now.
+	AffinityNew = "new"
+	// AffinityHit means the pinned deployment served the request, so the
+	// upstream's prompt cache was there to be read.
+	AffinityHit = "hit"
+	// AffinityMiss means a pin existed and something else served the request
+	// anyway — the pinned deployment was cooling down, at its limit, or had
+	// already failed this request.
 	AffinityMiss = "miss"
 )
 
@@ -201,9 +214,13 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 		if attemptErr == nil {
 			affinity := AffinityOff
 			if affinityKey != "" {
-				affinity = AffinityMiss
-				if dep.ID() == pinned {
+				switch {
+				case pinned == "":
+					affinity = AffinityNew
+				case dep.ID() == pinned:
 					affinity = AffinityHit
+				default:
+					affinity = AffinityMiss
 				}
 				// Written on every success, not only on a new pin: refreshing
 				// the TTL keeps an active conversation pinned for as long as it

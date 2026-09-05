@@ -47,8 +47,11 @@ func TestAffinityPinsAConversationToOneDeployment(t *testing.T) {
 	r, _ := buildAffinityRouter(t, []int{1, 1, 1}, config.PromptCacheConfig{}, 0, exec, nil)
 
 	first := route(t, r, "prefix-a")
-	if first.PromptAffinity != AffinityMiss {
-		t.Errorf("first request: affinity = %q, want %q", first.PromptAffinity, AffinityMiss)
+	// A prefix nobody has served yet has no pin to honour. That is not a miss:
+	// counting it as one would put every opening turn into the figure an
+	// operator alerts on.
+	if first.PromptAffinity != AffinityNew {
+		t.Errorf("first request: affinity = %q, want %q", first.PromptAffinity, AffinityNew)
 	}
 	for i := range 40 {
 		res := route(t, r, "prefix-a")
@@ -307,4 +310,31 @@ func TestMemStateAffinityIsConcurrencySafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// "No pin yet" and "a pin was passed over" are different facts, and only the
+// second is a problem worth alerting on.
+func TestAffinityDistinguishesANewPrefixFromAPassedOverPin(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, _ := buildAffinityRouter(t, []int{1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	if got := route(t, r, "prefix-a").PromptAffinity; got != AffinityNew {
+		t.Errorf("unpinned prefix: affinity = %q, want %q", got, AffinityNew)
+	}
+	if got := route(t, r, "prefix-a").PromptAffinity; got != AffinityHit {
+		t.Errorf("pinned prefix: affinity = %q, want %q", got, AffinityHit)
+	}
+
+	// Eject the pinned deployment: now a pin exists and cannot be honoured.
+	pinned, _, err := state.Affinity(context.Background(), "g\x00prefix-a")
+	if err != nil {
+		t.Fatalf("Affinity: %v", err)
+	}
+	if err := state.RecordFailure(context.Background(), pinned, time.Now(), 0, time.Minute); err != nil {
+		t.Fatalf("RecordFailure: %v", err)
+	}
+	if got := route(t, r, "prefix-a").PromptAffinity; got != AffinityMiss {
+		t.Errorf("passed-over pin: affinity = %q, want %q", got, AffinityMiss)
+	}
 }

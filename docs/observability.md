@@ -114,7 +114,7 @@ the project's only dependency is a YAML parser.
 | `gateway_request_duration_seconds` | histogram | model, deployment |
 | `gateway_prompt_cache_tokens_total` | counter | model, deployment, outcome (`read`, `write`) |
 | `gateway_prompt_cache_requests_total` | counter | model, deployment, outcome (`hit`, `miss`) |
-| `gateway_prompt_affinity_total` | counter | model, deployment, outcome (`hit`, `miss`) |
+| `gateway_prompt_affinity_total` | counter | model, deployment, outcome (`hit`, `miss`, `new`) |
 | `gateway_uptime_seconds` | gauge | — |
 
 `outcome` is `success`, `upstream_error`, `gateway_error` or `rejected`.

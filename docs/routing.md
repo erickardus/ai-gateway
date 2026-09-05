@@ -164,7 +164,7 @@ A `"disable_fallbacks": true` field in the request body skips fallbacks entirely
 | `x-gateway-attempted-retries` | Retries used within the final group. |
 | `x-gateway-attempted-fallbacks` | Fallback hops taken. |
 | `x-gateway-request-id` | Correlates with the access log. |
-| `x-gateway-prompt-affinity` | `hit` or `miss` when a prompt-prefix pin was consulted; absent otherwise. |
+| `x-gateway-prompt-affinity` | `hit`, `miss`, or `new` when a prompt-prefix pin was consulted; absent otherwise. |
 
 ## Differences from LiteLLM
 

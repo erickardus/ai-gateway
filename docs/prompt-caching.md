@@ -146,8 +146,14 @@ Per response:
 | Header | Meaning |
 |---|---|
 | `x-gateway-prompt-affinity: hit` | served by the deployment holding this prefix |
-| `x-gateway-prompt-affinity: miss` | a pin was consulted, something else served it |
+| `x-gateway-prompt-affinity: new` | this prefix had no pin; it has one now |
+| `x-gateway-prompt-affinity: miss` | a pin existed and something else served it |
 | absent | no pin was in play |
+
+`new` and `miss` are deliberately separate. Both mean the request did not land on
+a pinned deployment, but only a miss is a problem — a new prefix has nothing to
+honour yet. Merging them would put every conversation's opening turn into the
+miss count.
 
 In `/metrics`:
 
@@ -155,15 +161,18 @@ In `/metrics`:
 |---|---|---|
 | `gateway_prompt_cache_tokens_total` | model, deployment, outcome=`read`\|`write` | is caching saving money |
 | `gateway_prompt_cache_requests_total` | model, deployment, outcome=`hit`\|`miss` | is caching working |
-| `gateway_prompt_affinity_total` | model, deployment, outcome=`hit`\|`miss` | is routing keeping it working |
+| `gateway_prompt_affinity_total` | model, deployment, outcome=`hit`\|`miss`\|`new` | is routing keeping it working |
 
 The three are separate on purpose. Read/write tokens show the money. Hit rate
 shows whether prompts are being cached at all. Affinity shows whether the
 router, rather than the prompts, is the reason they are not.
 
-A useful alert is a falling `gateway_prompt_affinity_total{outcome="hit"}` share
-while traffic is steady: something has started scattering conversations, and the
-bill will follow.
+A useful alert is a rising `gateway_prompt_affinity_total{outcome="miss"}` share
+while traffic is steady: something has started scattering conversations away from
+the upstreams holding their prefixes, and the bill will follow. Measure it
+against `hit` alone — including `new` in the denominator makes the ratio move
+with how many fresh conversations start, which is a fact about your traffic
+rather than about your routing.
 
 Requests that never reached an upstream — rejected, or served from the response
 cache — are excluded from the hit rate. They gave the provider no prompt to

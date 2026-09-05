@@ -189,7 +189,7 @@ capability disabled.
 | `x-gateway-attempted-retries` | Retries used within the final group. |
 | `x-gateway-attempted-fallbacks` | Fallback hops taken. |
 | `x-gateway-cache` | `hit` or `miss`, when response caching is on. |
-| `x-gateway-prompt-affinity` | `hit` or `miss`, when a prompt-prefix pin was consulted. Absent otherwise. |
+| `x-gateway-prompt-affinity` | `hit`, `miss`, or `new`, when a prompt-prefix pin was consulted. Absent otherwise. |
 
 ## Per-request overrides
 

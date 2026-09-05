@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"reflect"
 	"testing"
 	"time"
 
@@ -224,8 +225,10 @@ func TestSpendSummariesFromRedis(t *testing.T) {
 
 	l.Record(ctx, spend.Entry{
 		KeyHash: "k1", KeyAlias: "dev-laptop", DeploymentID: "dep-1",
-		Usage: core.Usage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 100},
-		Cost:  0.5, Billable: true,
+		Usage:        core.Usage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 100},
+		Cost:         0.5,
+		CacheSavings: 0.27,
+		Billable:     true,
 	})
 	// Passthrough traffic: usage but no cost.
 	l.Record(ctx, spend.Entry{
@@ -246,6 +249,9 @@ func TestSpendSummariesFromRedis(t *testing.T) {
 	}
 	if got.InputTokens != 17 || got.CacheReadTokens != 100 {
 		t.Errorf("tokens = %d input, %d cache read; want 17 and 100", got.InputTokens, got.CacheReadTokens)
+	}
+	if got.CacheSavings < 0.269 || got.CacheSavings > 0.271 {
+		t.Errorf("cache_savings = %v, want ~0.27", got.CacheSavings)
 	}
 	if got.Alias != "dev-laptop" {
 		t.Errorf("alias = %q", got.Alias)
@@ -398,5 +404,77 @@ func TestAffinityDegradesWithoutRedis(t *testing.T) {
 	}
 	if _, _, err := s.Affinity(ctx, "fp"); err != nil {
 		t.Fatalf("Affinity returned an error instead of degrading: %v", err)
+	}
+}
+
+// The Redis ledger stores its totals field by field in a Lua script, so a field
+// added to spend.Totals is only reported once it is added in three places. Miss
+// one and the endpoint answers 0 — which reads as "nothing happened" rather than
+// as missing data, beside sibling figures that are correct.
+//
+// So this compares the two implementations rather than checking known fields:
+// one entry through each, every numeric total expected to agree. A new field
+// that only lands in the local ledger fails here.
+func TestRedisLedgerMatchesTheLocalLedgerFieldForField(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	s := newStore(t, prefix)
+
+	local := spend.New()
+	shared := NewLedger(s, spend.New(), prefix, discard(), 2*time.Second)
+
+	// Every field that feeds Totals is non-zero, so a dropped one is visible as
+	// a difference rather than as two matching zeros.
+	entry := spend.Entry{
+		KeyHash: "k1", KeyAlias: "dev", DeploymentID: "dep-1",
+		Usage: core.Usage{
+			InputTokens: 11, OutputTokens: 22,
+			CacheReadTokens: 33, CacheWriteTokens: 44,
+		},
+		Cost:         1.5,
+		CacheSavings: 2.75,
+		Billable:     true,
+	}
+	if err := local.Record(ctx, entry); err != nil {
+		t.Fatalf("local Record: %v", err)
+	}
+	if err := shared.Record(ctx, entry); err != nil {
+		t.Fatalf("shared Record: %v", err)
+	}
+
+	localRows, err := local.Keys(ctx)
+	if err != nil {
+		t.Fatalf("local Keys: %v", err)
+	}
+	sharedRows, err := shared.Keys(ctx)
+	if err != nil {
+		t.Fatalf("shared Keys: %v", err)
+	}
+	if len(localRows) != 1 || len(sharedRows) != 1 {
+		t.Fatalf("got %d local and %d shared summaries, want 1 of each", len(localRows), len(sharedRows))
+	}
+
+	wantTotals := reflect.ValueOf(localRows[0].Totals)
+	gotTotals := reflect.ValueOf(sharedRows[0].Totals)
+	fields := wantTotals.Type()
+
+	for i := range fields.NumField() {
+		name := fields.Field(i).Name
+		if name == "WindowStart" {
+			continue // set from the clock, not from the entry
+		}
+		want, got := wantTotals.Field(i), gotTotals.Field(i)
+		switch want.Kind() {
+		case reflect.Int:
+			if got.Int() != want.Int() {
+				t.Errorf("%s = %d via Redis, %d locally", name, got.Int(), want.Int())
+			}
+		case reflect.Float64:
+			if diff := got.Float() - want.Float(); diff > 1e-9 || diff < -1e-9 {
+				t.Errorf("%s = %v via Redis, %v locally", name, got.Float(), want.Float())
+			}
+		default:
+			t.Errorf("%s has kind %s, which this comparison does not cover — extend it", name, want.Kind())
+		}
 	}
 }

@@ -137,11 +137,17 @@ const (
 
 // Prompt-cache outcome labels. "read" and "write" name the provider's own two
 // counters; "hit" and "miss" say whether a request read from that cache at all.
+//
+// The affinity counter uses the same "hit" and "miss" and adds "new" for a
+// prefix that had no pin yet. Keeping that third value out of "miss" is what
+// lets the miss count mean "routing passed over a warm upstream" rather than
+// also counting every conversation's opening turn.
 const (
 	OutcomeCacheRead  = "read"
 	OutcomeCacheWrite = "write"
 	OutcomeHit        = "hit"
 	OutcomeMiss       = "miss"
+	OutcomeNew        = "new"
 )
 
 // Result is everything the gateway records about one completed request.
@@ -256,7 +262,7 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 	writeCounter(&b, "gateway_rejections_total", "Requests rejected before dispatch, by reason.", snapshot.rejections)
 	writeCounter(&b, "gateway_prompt_cache_tokens_total", "Provider prompt-cache tokens, by read or write. A read is billed at a fraction of input; a write at a premium.", snapshot.promptTokens)
 	writeCounter(&b, "gateway_prompt_cache_requests_total", "Dispatched requests that did or did not read from the provider's prompt cache.", snapshot.promptRequests)
-	writeCounter(&b, "gateway_prompt_affinity_total", "Requests whose prompt-prefix pin was honoured or passed over.", snapshot.affinity)
+	writeCounter(&b, "gateway_prompt_affinity_total", "Requests by what the prompt-prefix pin did: honoured, passed over, or newly established.", snapshot.affinity)
 	writeFloatCounter(&b, "gateway_cost_total", "Cost charged to the operator. Excludes passthrough traffic, which bills the caller's own subscription.", snapshot.cost)
 	writeGauge(&b, "gateway_in_flight", "Requests currently outstanding.", snapshot.inFlight)
 	writeHistogram(&b, "gateway_request_duration_seconds", "Request latency.", snapshot.latency)

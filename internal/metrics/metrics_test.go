@@ -169,6 +169,7 @@ func TestPromptCacheSeries(t *testing.T) {
 		PromptAffinity: "hit",
 	})
 	r.Observe(Result{Model: "m", Deployment: "d", Outcome: OutcomeSuccess, Tokens: 10, PromptAffinity: "miss"})
+	r.Observe(Result{Model: "m", Deployment: "d", Outcome: OutcomeSuccess, Tokens: 10, PromptAffinity: OutcomeNew})
 
 	var b strings.Builder
 	if _, err := r.WriteTo(&b); err != nil {
@@ -180,9 +181,13 @@ func TestPromptCacheSeries(t *testing.T) {
 		`gateway_prompt_cache_tokens_total{model="m",deployment="d",outcome="read"} 100`,
 		`gateway_prompt_cache_tokens_total{model="m",deployment="d",outcome="write"} 15`,
 		`gateway_prompt_cache_requests_total{model="m",deployment="d",outcome="hit"} 1`,
-		`gateway_prompt_cache_requests_total{model="m",deployment="d",outcome="miss"} 1`,
+		`gateway_prompt_cache_requests_total{model="m",deployment="d",outcome="miss"} 2`,
 		`gateway_prompt_affinity_total{model="m",deployment="d",outcome="hit"} 1`,
 		`gateway_prompt_affinity_total{model="m",deployment="d",outcome="miss"} 1`,
+		// "new" is counted apart from "miss": a prefix with no pin yet is not a
+		// pin that was passed over, and merging them would leave the miss share
+		// permanently inflated by every opening turn.
+		`gateway_prompt_affinity_total{model="m",deployment="d",outcome="new"} 1`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("scrape is missing %q:\n%s", want, got)
@@ -190,7 +195,7 @@ func TestPromptCacheSeries(t *testing.T) {
 	}
 
 	// Prompt-cache tokens are a breakdown of the total, not an addition to it.
-	if !strings.Contains(got, `gateway_tokens_total{model="m",deployment="d"} 125`) {
+	if !strings.Contains(got, `gateway_tokens_total{model="m",deployment="d"} 135`) {
 		t.Errorf("total token counter changed:\n%s", got)
 	}
 }

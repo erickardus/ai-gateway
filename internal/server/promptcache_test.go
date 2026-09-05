@@ -47,8 +47,10 @@ func TestPromptAffinityKeepsAConversationOnOneDeployment(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", first.Code, first.Body.String())
 	}
 	pinned := first.Header().Get("x-gateway-deployment")
-	if got := first.Header().Get("x-gateway-prompt-affinity"); got != "miss" {
-		t.Errorf("first request affinity = %q, want miss", got)
+	// The opening turn has no pin to honour yet, which is reported as "new"
+	// rather than as a miss.
+	if got := first.Header().Get("x-gateway-prompt-affinity"); got != "new" {
+		t.Errorf("first request affinity = %q, want new", got)
 	}
 
 	// A growing conversation keeps the same prefix, so it keeps the same pin.
