@@ -1,0 +1,147 @@
+# ai-gateway example configuration.
+#
+# Copy to config/gateway.yaml and edit. Every ${VAR} is read from the
+# environment at load time; ${VAR:-default} supplies a fallback.
+
+server:
+  addr: "0.0.0.0:4000"
+  read_header_timeout: 30s
+  idle_timeout: 120s
+  shutdown_grace: 30s
+  max_body_bytes: 33554432
+  # Note: there is deliberately no write timeout. A write deadline applies to
+  # the whole response, so any value large enough for a long streaming
+  # completion protects nothing, and any smaller value severs streams.
+
+# A model_list entry is one deployment. Several entries may share a model_name;
+# together they form a model group that the router load-balances across.
+model_list:
+  # Deployment 1 — the Claude Code subscription path.
+  #
+  # auth_mode: passthrough relays the CALLER's own credential upstream. That is
+  # what lets Claude Code keep using a claude.ai subscription login while its
+  # traffic flows through this gateway: the OAuth token in Authorization reaches
+  # Anthropic untouched, and the gateway authenticates the caller from the
+  # separate x-gateway-key header instead. The gateway holds no credential of
+  # its own here, so api_key must be empty.
+  - model_name: anthropic-claude
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      # Keep this equal to model_name and request bodies are forwarded byte for
+      # byte. Set it to a different upstream identifier and the gateway rewrites
+      # exactly that one JSON value, leaving every other byte untouched.
+      model: anthropic-claude
+      auth_mode: passthrough
+    weight: 10
+    rpm: 1000
+
+  # Deployment 2 — same public name, but billed to a server-side API key.
+  # Requests overflow here when deployment 1 is rate limited or ejected.
+  - model_name: anthropic-claude
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      model: claude-sonnet-4-5-20250929
+      auth_mode: api_key
+      auth_header: x-api-key
+      api_key: ${ANTHROPIC_API_KEY}
+    weight: 1
+    rpm: 500
+
+  # A cheaper group to fall back to.
+  - model_name: anthropic-claude-haiku
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      model: claude-haiku-4-5-20251001
+      auth_mode: api_key
+      auth_header: x-api-key
+      api_key: ${ANTHROPIC_API_KEY}
+    weight: 1
+
+  # An OpenAI-format deployment, reachable at /v1/chat/completions. There is no
+  # cross-format translation: an Anthropic ingress routes only to anthropic
+  # deployments, and an OpenAI ingress only to openai ones.
+  - model_name: gpt
+    params:
+      format: openai
+      api_base: https://api.openai.com/v1
+      model: gpt-5
+      auth_mode: api_key
+      auth_header: authorization
+      auth_scheme: Bearer
+      api_key: ${OPENAI_API_KEY}
+    weight: 1
+
+router:
+  # weighted-shuffle | least-busy | usage-based | latency-based
+  strategy: weighted-shuffle
+
+  # Total upstream attempts is 1 + num_retries. A retry always moves to a
+  # different deployment while an untried one is available.
+  num_retries: 2
+
+  timeout: 600s
+  # For streaming requests this bounds time to the first chunk, not the whole
+  # response, which may legitimately run for minutes.
+  stream_timeout: 60s
+
+  cooldown:
+    # Failures tolerated within the period before a deployment is ejected.
+    # 0 means eject on the first failure; the value always means what it says.
+    allowed_fails: 3
+    period: 30s
+
+  # Backoff applies only when no untried deployment remains. With an
+  # alternative available the router retries immediately.
+  backoff:
+    initial: 500ms
+    max: 8s
+    jitter: 0.75
+
+  max_fallback_hops: 5
+  fallbacks:
+    - from: anthropic-claude
+      to: [anthropic-claude-haiku]
+
+  # Used by latency-based routing: widens the candidate set to every deployment
+  # within this fraction of the best observed latency.
+  lowest_latency_buffer: 0.2
+
+virtual_keys:
+  # Enables the /key/* management endpoints. Leave unset to disable them.
+  master_key: ${GATEWAY_MASTER_KEY}
+
+  store:
+    # memory | file
+    kind: file
+    path: ./data/keys.json
+
+  # Headers that may carry a virtual key, in precedence order. These must not
+  # collide with a header the client sets itself: the whole design depends on
+  # the key travelling ALONGSIDE the caller's own credential rather than
+  # replacing it. x-litellm-api-key is accepted for drop-in compatibility with
+  # tooling already pointed at a LiteLLM proxy.
+  header_names:
+    - x-gateway-key
+    - x-litellm-api-key
+
+  # A passthrough deployment relays a caller credential, so its upstream host
+  # must be listed here explicitly.
+  allowed_upstream_hosts:
+    - api.anthropic.com
+
+  keys:
+    - key: ${DEV_KEY}
+      alias: dev-laptop
+      models: ["anthropic-claude", "anthropic-claude-haiku"]
+      rpm_limit: 200
+      tpm_limit: 400000
+      # Required before this key may reach a passthrough deployment.
+      allow_passthrough: true
+
+observability:
+  log_level: info
+  # text | json
+  log_format: text
