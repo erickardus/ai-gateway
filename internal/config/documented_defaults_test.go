@@ -65,6 +65,11 @@ model_list:
 		{"cache.max_entries", cfg.Cache.MaxEntries, 1000},
 		{"cache.max_entry_bytes", cfg.Cache.MaxEntryBytes, int64(1048576)},
 
+		{"prompt_cache.affinity", cfg.PromptCache.AffinityEnabled(), true},
+		{"prompt_cache.affinity_ttl", cfg.PromptCache.AffinityTTL.String(), "5m0s"},
+		{"prompt_cache.inject", cfg.PromptCache.Inject, false},
+		{"prompt_cache.inject_min_bytes", cfg.PromptCache.InjectMinBytes, 4096},
+
 		{"observability.log_level", cfg.Observability.LogLevel, "info"},
 		{"observability.log_format", cfg.Observability.LogFormat, "text"},
 		{"observability.metrics", cfg.Observability.Metrics, false},

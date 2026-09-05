@@ -89,6 +89,15 @@ type Registry struct {
 	rejections map[labels]uint64
 	latency    map[labels]*histogram
 	inFlight   map[labels]int64
+	// promptTokens splits the provider's prompt-cache counters by outcome, and
+	// promptRequests counts how many requests read from that cache at all. The
+	// two answer different questions: whether caching is saving money, and
+	// whether it is working. Kept apart from tokens, which is the total.
+	promptTokens   map[labels]uint64
+	promptRequests map[labels]uint64
+	// affinity counts what the prompt-prefix pin achieved, which is the early
+	// warning that load balancing has started shredding prompt caches.
+	affinity map[labels]uint64
 
 	startedAt time.Time
 	now       func() time.Time
@@ -106,8 +115,12 @@ func New() *Registry {
 		rejections: map[labels]uint64{},
 		latency:    map[labels]*histogram{},
 		inFlight:   map[labels]int64{},
-		startedAt:  time.Now(),
-		now:        time.Now,
+
+		promptTokens:   map[labels]uint64{},
+		promptRequests: map[labels]uint64{},
+		affinity:       map[labels]uint64{},
+		startedAt:      time.Now(),
+		now:            time.Now,
 	}
 }
 
@@ -122,6 +135,15 @@ const (
 	OutcomeCacheHit = "cache_hit"
 )
 
+// Prompt-cache outcome labels. "read" and "write" name the provider's own two
+// counters; "hit" and "miss" say whether a request read from that cache at all.
+const (
+	OutcomeCacheRead  = "read"
+	OutcomeCacheWrite = "write"
+	OutcomeHit        = "hit"
+	OutcomeMiss       = "miss"
+)
+
 // Result is everything the gateway records about one completed request.
 type Result struct {
 	Model        string
@@ -134,6 +156,14 @@ type Result struct {
 	Fallbacks    int
 	CooledDown   bool
 	RejectReason string
+	// CacheReadTokens and CacheWriteTokens are the provider's prompt-cache
+	// counters, separate from Tokens, which is every token the upstream
+	// reported.
+	CacheReadTokens  int
+	CacheWriteTokens int
+	// PromptAffinity is "hit" or "miss" when a prompt-prefix pin was consulted,
+	// and empty when none was.
+	PromptAffinity string
 }
 
 // Observe records a completed request.
@@ -153,6 +183,25 @@ func (r *Registry) Observe(res Result) {
 	}
 	if res.Cost > 0 {
 		r.cost[unlabelled] += res.Cost
+	}
+	if res.CacheReadTokens > 0 {
+		r.promptTokens[labels{model: res.Model, deployment: res.Deployment, outcome: OutcomeCacheRead}] += uint64(res.CacheReadTokens)
+	}
+	if res.CacheWriteTokens > 0 {
+		r.promptTokens[labels{model: res.Model, deployment: res.Deployment, outcome: OutcomeCacheWrite}] += uint64(res.CacheWriteTokens)
+	}
+	// Counted only for requests that actually reached an upstream: a rejected
+	// or cache-served request never gave the provider a prompt to cache, and
+	// counting it as a miss would understate the hit rate.
+	if res.Outcome == OutcomeSuccess {
+		hit := OutcomeMiss
+		if res.CacheReadTokens > 0 {
+			hit = OutcomeHit
+		}
+		r.promptRequests[labels{model: res.Model, deployment: res.Deployment, outcome: hit}]++
+	}
+	if res.PromptAffinity != "" {
+		r.affinity[labels{model: res.Model, deployment: res.Deployment, outcome: res.PromptAffinity}]++
 	}
 	if res.Retries > 0 {
 		r.retries[unlabelled] += uint64(res.Retries)
@@ -205,6 +254,9 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 	writeCounter(&b, "gateway_fallbacks_total", "Fallback hops taken.", snapshot.fallbacks)
 	writeCounter(&b, "gateway_cooldowns_total", "Deployment ejections.", snapshot.cooldowns)
 	writeCounter(&b, "gateway_rejections_total", "Requests rejected before dispatch, by reason.", snapshot.rejections)
+	writeCounter(&b, "gateway_prompt_cache_tokens_total", "Provider prompt-cache tokens, by read or write. A read is billed at a fraction of input; a write at a premium.", snapshot.promptTokens)
+	writeCounter(&b, "gateway_prompt_cache_requests_total", "Dispatched requests that did or did not read from the provider's prompt cache.", snapshot.promptRequests)
+	writeCounter(&b, "gateway_prompt_affinity_total", "Requests whose prompt-prefix pin was honoured or passed over.", snapshot.affinity)
 	writeFloatCounter(&b, "gateway_cost_total", "Cost charged to the operator. Excludes passthrough traffic, which bills the caller's own subscription.", snapshot.cost)
 	writeGauge(&b, "gateway_in_flight", "Requests currently outstanding.", snapshot.inFlight)
 	writeHistogram(&b, "gateway_request_duration_seconds", "Request latency.", snapshot.latency)
@@ -219,6 +271,7 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 
 type snap struct {
 	requests, tokens, retries, fallbacks, cooldowns, rejections map[labels]uint64
+	promptTokens, promptRequests, affinity                      map[labels]uint64
 	cost                                                        map[labels]float64
 	inFlight                                                    map[labels]int64
 	latency                                                     map[labels]histogram
@@ -233,8 +286,12 @@ func (r *Registry) snapshotLocked() snap {
 		cooldowns:  maps.Clone(r.cooldowns),
 		rejections: maps.Clone(r.rejections),
 		cost:       maps.Clone(r.cost),
-		inFlight:   maps.Clone(r.inFlight),
-		latency:    make(map[labels]histogram, len(r.latency)),
+
+		promptTokens:   maps.Clone(r.promptTokens),
+		promptRequests: maps.Clone(r.promptRequests),
+		affinity:       maps.Clone(r.affinity),
+		inFlight:       maps.Clone(r.inFlight),
+		latency:        make(map[labels]histogram, len(r.latency)),
 	}
 	for k, h := range r.latency {
 		s.latency[k] = histogram{counts: slices.Clone(h.counts), sum: h.sum, total: h.total}

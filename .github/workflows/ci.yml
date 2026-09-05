@@ -48,3 +48,6 @@ jobs:
 
       - name: Fuzz the JSON splicer briefly
         run: go test ./internal/jsonx -run Fuzz -fuzz FuzzSetTopLevelString -fuzztime 30s
+
+      - name: Fuzz the JSON editors briefly
+        run: go test ./internal/jsonx -run Fuzz -fuzz FuzzEdit -fuzztime 30s

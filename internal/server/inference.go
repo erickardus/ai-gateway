@@ -15,6 +15,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/jsonx"
 	"github.com/erickardus/ai-gateway/internal/metrics"
+	"github.com/erickardus/ai-gateway/internal/promptcache"
 	"github.com/erickardus/ai-gateway/internal/provider"
 	"github.com/erickardus/ai-gateway/internal/router"
 )
@@ -125,6 +126,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	overrides := router.OverridesFromHeaders(r.Header)
 	overrides.AllowPassthrough = authCtx.Key != nil && authCtx.Key.AllowPassthrough
+	overrides.PromptPrefix = s.promptPrefix(format, fields)
 	if fields.HasDisableFallbacks {
 		overrides.DisableFallbacks = fields.DisableFallbacks
 		// It is a gateway directive, not part of the provider's schema, so it
@@ -135,6 +137,23 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 			return
 		}
 		body = stripped
+	}
+
+	// Mark the cacheable prefix last, once every gateway directive has been
+	// stripped: injection edits the body, and editing one that is about to
+	// change again would place a breakpoint against bytes the upstream never
+	// sees. Configuration refuses injection alongside any passthrough
+	// deployment, so no rewritten body can reach the path that must forward one
+	// unchanged.
+	if s.cfg.PromptCache.Inject && format == core.FormatAnthropic {
+		injected, changed, err := promptcache.Inject(body, s.cfg.PromptCache.InjectMinBytes)
+		if err != nil {
+			// The request is forwarded exactly as it arrived. An optimization
+			// that could not be applied is not a reason to refuse a request.
+			s.log.Warn("prompt cache injection skipped", "error", err, "request_id", RequestIDFrom(ctx))
+		} else if changed {
+			body = injected
+		}
 	}
 
 	req := &provider.Request{
@@ -163,6 +182,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	obs.deployment = result.Deployment.ID()
 	obs.retries, obs.fallbacks = result.AttemptedRetries, result.AttemptedFallback
+	obs.promptAffinity = result.PromptAffinity
 	s.metrics.InFlightAdd(obs.model, obs.deployment, 1)
 	defer s.metrics.InFlightAdd(obs.model, obs.deployment, -1)
 
@@ -174,6 +194,12 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	w.Header().Set("x-gateway-deployment", result.Deployment.ID())
 	w.Header().Set("x-gateway-attempted-retries", strconv.Itoa(result.AttemptedRetries))
 	w.Header().Set("x-gateway-attempted-fallbacks", strconv.Itoa(result.AttemptedFallback))
+	if result.PromptAffinity != router.AffinityOff {
+		// Whether the request reached the deployment holding its warm prefix is
+		// visible per request, not only in aggregate: a cache-affinity problem
+		// is otherwise only discoverable from a bill.
+		w.Header().Set(promptAffinityHeader, result.PromptAffinity)
+	}
 	w.WriteHeader(result.Response.StatusCode)
 
 	// Tee the relay when the response is a candidate for caching. The client
@@ -226,6 +252,24 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	}
 	obs.latency = time.Since(started)
 	s.record(r, obs)
+}
+
+// promptPrefix fingerprints the cacheable prefix of a request, or returns empty
+// when nothing would come of pinning it.
+//
+// Fingerprinting is skipped where it cannot pay: with affinity off, or with
+// every model group holding one deployment, hashing the system blocks and tool
+// definitions of every request would cost real time for a preference that has
+// nothing to choose between.
+func (s *Server) promptPrefix(format core.Format, fields jsonx.Fields) string {
+	if !s.cfg.PromptCache.AffinityEnabled() || !s.balanced {
+		return ""
+	}
+	fingerprint, ok := promptcache.Fingerprint(format, fields.Model, fields)
+	if !ok {
+		return ""
+	}
+	return fingerprint
 }
 
 // reject records a request refused before dispatch. Such a request consumed no

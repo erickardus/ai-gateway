@@ -120,6 +120,28 @@ func TestValidationErrors(t *testing.T) {
 			want: "must be empty when auth_mode is passthrough",
 		},
 		{
+			// Injection rewrites the request body, and the passthrough path
+			// exists to forward one unchanged.
+			name: "prompt cache injection alongside passthrough",
+			yaml: "virtual_keys:\n  allowed_upstream_hosts: [api.anthropic.com]\nprompt_cache:\n  inject: true\nmodel_list:\n  - model_name: m\n    params:\n      format: anthropic\n      api_base: https://api.anthropic.com\n      auth_mode: passthrough\n",
+			want: "prompt_cache.inject",
+		},
+		{
+			name: "prompt cache injection on an openai deployment",
+			yaml: "prompt_cache:\n  inject: true\nmodel_list:\n  - model_name: m\n    params:\n      format: openai\n      api_base: https://api.openai.com\n      auth_mode: api_key\n      auth_header: authorization\n      api_key: k\n",
+			want: "cache breakpoints are an Anthropic construct",
+		},
+		{
+			name: "negative prompt cache affinity ttl",
+			yaml: minimalConfig + "\nprompt_cache:\n  affinity_ttl: -1s\n",
+			want: "prompt_cache.affinity_ttl",
+		},
+		{
+			name: "negative prompt cache inject minimum",
+			yaml: minimalConfig + "\nprompt_cache:\n  inject_min_bytes: -1\n",
+			want: "prompt_cache.inject_min_bytes",
+		},
+		{
 			name: "api_key mode needs a credential",
 			yaml: "model_list:\n  - model_name: m\n    params:\n      format: anthropic\n      api_base: https://api.anthropic.com\n      auth_mode: api_key\n",
 			want: "params.api_key",

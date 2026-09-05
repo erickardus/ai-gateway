@@ -29,6 +29,7 @@ cover:
 .PHONY: fuzz
 fuzz:
 	go test ./internal/jsonx -run Fuzz -fuzz FuzzSetTopLevelString -fuzztime 60s
+	go test ./internal/jsonx -run Fuzz -fuzz FuzzEdit -fuzztime 60s
 
 .PHONY: vet
 vet:

@@ -72,16 +72,19 @@ func (s *Server) writeSpend(w http.ResponseWriter, r *http.Request, fetch func()
 		return
 	}
 
-	var totalCost float64
+	var totalCost, totalSavings float64
 	for _, row := range rows {
 		totalCost += row.Cost
+		totalSavings += row.CacheSavings
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"entries":    rows,
-		"count":      len(rows),
-		"total_cost": totalCost,
-		"note":       "Cost covers only deployments the operator pays for. Passthrough traffic bills the caller's own subscription and is reported as usage with no cost.",
+		"entries":             rows,
+		"count":               len(rows),
+		"total_cost":          totalCost,
+		"total_cache_savings": totalSavings,
+		"note":                "Cost covers only deployments the operator pays for. Passthrough traffic bills the caller's own subscription and is reported as usage with no cost.",
+		"cache_savings_note":  "What the provider's prompt cache took off the bill, against the same tokens charged as ordinary input. It is not included in cost, which is what was actually charged.",
 	})
 }
 
@@ -100,9 +103,10 @@ func (s *Server) record(r *http.Request, obs observation) {
 	defer cancel()
 
 	pricing := s.pricing[obs.deployment]
-	cost := 0.0
+	cost, savings := 0.0, 0.0
 	if pricing.billable {
 		cost = pricing.price.Cost(obs.usage)
+		savings = pricing.price.CacheSavings(obs.usage)
 	}
 
 	if s.ledger != nil && obs.deployment != "" {
@@ -114,6 +118,7 @@ func (s *Server) record(r *http.Request, obs observation) {
 			Usage:        obs.usage,
 			Cost:         cost,
 			Billable:     pricing.billable,
+			CacheSavings: savings,
 		}
 		if err := s.ledger.Record(ctx, entry); err != nil {
 			s.log.Warn("record spend", "error", err, "request_id", RequestIDFrom(r.Context()))
@@ -136,6 +141,9 @@ type observation struct {
 	rejectReason       string
 	retries, fallbacks int
 	latency            time.Duration
+	// promptAffinity records whether the request went to the deployment already
+	// holding its prompt prefix. Empty when no pin was consulted.
+	promptAffinity string
 }
 
 // toResult renders an observation for the metrics registry.
@@ -150,5 +158,9 @@ func (o observation) toResult(cost float64) metrics.Result {
 		Retries:      o.retries,
 		Fallbacks:    o.fallbacks,
 		RejectReason: o.rejectReason,
+
+		CacheReadTokens:  o.usage.CacheReadTokens,
+		CacheWriteTokens: o.usage.CacheWriteTokens,
+		PromptAffinity:   o.promptAffinity,
 	}
 }

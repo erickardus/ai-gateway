@@ -66,6 +66,34 @@ status ≥400 into an error, so the branch is unreachable today. It stays as
 defence in depth. A mutation test cannot currently reach it, and the code says
 so rather than looking covered.
 
+### 🟡 Breakpoint injection is refused alongside passthrough
+
+`prompt_cache.inject` rewrites the request body to mark a cacheable prefix. The
+passthrough path must forward a body unchanged, so configuration refuses the two
+together rather than letting subscription traffic be quietly rewritten. A gateway
+fronting both Claude Code and plain API callers therefore cannot use injection
+at all today, even for the callers that would benefit.
+
+The seam is a per-deployment body rewrite: `provider.Request` would carry the
+transform rather than a finished body, and `Client.Do` would apply it only for
+deployments whose auth mode permits it. That means the router can no longer
+assume one set of bytes per request, which touches retry, fallback and the
+response-cache key, so it was not worth doing before the feature had users.
+
+Claude Code places its own breakpoints, so nothing is lost on the traffic this
+gateway primarily carries.
+
+### 🟡 Prefix affinity can trade balance for cache hits
+
+A pin sends every turn of a conversation to one deployment. That is the point,
+but a small number of very long conversations will load one upstream more than
+weights alone would. The pin yields to cooldowns and rate limits, so the effect
+is bounded by whatever limits are configured — and unbounded where none are.
+
+`gateway_prompt_affinity_total` alongside `gateway_in_flight` shows whether it is
+happening. Turning `prompt_cache.affinity` off restores pure weighted balance at
+the cost of a cache write per turn.
+
 ### 🟡 Budget windows reset lazily
 
 A key's budget window resets on its **first request after** the window elapses,
@@ -96,6 +124,13 @@ guarantee that makes the passthrough path work.
 If it is wanted, the shape is a `Transformer` between ingress and `provider`,
 applied only to deployments whose format differs from the ingress, never on the
 passthrough path.
+
+### 🔴 No cache-hit-rate signal per prefix
+
+Metrics report prompt-cache hit rate per model and deployment, which answers
+"is caching working" but not "which prompt shape is missing". Answering the
+second means keying counters by fingerprint, which is unbounded cardinality on a
+Prometheus endpoint. It needs a sampled top-N, not another label.
 
 ### 🔴 Guardrails and content filtering
 
@@ -166,6 +201,7 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Rate-limit windows | monotonic | LiteLLM's wall-clock buckets wrap daily |
 | `anthropic-beta` | forwarded verbatim | LiteLLM validates against a pinned list, which breaks on new Claude Code releases |
 | Cache scope | per-key by default | shared-by-default leaks completions across tenants |
+| Provider prompt cache | routed for | LiteLLM balances without regard to it, so every hop pays a cache write instead of a read |
 | Passthrough cost | not billed to the operator | it is billed to the caller's subscription |
 
 ---

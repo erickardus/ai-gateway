@@ -46,7 +46,20 @@ type StateStore interface {
 	// half of AddTokens, so usage-based routing can go through the interface
 	// rather than reaching into a concrete implementation.
 	TokensUsed(ctx context.Context, id string) (int, error)
+	// Affinity reports which deployment last served a request carrying this
+	// prompt-prefix fingerprint, so the next one can reuse the prompt cache it
+	// warmed. A miss is not an error.
+	Affinity(ctx context.Context, fingerprint string) (string, bool, error)
+	// SetAffinity pins a fingerprint to a deployment for ttl. It is called only
+	// after a successful response, so a pin always names a deployment that has
+	// actually served this prefix.
+	SetAffinity(ctx context.Context, fingerprint, id string, ttl time.Duration) error
 }
+
+// maxAffinityEntries bounds each generation of the affinity map, so a gateway
+// seeing an unbounded stream of distinct prompts keeps flat memory. Two
+// generations are held at once, so the real ceiling is twice this.
+const maxAffinityEntries = 10_000
 
 // deploymentState is the in-memory state of a single deployment.
 type deploymentState struct {
@@ -65,11 +78,65 @@ type MemState struct {
 	mu     sync.RWMutex
 	states map[string]*deploymentState
 	limits *limiter.Limiter
+
+	// Prompt-prefix pins are held in two generations rather than one map with
+	// per-entry eviction. When the live generation fills it becomes the older
+	// one and a fresh map takes over, which bounds memory in O(1) without ever
+	// walking the map to find something to evict — and a pin demoted to the
+	// older generation is still served, so a busy conversation is not dropped
+	// merely because unrelated traffic filled the map.
+	affinityMu   sync.Mutex
+	affinityCur  map[string]affinityPin
+	affinityPrev map[string]affinityPin
+
+	now func() time.Time
+}
+
+// affinityPin is one prompt prefix's deployment, with its expiry.
+type affinityPin struct {
+	deployment string
+	expires    time.Time
 }
 
 // NewMemState returns an in-memory state store.
 func NewMemState() *MemState {
-	return &MemState{states: make(map[string]*deploymentState), limits: limiter.New()}
+	return &MemState{
+		states:      make(map[string]*deploymentState),
+		limits:      limiter.New(),
+		affinityCur: make(map[string]affinityPin),
+		now:         time.Now,
+	}
+}
+
+// Affinity implements StateStore.
+func (s *MemState) Affinity(_ context.Context, fingerprint string) (string, bool, error) {
+	s.affinityMu.Lock()
+	defer s.affinityMu.Unlock()
+
+	pin, ok := s.affinityCur[fingerprint]
+	if !ok {
+		pin, ok = s.affinityPrev[fingerprint]
+	}
+	if !ok || !s.now().Before(pin.expires) {
+		return "", false, nil
+	}
+	return pin.deployment, true, nil
+}
+
+// SetAffinity implements StateStore.
+func (s *MemState) SetAffinity(_ context.Context, fingerprint, id string, ttl time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	s.affinityMu.Lock()
+	defer s.affinityMu.Unlock()
+
+	if len(s.affinityCur) >= maxAffinityEntries {
+		s.affinityPrev = s.affinityCur
+		s.affinityCur = make(map[string]affinityPin, maxAffinityEntries/4)
+	}
+	s.affinityCur[fingerprint] = affinityPin{deployment: id, expires: s.now().Add(ttl)}
+	return nil
 }
 
 // Prepare pre-creates state for known deployment IDs so that the read paths —

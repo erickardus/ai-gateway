@@ -40,6 +40,39 @@ type Fields struct {
 	// upstream that rejects unknown top-level fields would 400 the request.
 	DisableFallbacks    bool
 	HasDisableFallbacks bool
+
+	// System, Tools and Messages carry the raw bytes of the fields a
+	// prompt-cache prefix is derived from. They alias the body rather than
+	// copying it, and are captured during the walk the router already performs
+	// — deriving them separately would mean validating and scanning a
+	// multi-megabyte document a second time on every request.
+	System, Tools, Messages json.RawMessage
+}
+
+// LeadingMessages returns the raw bytes of up to n leading elements of the
+// messages array, which are the turns that stay fixed as a conversation grows.
+//
+// It is a method on Fields rather than a free function because that is what
+// carries the invariant it relies on: Peek validated the whole document, so
+// these bytes are known to be well-formed and can be scanned without paying for
+// validation again. Elements is the entry point for an array of unknown
+// provenance.
+func (f Fields) LeadingMessages(n int) [][]byte {
+	if len(f.Messages) == 0 || n <= 0 {
+		return nil
+	}
+	spans, err := elements(f.Messages)
+	if err != nil {
+		return nil
+	}
+	out := make([][]byte, 0, min(n, len(spans)))
+	for _, span := range spans {
+		if len(out) == n {
+			break
+		}
+		out = append(out, f.Messages[span[0]:span[1]])
+	}
+	return out
 }
 
 // member is one key/value pair of the root object.
@@ -74,6 +107,12 @@ func Peek(body []byte) (Fields, error) {
 			if json.Unmarshal(m.raw, &b) == nil {
 				out.DisableFallbacks, out.HasDisableFallbacks = b, true
 			}
+		case "system":
+			out.System = m.raw
+		case "tools":
+			out.Tools = m.raw
+		case "messages":
+			out.Messages = m.raw
 		}
 		return nil
 	})

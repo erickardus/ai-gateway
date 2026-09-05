@@ -157,5 +157,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"healthy_deployments": healthy,
 		"total_deployments":   len(rows),
 		"deployments":         rows,
+		"prompt_cache":        s.promptCacheStatus(),
 	})
+}
+
+// promptCacheStatus reports how the gateway is treating the provider's prompt
+// cache. It sits on /health beside the strategy because the two decide together
+// where a request lands, and because "affinity is on" and "affinity is doing
+// anything" are different claims: a fleet of single-deployment groups reports
+// the first without the second.
+func (s *Server) promptCacheStatus() map[string]any {
+	status := map[string]any{
+		"affinity":     s.cfg.PromptCache.AffinityEnabled() && s.balanced,
+		"affinity_ttl": s.cfg.PromptCache.AffinityTTL.String(),
+		"inject":       s.cfg.PromptCache.Inject,
+	}
+	if s.cfg.PromptCache.AffinityEnabled() && !s.balanced {
+		status["affinity_note"] = "configured, but inactive: every model group has a single deployment, so there is nothing to pin against"
+	}
+	return status
 }

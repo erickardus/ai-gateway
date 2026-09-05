@@ -94,7 +94,9 @@ interface waiting for it.
 | Streaming (SSE) | ✅ |
 | Health checks, timeouts | ✅ |
 | Spend tracking, cost attribution and budgets | ✅ |
-| Caching, guardrails | ⏳ |
+| Response caching | ✅ |
+| Prompt caching — prefix affinity, breakpoints, savings reporting | ✅ |
+| Guardrails | ⏳ |
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
 | Multi-instance shared state (Redis) | ✅ |
 | Admin UI, teams, MCP gateway | ⏳ |
@@ -110,7 +112,8 @@ unchanged, and translation is the opposite of that.
 - **[docs/claude-code.md](docs/claude-code.md)** — subscription passthrough setup
 - **[docs/configuration.md](docs/configuration.md)** — every config key, endpoint and status code
 - **[docs/routing.md](docs/routing.md)** — strategies, retries, cooldowns, fallbacks
-- **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics, caching
+- **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics, response caching
+- **[docs/prompt-caching.md](docs/prompt-caching.md)** — keeping the provider's prompt cache hittable behind a load balancer
 - **[docs/roadmap.md](docs/roadmap.md)** — what is not built, and what is unverified
 
 ## Development

@@ -32,6 +32,13 @@ type Overrides struct {
 	// that relays its own credential upstream. Keys without it are routed only
 	// to deployments holding a server-side credential.
 	AllowPassthrough bool
+	// PromptPrefix fingerprints the cacheable prefix of the request, so the
+	// router can send it back to the deployment already holding that prefix in
+	// its prompt cache. Empty disables the preference for this request.
+	//
+	// It is a hash, never prompt text: it travels into routing state and, with
+	// Redis configured, out of the process.
+	PromptPrefix string
 }
 
 // OverridesFromHeaders reads the per-request routing headers. Names match

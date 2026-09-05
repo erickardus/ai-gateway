@@ -334,3 +334,69 @@ func TestLatencyAndInFlightStayLocal(t *testing.T) {
 		t.Error("instance B sees A's latency samples; latency is per-instance by design")
 	}
 }
+
+// A prompt-prefix pin has to be shared. Behind a load balancer the next turn of
+// a conversation lands on a different replica, and a per-instance pin would send
+// it to a different upstream — the exact thing the pin exists to prevent.
+func TestAffinitySharedAcrossInstances(t *testing.T) {
+	prefix := uniquePrefix(t)
+	a, b := newStore(t, prefix), newStore(t, prefix)
+	ctx := context.Background()
+
+	if _, ok, err := b.Affinity(ctx, "fp-1"); err != nil || ok {
+		t.Fatalf("unset pin: ok = %v, err = %v; want a clean miss", ok, err)
+	}
+	if err := a.SetAffinity(ctx, "fp-1", "dep-1", time.Minute); err != nil {
+		t.Fatalf("SetAffinity: %v", err)
+	}
+
+	got, ok, err := b.Affinity(ctx, "fp-1")
+	if err != nil {
+		t.Fatalf("Affinity: %v", err)
+	}
+	if !ok || got != "dep-1" {
+		t.Errorf("the other instance read %q, %v; want dep-1, true", got, ok)
+	}
+
+	// A pin is refreshed on every success, so it follows a failover rather than
+	// holding a conversation on a deployment that stopped serving it.
+	if err := b.SetAffinity(ctx, "fp-1", "dep-2", time.Minute); err != nil {
+		t.Fatalf("SetAffinity: %v", err)
+	}
+	if got, _, _ := a.Affinity(ctx, "fp-1"); got != "dep-2" {
+		t.Errorf("pin = %q after re-pinning, want dep-2", got)
+	}
+}
+
+func TestAffinityExpiresInRedis(t *testing.T) {
+	s := newStore(t, uniquePrefix(t))
+	ctx := context.Background()
+
+	if err := s.SetAffinity(ctx, "fp-ttl", "dep-1", time.Second); err != nil {
+		t.Fatalf("SetAffinity: %v", err)
+	}
+	ttl, err := s.Client().TTL(ctx, s.key("affinity", "fp-ttl")).Result()
+	if err != nil {
+		t.Fatalf("TTL: %v", err)
+	}
+	if ttl <= 0 || ttl > time.Second {
+		t.Errorf("ttl = %v, want a positive value no greater than 1s — a pin with no expiry would outlive the cache it points at", ttl)
+	}
+}
+
+// Losing a pin costs a cache write, not a request.
+func TestAffinityDegradesWithoutRedis(t *testing.T) {
+	s := New(Options{
+		Addr:      "127.0.0.1:1", // nothing listening
+		KeyPrefix: "test", Timeout: 100 * time.Millisecond,
+	}, router.NewMemState(), discard())
+	defer s.Close()
+	ctx := context.Background()
+
+	if err := s.SetAffinity(ctx, "fp", "dep-1", time.Minute); err != nil {
+		t.Fatalf("SetAffinity returned an error instead of degrading: %v", err)
+	}
+	if _, _, err := s.Affinity(ctx, "fp"); err != nil {
+		t.Fatalf("Affinity returned an error instead of degrading: %v", err)
+	}
+}

@@ -160,3 +160,53 @@ func TestEmptyRegistryOmitsSeries(t *testing.T) {
 		t.Error("uptime should always be present")
 	}
 }
+
+func TestPromptCacheSeries(t *testing.T) {
+	r := New()
+	r.Observe(Result{
+		Model: "m", Deployment: "d", Outcome: OutcomeSuccess,
+		Tokens: 115, CacheReadTokens: 100, CacheWriteTokens: 15,
+		PromptAffinity: "hit",
+	})
+	r.Observe(Result{Model: "m", Deployment: "d", Outcome: OutcomeSuccess, Tokens: 10, PromptAffinity: "miss"})
+
+	var b strings.Builder
+	if _, err := r.WriteTo(&b); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	got := b.String()
+
+	for _, want := range []string{
+		`gateway_prompt_cache_tokens_total{model="m",deployment="d",outcome="read"} 100`,
+		`gateway_prompt_cache_tokens_total{model="m",deployment="d",outcome="write"} 15`,
+		`gateway_prompt_cache_requests_total{model="m",deployment="d",outcome="hit"} 1`,
+		`gateway_prompt_cache_requests_total{model="m",deployment="d",outcome="miss"} 1`,
+		`gateway_prompt_affinity_total{model="m",deployment="d",outcome="hit"} 1`,
+		`gateway_prompt_affinity_total{model="m",deployment="d",outcome="miss"} 1`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("scrape is missing %q:\n%s", want, got)
+		}
+	}
+
+	// Prompt-cache tokens are a breakdown of the total, not an addition to it.
+	if !strings.Contains(got, `gateway_tokens_total{model="m",deployment="d"} 125`) {
+		t.Errorf("total token counter changed:\n%s", got)
+	}
+}
+
+// A request that never reached an upstream gave the provider no prompt to
+// cache, so counting it as a miss would understate the hit rate.
+func TestPromptCacheHitRateExcludesRequestsThatNeverDispatched(t *testing.T) {
+	r := New()
+	r.Observe(Result{Model: "m", Outcome: OutcomeRejected, RejectReason: "rate_limited"})
+	r.Observe(Result{Model: "m", Deployment: "cache", Outcome: OutcomeCacheHit})
+
+	var b strings.Builder
+	if _, err := r.WriteTo(&b); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if strings.Contains(b.String(), "gateway_prompt_cache_requests_total") {
+		t.Errorf("undispatched requests were counted:\n%s", b.String())
+	}
+}

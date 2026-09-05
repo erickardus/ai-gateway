@@ -22,6 +22,45 @@ type Config struct {
 	Observability ObservabilityConfig `yaml:"observability"`
 	Redis         RedisConfig         `yaml:"redis"`
 	Cache         CacheConfig         `yaml:"cache"`
+	PromptCache   PromptCacheConfig   `yaml:"prompt_cache"`
+}
+
+// PromptCacheConfig controls how the gateway treats the provider's own prompt
+// cache. It is unrelated to CacheConfig, which caches whole responses here; this
+// one is about the cache Anthropic keeps of a request's leading tokens.
+type PromptCacheConfig struct {
+	// Affinity pins requests sharing a cacheable prefix to the deployment that
+	// last served one, so a conversation keeps hitting the prompt cache it
+	// warmed instead of paying a cache write on every hop. On by default: with
+	// prompt caching in play, spreading a conversation across deployments costs
+	// more than it balances.
+	//
+	// It is a preference, never a constraint. A pinned deployment that is
+	// cooling down, at its rate limit or already failed this request is passed
+	// over exactly as if there were no pin.
+	Affinity *bool `yaml:"affinity"`
+	// AffinityTTL is how long a pin survives without use. It defaults to the
+	// lifetime of an ephemeral prompt cache entry, since a pin outliving the
+	// cache it points at only concentrates load.
+	AffinityTTL time.Duration `yaml:"affinity_ttl"`
+
+	// Inject marks the stable prefix of an Anthropic request — the tools and
+	// the system prompt — as cacheable when the caller has not marked anything
+	// itself.
+	//
+	// Off by default, and refused outright while any passthrough deployment is
+	// configured: injection edits the request body, and the passthrough path
+	// exists precisely to forward a body unchanged.
+	Inject bool `yaml:"inject"`
+	// InjectMinBytes suppresses injection for prefixes too small for a provider
+	// to cache. Anthropic ignores a breakpoint below its own minimum rather
+	// than rejecting it, so this is an economy rather than a correctness rule.
+	InjectMinBytes int `yaml:"inject_min_bytes"`
+}
+
+// AffinityEnabled reports whether prefix affinity is on, defaulting to true.
+func (p PromptCacheConfig) AffinityEnabled() bool {
+	return p.Affinity == nil || *p.Affinity
 }
 
 // CacheConfig controls response caching.

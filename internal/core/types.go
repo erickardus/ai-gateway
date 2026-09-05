@@ -176,6 +176,24 @@ func (p Pricing) Zero() bool {
 	return p.InputPer1M == 0 && p.OutputPer1M == 0 && p.CacheReadPer1M == 0 && p.CacheWritePer1M == 0
 }
 
+// CacheSavings returns what the prompt cache saved on this request: the
+// difference between what its cache reads cost and what those same tokens would
+// have cost as ordinary input.
+//
+// It is reported rather than inferred because the alternative — reading a cache
+// hit rate off a dashboard and multiplying — needs the price of the deployment
+// that actually served each request, which a dashboard does not have. Zero when
+// the deployment is unpriced, and never negative: a cache read priced above
+// input is a configuration mistake, not a loss to report.
+func (p Pricing) CacheSavings(u Usage) float64 {
+	const perMillion = 1_000_000.0
+	saved := float64(u.CacheReadTokens) * (p.InputPer1M - p.CacheReadPer1M) / perMillion
+	if saved < 0 {
+		return 0
+	}
+	return saved
+}
+
 // Cost returns what a request cost, in the currency the pricing was written in.
 func (p Pricing) Cost(u Usage) float64 {
 	const perMillion = 1_000_000.0
