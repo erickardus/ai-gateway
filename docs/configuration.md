@@ -43,12 +43,33 @@ the router load-balances across. A group must be format-homogeneous.
 | `params.api_key` | required for `api_key` | Must be **empty** for `passthrough`. |
 | `cost.input_per_1m` | — | Per million tokens. |
 | `cost.output_per_1m` | — | |
-| `cost.cache_read_per_1m` | — | Not optional detail: Claude Code leans on prompt caching. |
-| `cost.cache_write_per_1m` | — | |
+| `cost.cache_read_per_1m` | — | Required once `input_per_1m` is set. Not optional detail: Claude Code leans on prompt caching. |
+| `cost.cache_write_per_1m` | — | Required on an `anthropic` deployment once `input_per_1m` is set. |
+| `cost.cache_write_1h_per_1m` | `cache_write_per_1m` | Anthropic's one-hour cache write, priced at 2x base input against the five-minute tier's 1.25x. |
 
 A `passthrough` deployment must have its host listed in
 `virtual_keys.allowed_upstream_hosts`, must not carry an `api_key`, and must not
 be priced — the upstream bills the caller's own subscription.
+
+### A partial cost model is refused at load
+
+A deployment with no `cost` block accrues usage and no cost, which is a coherent
+state. A deployment priced for input and output but not for its cache is not:
+it charges every cached token at the full input rate, reports savings of exactly
+zero on the traffic prompt caching exists for, and says nothing about either
+until the provider's invoice disagrees.
+
+So the combination fails validation rather than serving traffic:
+
+| Rule | Why |
+|---|---|
+| `cache_read_per_1m` required once `input_per_1m` is set | zero prices cache reads as free, overstating savings and understating cost by the whole of the cache traffic |
+| `cache_read_per_1m` below `input_per_1m` | a read costing as much as fresh input means caching saves nothing, which no provider charges |
+| `cache_write_per_1m` required and above `input_per_1m`, on `anthropic` | a write is charged at a premium; pricing it at or below input makes a cache miss look free |
+| `cache_write_1h_per_1m`, if set, at least `cache_write_per_1m` | the longer-lived cache is the more expensive one to write |
+
+An `openai` deployment needs no write price: OpenAI-compatible providers cache
+automatically and charge nothing to write.
 
 ## `router`
 

@@ -145,9 +145,14 @@ const (
 const (
 	OutcomeCacheRead  = "read"
 	OutcomeCacheWrite = "write"
-	OutcomeHit        = "hit"
-	OutcomeMiss       = "miss"
-	OutcomeNew        = "new"
+	// OutcomeCacheWrite1h is the part of the write total written with a
+	// one-hour TTL. It is reported separately because it is priced separately:
+	// twice base input against the five-minute tier's 1.25x, so a shift in the
+	// mix moves the bill without moving the token count.
+	OutcomeCacheWrite1h = "write_1h"
+	OutcomeHit          = "hit"
+	OutcomeMiss         = "miss"
+	OutcomeNew          = "new"
 )
 
 // Result is everything the gateway records about one completed request.
@@ -167,6 +172,9 @@ type Result struct {
 	// reported.
 	CacheReadTokens  int
 	CacheWriteTokens int
+	// CacheWrite1hTokens is the long-TTL subset of CacheWriteTokens, exported
+	// as its own series rather than added to the total.
+	CacheWrite1hTokens int
 	// PromptAffinity is "hit" or "miss" when a prompt-prefix pin was consulted,
 	// and empty when none was.
 	PromptAffinity string
@@ -195,6 +203,9 @@ func (r *Registry) Observe(res Result) {
 	}
 	if res.CacheWriteTokens > 0 {
 		r.promptTokens[labels{model: res.Model, deployment: res.Deployment, outcome: OutcomeCacheWrite}] += uint64(res.CacheWriteTokens)
+	}
+	if res.CacheWrite1hTokens > 0 {
+		r.promptTokens[labels{model: res.Model, deployment: res.Deployment, outcome: OutcomeCacheWrite1h}] += uint64(res.CacheWrite1hTokens)
 	}
 	// Counted only for requests that actually reached an upstream: a rejected
 	// or cache-served request never gave the provider a prompt to cache, and
@@ -260,7 +271,7 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 	writeCounter(&b, "gateway_fallbacks_total", "Fallback hops taken.", snapshot.fallbacks)
 	writeCounter(&b, "gateway_cooldowns_total", "Deployment ejections.", snapshot.cooldowns)
 	writeCounter(&b, "gateway_rejections_total", "Requests rejected before dispatch, by reason.", snapshot.rejections)
-	writeCounter(&b, "gateway_prompt_cache_tokens_total", "Provider prompt-cache tokens, by read or write. A read is billed at a fraction of input; a write at a premium.", snapshot.promptTokens)
+	writeCounter(&b, "gateway_prompt_cache_tokens_total", "Provider prompt-cache tokens, by outcome. A read is billed at a fraction of input; a write at a premium, and write_1h is the long-TTL subset of write rather than an addition to it.", snapshot.promptTokens)
 	writeCounter(&b, "gateway_prompt_cache_requests_total", "Dispatched requests that did or did not read from the provider's prompt cache.", snapshot.promptRequests)
 	writeCounter(&b, "gateway_prompt_affinity_total", "Requests by what the prompt-prefix pin did: honoured, passed over, or newly established.", snapshot.affinity)
 	writeFloatCounter(&b, "gateway_cost_total", "Cost charged to the operator. Excludes passthrough traffic, which bills the caller's own subscription.", snapshot.cost)

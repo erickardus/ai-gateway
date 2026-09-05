@@ -26,10 +26,16 @@ cover:
 	go test -coverprofile=coverage.out $(PKG)
 	go tool cover -func=coverage.out | tail -1
 
+# The body editors, the breakpoint detector and the usage parser are where a
+# malformed input becomes a rewritten prompt or a wrong bill rather than a failed
+# request, so each of them is fuzzed.
 .PHONY: fuzz
 fuzz:
 	go test ./internal/jsonx -run Fuzz -fuzz FuzzSetTopLevelString -fuzztime 60s
 	go test ./internal/jsonx -run Fuzz -fuzz FuzzEdit -fuzztime 60s
+	go test ./internal/jsonx -run Fuzz -fuzz FuzzContainsObjectKey -fuzztime 60s
+	go test ./internal/promptcache -run Fuzz -fuzz FuzzInject -fuzztime 60s
+	go test ./internal/provider -run Fuzz -fuzz FuzzUsageAccounting -fuzztime 60s
 
 .PHONY: vet
 vet:

@@ -96,6 +96,7 @@ interface waiting for it.
 | Spend tracking, cost attribution and budgets | ✅ |
 | Response caching | ✅ |
 | Prompt caching — prefix affinity, breakpoints, savings reporting | ✅ |
+| Prompt-cache accounting for OpenAI-compatible providers | ✅ |
 | Guardrails | ⏳ |
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
 | Multi-instance shared state (Redis) | ✅ |

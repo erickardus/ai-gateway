@@ -121,6 +121,62 @@ log line, or Redis.
 
 ---
 
+## OpenAI-compatible deployments
+
+Everything above applies to an `openai` deployment unchanged. The fingerprint
+covers the same stable prefix, the pin is scoped by group the same way, and the
+same headers and metrics report what happened. What differs is what the provider
+does with it, and what it says afterwards.
+
+| | Anthropic | OpenAI-compatible |
+|---|---|---|
+| How a prefix is cached | explicitly, at a `cache_control` breakpoint | automatically, above a minimum prefix length |
+| What a write costs | a premium over input | nothing |
+| Where the discount shows up | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens` |
+| Whether input includes it | no | **yes** |
+
+That last row is the one that costs money. Anthropic reports an `input_tokens`
+that already excludes both cache counters, so the three figures are simply added
+up at their own prices. An OpenAI-compatible response reports a `prompt_tokens`
+that **includes** its cached tokens, and names how many of them were cached
+separately.
+
+Read with Anthropic's rule, every cached token on an OpenAI deployment is
+charged twice — once at the full input rate inside `prompt_tokens`, once at the
+cache-read rate beside it. On a conversation with a 100k-token cached prefix
+that is roughly four times the real cost, reported as confidently as the right
+number would be. Ignore the field entirely, which is what a gateway does by
+default, and the deployment has no prompt-cache accounting at all: its cheapest
+tokens are billed as its most expensive, `cache_savings` reads zero forever, and
+the hit-rate metric says caching is not working when it is.
+
+So the gateway normalizes at the point of parsing, under the format of the
+deployment that served the request:
+
+```
+InputTokens = prompt_tokens - cached_tokens      # openai
+InputTokens = input_tokens                       # anthropic
+```
+
+The invariant is that every prompt token is counted exactly once, in whichever
+bucket the provider priced it in. It holds against the field names in use across
+OpenAI-compatible servers — `prompt_tokens_details.cached_tokens`,
+`input_tokens_details.cached_tokens`, and DeepSeek's `prompt_cache_hit_tokens` —
+and a cached count larger than the input it belongs to is clamped rather than
+allowed to mint savings out of an upstream's arithmetic error.
+
+**Breakpoint injection does not apply.** `cache_control` is an Anthropic
+construct, caching on an OpenAI-compatible provider is automatic, and there is
+nothing for the gateway to mark. Configuration refuses `inject` alongside an
+`openai` deployment rather than silently doing nothing to it.
+
+What the gateway does not yet do is pass OpenAI's `prompt_cache_key`, which
+biases that provider's own cache routing for callers sending the same prefix at
+high rates. It is a body rewrite, and body rewrites are constrained here for the
+same reasons injection is; [roadmap.md](roadmap.md) records the seam.
+
+---
+
 ## Cache breakpoints
 
 Anthropic caches a prefix only where the request marks one with `cache_control`.
@@ -141,9 +197,19 @@ read.
 
 It is skipped entirely when:
 
-- the body **already carries a `cache_control`** anywhere. A caller that placed
-  its own knows where its prompt repeats, and the API caps how many breakpoints
-  one request may hold.
+- the body **already carries a `cache_control` member** anywhere. A caller that
+  placed its own knows where its prompt repeats, and the API caps how many
+  breakpoints one request may hold.
+
+  The test is structural, not a substring search. Prompt text is JSON string
+  data, and a conversation that discusses `cache_control` — a developer asking
+  Claude Code about prompt caching, a diff that touches the gateway's own source
+  — contains those bytes without carrying a breakpoint. Reading that as "the
+  caller manages its own" would switch injection off for the rest of that
+  conversation, and show up only as a larger bill nobody could trace back to a
+  word in a message. The cheap byte scan is kept as a prefilter, so the walk
+  that distinguishes a member name from prose runs only where the name appears
+  at all.
 - the prefix is **shorter than `inject_min_bytes`**. Anthropic ignores a
   breakpoint below its own minimum rather than rejecting it, so this is an
   economy, not a correctness rule.
@@ -197,7 +263,7 @@ In `/metrics`:
 
 | Metric | Labels | Answers |
 |---|---|---|
-| `gateway_prompt_cache_tokens_total` | model, deployment, outcome=`read`\|`write` | is caching saving money |
+| `gateway_prompt_cache_tokens_total` | model, deployment, outcome=`read`\|`write`\|`write_1h` | is caching saving money |
 | `gateway_prompt_cache_requests_total` | model, deployment, outcome=`hit`\|`miss` | is caching working |
 | `gateway_prompt_affinity_total` | model, deployment, outcome=`hit`\|`miss`\|`new` | is routing keeping it working |
 
@@ -247,10 +313,55 @@ cost:
   output_per_1m: 15.00
   cache_read_per_1m: 0.30
   cache_write_per_1m: 3.75
+  cache_write_1h_per_1m: 6.00   # only if your callers use the one-hour cache
 ```
 
 Claude Code leans on prompt caching heavily, so a cost model using only input
 and output is wrong by a wide margin on exactly the traffic this gateway exists
-to carry. The gateway reads Anthropic's `cache_read_input_tokens` and
+to carry. It is wrong quietly, too — nothing errors, the numbers just do not
+match the invoice — so a cost model that prices input without pricing the cache
+is [refused at load](configuration.md#a-partial-cost-model-is-refused-at-load)
+rather than served.
+
+The gateway reads Anthropic's `cache_read_input_tokens` and
 `cache_creation_input_tokens` from the response, including from the
-`message_start` event of a streamed reply.
+`message_start` event of a streamed reply, and the OpenAI-compatible
+`prompt_tokens_details.cached_tokens` under the rule
+[above](#openai-compatible-deployments).
+
+### The two write tiers
+
+Anthropic's default breakpoint writes a cache that lives about five minutes and
+costs 1.25x base input. A caller can ask for one that lives an hour, and that
+one costs **2x**. The response reports the split under `cache_creation`, and a
+gateway that flattened the two would under-report every long write by more than
+a third — on exactly the traffic that opts into the longer cache, which is the
+traffic large enough to have bothered.
+
+`cache_write_1h_per_1m` prices the long tier. Left unset it falls back to
+`cache_write_per_1m`, which is correct for a deployment whose callers never ask
+for the longer TTL. For one whose callers do, the fallback is understating the
+bill, so the gateway says so: the first response reporting a one-hour write on a
+deployment without the price logs a warning naming the deployment and the key to
+add, and `gateway_prompt_cache_tokens_total{outcome="write_1h"}` counts the
+tokens it is happening to.
+
+---
+
+## What guards this
+
+Prompt caching is the difference between a bill and several times a bill, and
+every way of getting it wrong is silent. So the tests assert on money rather
+than on mechanism:
+
+| Test | What it would catch |
+|---|---|
+| `TestAConversationPaysForItsPrefixOnce` | a ten-turn conversation through a balanced group, billed against a hand-computed figure. Each fake upstream holds its own cache, so a scattered conversation pays real cache writes |
+| `TestScatteringAConversationCostsRealMoney` | the same workload with affinity off, proving the guarantee above is doing something rather than describing a group that never balanced |
+| `TestOpenAICachedPrefixIsBilledOnce` | the double-billing bug, end to end, plus the invariant that input and cache-read tokens sum to what the provider reported |
+| `TestUsageIsReadUnderTheFormatThatProducedIt` | every provider usage shape in use, read under both formats, against expected counters |
+| `FuzzUsageAccounting` | a hostile or broken upstream producing negative counts, negative cost, or savings nobody made |
+| `TestInjectionAddsBreakpointsAndNothingElse`, `FuzzInject` | a rewritten body that differs from the original by anything other than its breakpoints — which would change the very prefix bytes the cache keys on |
+| `TestInjectionIsIdempotent` | breakpoints accumulating past the API's cap through a retry or a second gateway |
+| `TestOneHourWritesArePricedAtTheirOwnRate` | the long tier billed at the short tier's price |
+| `TestPricingValidation` | a cost model that would misreport what caching costs, accepted at load |

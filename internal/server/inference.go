@@ -103,7 +103,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		} else if hit {
 			obs.deployment, obs.outcome = "cache", metrics.OutcomeCacheHit
 			obs.usage, obs.latency = entry.Usage, time.Since(started)
-			s.serveFromCache(w, entry, fields.Model)
+			s.serveFromCache(w, entry, fields.Model, format)
 			s.metrics.Observe(obs.toResult(0))
 			return
 		}
@@ -212,7 +212,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		relayTarget = tee
 	}
 
-	usage, relayErr := provider.Relay(relayTarget, result.Response.Body)
+	usage, relayErr := provider.Relay(relayTarget, result.Response.Body, format)
 	if relayErr != nil {
 		// The status line is already sent, so the only thing left is to record
 		// what happened.

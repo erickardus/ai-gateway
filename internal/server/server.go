@@ -10,6 +10,7 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/cache"
@@ -43,6 +44,10 @@ type Server struct {
 	// upstream per group every request already lands on the same prompt cache,
 	// so hashing the prefix of every request would buy nothing.
 	balanced bool
+	// mispriced records the deployments already warned about for reporting a
+	// token counter their cost model does not price. The warning belongs in a
+	// log once per deployment, not once per request.
+	mispriced sync.Map
 }
 
 // deploymentPricing is what one deployment costs the operator.

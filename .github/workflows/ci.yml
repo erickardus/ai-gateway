@@ -51,3 +51,16 @@ jobs:
 
       - name: Fuzz the JSON editors briefly
         run: go test ./internal/jsonx -run Fuzz -fuzz FuzzEdit -fuzztime 30s
+
+      # The prompt-cache path is where a bad input becomes a wrong bill rather
+      # than a failed request, so its three fuzz targets run on every push: the
+      # breakpoint detector, the body rewriter, and the usage parser that turns
+      # a provider's counters into money.
+      - name: Fuzz the breakpoint detector briefly
+        run: go test ./internal/jsonx -run Fuzz -fuzz FuzzContainsObjectKey -fuzztime 30s
+
+      - name: Fuzz breakpoint injection briefly
+        run: go test ./internal/promptcache -run Fuzz -fuzz FuzzInject -fuzztime 30s
+
+      - name: Fuzz usage accounting briefly
+        run: go test ./internal/provider -run Fuzz -fuzz FuzzUsageAccounting -fuzztime 30s

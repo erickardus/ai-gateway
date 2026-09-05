@@ -1,6 +1,7 @@
 package jsonx
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -274,4 +275,91 @@ func walkObject(object []byte, visit func(member) error) error {
 		}
 		i = valEnd
 	}
+}
+
+// ContainsObjectKey reports whether any object anywhere in a JSON value has a
+// member with the given name.
+//
+// It exists because a substring search does not answer that question. Prompt
+// text is JSON string data, and a request whose conversation happens to discuss
+// `cache_control` — a developer asking Claude Code about prompt caching, a diff
+// that touches this very file — contains those bytes without carrying a
+// breakpoint. Treating that as "the caller manages its own breakpoints" silently
+// switches injection off for the rest of the conversation, which is a bill
+// nobody can trace back to a word in a message.
+//
+// The walk distinguishes a key from a value by position rather than by content:
+// only a string in key position inside an object counts. The document must be
+// valid JSON; malformed input is reported as an error rather than a false
+// negative, because the caller's safe answer is "assume it is there".
+func ContainsObjectKey(doc []byte, key string) (bool, error) {
+	if !json.Valid(doc) {
+		return false, errors.New("value is not valid JSON")
+	}
+
+	// Object depth is tracked as a bit per level: a key may only appear where
+	// the innermost container is an object.
+	inObject := make([]bool, 0, 32)
+	expectKey := false
+
+	for i := 0; i < len(doc); {
+		switch c := doc[i]; c {
+		case '{':
+			inObject = append(inObject, true)
+			expectKey = true
+			i++
+		case '[':
+			inObject = append(inObject, false)
+			expectKey = false
+			i++
+		case '}', ']':
+			if len(inObject) == 0 {
+				return false, errors.New("malformed JSON: unbalanced container")
+			}
+			inObject = inObject[:len(inObject)-1]
+			expectKey = false
+			i++
+		case '"':
+			end, err := scanString(doc, i)
+			if err != nil {
+				return false, err
+			}
+			if expectKey {
+				if matchesKey(doc[i:end], key) {
+					return true, nil
+				}
+				expectKey = false
+			}
+			i = end
+		case ',':
+			expectKey = len(inObject) > 0 && inObject[len(inObject)-1]
+			i++
+		case ':':
+			expectKey = false
+			i++
+		default:
+			i++
+		}
+	}
+	return false, nil
+}
+
+// matchesKey compares a quoted JSON string against a plain key name.
+//
+// The common case is a byte comparison against the obvious encoding. Anything
+// carrying an escape is decoded first, because a key written as
+// "cache\u005fcontrol" names the same member as "cache_control", and an
+// upstream reading the request would treat the two as one.
+func matchesKey(quoted []byte, key string) bool {
+	if len(quoted) == len(key)+2 && string(quoted[1:len(quoted)-1]) == key {
+		return true
+	}
+	if !bytes.ContainsRune(quoted, '\\') {
+		return false
+	}
+	var decoded string
+	if err := json.Unmarshal(quoted, &decoded); err != nil {
+		return false
+	}
+	return decoded == key
 }

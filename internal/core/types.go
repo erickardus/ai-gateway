@@ -147,13 +147,35 @@ func matchPattern(pattern, s string) bool {
 // alone would be wrong by a wide margin on exactly the traffic this gateway is
 // built for.
 type Usage struct {
+	// InputTokens is input the provider charged at the ordinary input rate:
+	// tokens that were neither read from nor written to its prompt cache.
+	//
+	// The two wire formats disagree about this, which is the single most
+	// expensive thing to get wrong here. Anthropic reports an input_tokens that
+	// already excludes both cache counters, while an OpenAI-compatible response
+	// reports a prompt_tokens that *includes* its cached tokens. Normalizing to
+	// "uncached input" at the point of parsing means a cached token is priced
+	// once, by whichever field the provider reported it in, rather than twice.
 	InputTokens      int
 	OutputTokens     int
 	CacheReadTokens  int
 	CacheWriteTokens int
+	// CacheWrite1hTokens is the part of CacheWriteTokens written with a
+	// one-hour TTL rather than the default five minutes. It is a subset, not an
+	// addend: Anthropic reports the two as a breakdown of the same total, and
+	// prices the long one at twice base input against the short one's 1.25x.
+	//
+	// A gateway that flattened them would under-report the cost of exactly the
+	// traffic that opts into the longer cache, which is the traffic large
+	// enough to have bothered.
+	CacheWrite1hTokens int
 }
 
 // Total returns every token the upstream reported, for rate limiting.
+//
+// CacheWrite1hTokens is deliberately absent: it is a subset of
+// CacheWriteTokens, and adding it would count those tokens twice against a
+// caller's TPM limit.
 func (u Usage) Total() int {
 	return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens
 }
@@ -169,11 +191,29 @@ type Pricing struct {
 	OutputPer1M     float64 `yaml:"output_per_1m"`
 	CacheReadPer1M  float64 `yaml:"cache_read_per_1m"`
 	CacheWritePer1M float64 `yaml:"cache_write_per_1m"`
+	// CacheWrite1hPer1M prices a write to the one-hour cache, which Anthropic
+	// charges at twice base input where the default five-minute write costs
+	// 1.25x. Left unset it falls back to CacheWritePer1M, which is correct for
+	// a deployment whose callers never ask for the longer TTL and merely
+	// optimistic for one whose callers do — so the first response that reports
+	// a long write at a deployment without this price is logged, rather than
+	// left to be discovered on an invoice.
+	CacheWrite1hPer1M float64 `yaml:"cache_write_1h_per_1m"`
 }
 
 // Zero reports whether no pricing was configured.
 func (p Pricing) Zero() bool {
-	return p.InputPer1M == 0 && p.OutputPer1M == 0 && p.CacheReadPer1M == 0 && p.CacheWritePer1M == 0
+	return p.InputPer1M == 0 && p.OutputPer1M == 0 && p.CacheReadPer1M == 0 &&
+		p.CacheWritePer1M == 0 && p.CacheWrite1hPer1M == 0
+}
+
+// write1hRate is what a one-hour cache write costs, falling back to the
+// five-minute price where none was configured.
+func (p Pricing) write1hRate() float64 {
+	if p.CacheWrite1hPer1M == 0 {
+		return p.CacheWritePer1M
+	}
+	return p.CacheWrite1hPer1M
 }
 
 // CacheSavings returns what the prompt cache saved on this request: the
@@ -195,12 +235,20 @@ func (p Pricing) CacheSavings(u Usage) float64 {
 }
 
 // Cost returns what a request cost, in the currency the pricing was written in.
+//
+// The two cache-write tiers are billed apart: CacheWrite1hTokens is a subset of
+// CacheWriteTokens, so the short-TTL remainder is what is left after it, and a
+// malformed breakdown claiming more long writes than writes is clamped rather
+// than allowed to charge for tokens the provider never reported.
 func (p Pricing) Cost(u Usage) float64 {
 	const perMillion = 1_000_000.0
+	write1h := min(max(u.CacheWrite1hTokens, 0), u.CacheWriteTokens)
+	write5m := u.CacheWriteTokens - write1h
 	return float64(u.InputTokens)*p.InputPer1M/perMillion +
 		float64(u.OutputTokens)*p.OutputPer1M/perMillion +
 		float64(u.CacheReadTokens)*p.CacheReadPer1M/perMillion +
-		float64(u.CacheWriteTokens)*p.CacheWritePer1M/perMillion
+		float64(write5m)*p.CacheWritePer1M/perMillion +
+		float64(write1h)*p.write1hRate()/perMillion
 }
 
 // ControlHeaders are the headers the gateway interprets for its own routing and

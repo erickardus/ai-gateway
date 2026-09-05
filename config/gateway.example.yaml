@@ -59,6 +59,11 @@ model_list:
       output_per_1m: 15.00
       cache_read_per_1m: 0.30
       cache_write_per_1m: 3.75
+      # Only needed where callers ask for the one-hour cache, which Anthropic
+      # charges at 2x base input against the five-minute tier's 1.25x. Unset, it
+      # falls back to cache_write_per_1m and the gateway warns the first time an
+      # upstream reports a long write it cannot price.
+      # cache_write_1h_per_1m: 6.00
 
   # A cheaper group to fall back to.
   - model_name: anthropic-claude-haiku
@@ -89,6 +94,14 @@ model_list:
       auth_scheme: Bearer
       api_key: ${OPENAI_API_KEY}
     weight: 1
+    # An OpenAI-compatible provider caches automatically and charges nothing to
+    # write, so there is no write price here — but cache_read_per_1m is still
+    # required, because its cached tokens arrive inside prompt_tokens and would
+    # otherwise be billed as ordinary input.
+    cost:
+      input_per_1m: 1.25
+      output_per_1m: 10.00
+      cache_read_per_1m: 0.125
 
 router:
   # weighted-shuffle | least-busy | usage-based | latency-based
