@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/core"
 )
 
@@ -20,6 +21,27 @@ type Config struct {
 	VirtualKeys   VirtualKeysConfig   `yaml:"virtual_keys"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	Redis         RedisConfig         `yaml:"redis"`
+	Cache         CacheConfig         `yaml:"cache"`
+}
+
+// CacheConfig controls response caching.
+type CacheConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	TTL     time.Duration `yaml:"ttl"`
+	// Scope decides who may see a cached response. "key" — the default — keeps
+	// each virtual key to its own responses. "shared" lets every caller reuse
+	// any cached response, which saves far more but serves one tenant's
+	// completion to another, so it is only appropriate when all callers are
+	// equally trusted.
+	Scope cache.Scope `yaml:"scope"`
+	// MaxEntries bounds the in-process cache.
+	MaxEntries int `yaml:"max_entries"`
+	// MaxEntryBytes refuses to cache responses larger than this, so one
+	// oversized completion cannot evict everything else.
+	MaxEntryBytes int64 `yaml:"max_entry_bytes"`
+	// Shared stores entries in Redis, so a hit on one instance serves them all.
+	// Requires redis.addr.
+	Shared bool `yaml:"shared"`
 }
 
 // RedisConfig shares state across gateway instances.

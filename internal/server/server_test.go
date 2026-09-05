@@ -11,8 +11,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/erickardus/ai-gateway/internal/auth"
+	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/metrics"
@@ -51,6 +53,7 @@ func (c *captured) get() (http.Header, []byte, string, string) {
 // harness builds a gateway in front of a fake upstream.
 type harness struct {
 	srv          *Server
+	store        auth.KeyStore
 	deploymentID string
 	ledger       *spend.Ledger
 	metrics      *metrics.Registry
@@ -68,6 +71,8 @@ type harnessOpts struct {
 	maxBodyBytes     int64
 	rpmLimit         int
 	maxBudget        float64
+	cache            bool
+	cacheScope       cache.Scope
 }
 
 func intPtr(n int) *int { return &n }
@@ -159,9 +164,23 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 
 	ledger := spend.New()
 	reg := metrics.New()
-	srv := New(cfg, authn, store, rtr, log, ledger, reg, nil)
+	var responses cache.Cache
+	if opts.cache {
+		cfg.Cache.Enabled = true
+		cfg.Cache.Scope = opts.cacheScope
+		if cfg.Cache.Scope == "" {
+			cfg.Cache.Scope = cache.ScopeKey
+		}
+		cfg.Cache.TTL = time.Minute
+		cfg.Cache.MaxEntries = 100
+		cfg.Cache.MaxEntryBytes = 1 << 20
+		responses = cache.NewMemory(100)
+	}
+
+	srv := New(cfg, authn, store, rtr, log, ledger, reg, nil, responses)
 	return &harness{
 		srv:          srv,
+		store:        store,
 		deploymentID: cfg.ModelList[0].ID(),
 		ledger:       ledger,
 		metrics:      reg,
@@ -169,6 +188,16 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		upstream:     upstream,
 		seen:         seen,
 		logBuf:       logBuf,
+	}
+}
+
+// addKey issues a second virtual key, for tests that need two callers.
+func (h *harness) addKey(t *testing.T, plaintext, alias string) {
+	t.Helper()
+	if err := h.store.Put(context.Background(), &core.Key{
+		Hash: auth.HashKey(plaintext), Alias: alias, AllowPassthrough: true,
+	}); err != nil {
+		t.Fatalf("add key: %v", err)
 	}
 }
 

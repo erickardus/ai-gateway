@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/core"
 )
 
@@ -53,6 +54,7 @@ func (c *Config) Validate() error {
 		{"router.backoff.max", c.Router.Backoff.Max},
 		{"observability.spend_flush_interval", c.Observability.SpendFlushInterval},
 		{"redis.timeout", c.Redis.Timeout},
+		{"cache.ttl", c.Cache.TTL},
 	} {
 		if d.value < 0 {
 			errs = append(errs, fmt.Errorf("%s: must not be negative, got %s", d.path, d.value))
@@ -71,6 +73,38 @@ func (c *Config) Validate() error {
 				i, d.ModelName, seen, d.Params.Format))
 		} else if !ok {
 			groupFormat[d.ModelName] = d.Params.Format
+		}
+	}
+
+	if c.Cache.Enabled {
+		switch c.Cache.Scope {
+		case cache.ScopeKey, cache.ScopeShared:
+		default:
+			errs = append(errs, fmt.Errorf("cache.scope: must be %q or %q, got %q", cache.ScopeKey, cache.ScopeShared, c.Cache.Scope))
+		}
+		if c.Cache.MaxEntries < 1 {
+			errs = append(errs, fmt.Errorf("cache.max_entries: must be >= 1, got %d", c.Cache.MaxEntries))
+		}
+		if c.Cache.MaxEntryBytes < 1 {
+			errs = append(errs, fmt.Errorf("cache.max_entry_bytes: must be >= 1, got %d", c.Cache.MaxEntryBytes))
+		}
+		if c.Cache.Shared && !c.Redis.Enabled() {
+			errs = append(errs, errors.New("cache.shared: requires redis.addr, since a shared cache lives in Redis"))
+		}
+
+		// A passthrough deployment's response was generated under one caller's
+		// personal subscription. Serving it to a different caller would hand
+		// them output someone else paid for, so the combination is refused
+		// rather than left as a footgun.
+		if c.Cache.Scope == cache.ScopeShared {
+			for i := range c.ModelList {
+				if c.ModelList[i].Params.AuthMode == core.AuthModePassthrough {
+					errs = append(errs, fmt.Errorf(
+						"cache.scope: %q cannot be used while model_list[%d] is a passthrough deployment; its responses are generated under the caller's own subscription and must not be served to other keys",
+						cache.ScopeShared, i))
+					break
+				}
+			}
 		}
 	}
 

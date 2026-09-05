@@ -178,6 +178,23 @@ virtual_keys:
 #   key_prefix: ai-gateway
 #   timeout: 250ms
 
+# Serve an identical request from a stored response instead of calling the
+# provider again.
+#
+# scope decides who may see a cached response, and the default is deliberate.
+# "key" confines each virtual key to its own responses: it cannot leak one
+# caller's completion to another. "shared" lets every caller reuse any cached
+# response — far larger savings, but only appropriate when all callers are
+# equally trusted, and refused outright while any passthrough deployment exists,
+# since those responses are generated under one person's own subscription.
+# cache:
+#   enabled: true
+#   ttl: 5m
+#   scope: key            # key | shared
+#   max_entries: 1000
+#   max_entry_bytes: 1048576
+#   shared: false         # store in Redis so a hit on one instance serves all
+
 observability:
   log_level: info
   # text | json

@@ -4,6 +4,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/cache"
+
 	"github.com/erickardus/ai-gateway/internal/core"
 )
 
@@ -36,6 +38,14 @@ const (
 	// DefaultRedisTimeout bounds each Redis call, short enough that an
 	// unhealthy Redis degrades the gateway rather than slowing it.
 	DefaultRedisTimeout = 250 * time.Millisecond
+
+	// DefaultCacheTTL is short: an LLM response is only interchangeable with a
+	// fresh one for so long, and a long TTL turns a cache into stale answers.
+	DefaultCacheTTL = 5 * time.Minute
+	// DefaultCacheMaxEntries bounds the in-process cache.
+	DefaultCacheMaxEntries = 1000
+	// DefaultCacheMaxEntryBytes refuses outsized responses.
+	DefaultCacheMaxEntryBytes = 1 << 20
 )
 
 // Strategy names accepted by router.strategy.
@@ -139,5 +149,20 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Redis.Timeout == 0 {
 		c.Redis.Timeout = DefaultRedisTimeout
+	}
+
+	if c.Cache.TTL == 0 {
+		c.Cache.TTL = DefaultCacheTTL
+	}
+	if c.Cache.Scope == "" {
+		// Per-key by default: a shared cache is a deliberate choice, not
+		// something to arrive at by omission.
+		c.Cache.Scope = cache.ScopeKey
+	}
+	if c.Cache.MaxEntries == 0 {
+		c.Cache.MaxEntries = DefaultCacheMaxEntries
+	}
+	if c.Cache.MaxEntryBytes == 0 {
+		c.Cache.MaxEntryBytes = DefaultCacheMaxEntryBytes
 	}
 }

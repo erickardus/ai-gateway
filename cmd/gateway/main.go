@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/erickardus/ai-gateway/internal/auth"
+	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/provider"
@@ -112,6 +113,17 @@ func run() error {
 		ledger = rstate.NewLedger(shared, localLedger, cfg.Redis.KeyPrefix, log, cfg.Redis.Timeout)
 	}
 
+	// A shared cache means a hit on one instance serves them all; a local cache
+	// is per-process but needs no dependency.
+	var responses cache.Cache
+	if cfg.Cache.Enabled {
+		local := cache.NewMemory(cfg.Cache.MaxEntries)
+		responses = local
+		if cfg.Cache.Shared && shared != nil {
+			responses = cache.NewRedis(shared.Client(), local, cfg.Redis.KeyPrefix, log, cfg.Redis.Timeout)
+		}
+	}
+
 	client := newUpstreamClient(cfg)
 	rtr, err := router.New(cfg, state, client, log, router.Options{})
 	if err != nil {
@@ -122,7 +134,7 @@ func run() error {
 		reg = metrics.New()
 	}
 
-	srv := server.New(cfg, authn, store, rtr, log, ledger, reg, shared).HTTPServer()
+	srv := server.New(cfg, authn, store, rtr, log, ledger, reg, shared, responses).HTTPServer()
 
 	// Persist the ledger periodically and once more on the way out, so a
 	// restart does not hand every key a fresh budget.
@@ -161,6 +173,8 @@ func run() error {
 		"metrics", cfg.Observability.Metrics,
 		"spend_store", cfg.Observability.SpendStorePath != "",
 		"shared_state", cfg.Redis.Enabled(),
+		"cache", cfg.Cache.Enabled,
+		"cache_scope", cfg.Cache.Scope,
 	)
 
 	errCh := make(chan error, 1)

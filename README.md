@@ -73,6 +73,7 @@ claude    # /login → "Claude account with subscription"
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | Key management, master-key only. |
 | `GET /spend/keys`, `GET /spend/deployments` | Usage and cost reports, master-key only. |
 | `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. |
+| `POST /cache/purge` | Empty the response cache, master-key only. |
 
 ## Scope
 

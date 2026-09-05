@@ -29,6 +29,21 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
+// handleCachePurge empties the response cache. Master-key only: it affects
+// every caller.
+func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w, r) {
+		return
+	}
+	if err := s.cache.Purge(r.Context()); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.log.Info("response cache purged", "request_id", RequestIDFrom(r.Context()))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "purged"})
+}
+
 // handleSpendKeys reports consumption per virtual key. Master-key only: it
 // discloses what every developer spent.
 func (s *Server) handleSpendKeys(w http.ResponseWriter, r *http.Request) {

@@ -117,6 +117,9 @@ const (
 	OutcomeUpstream = "upstream_error"
 	OutcomeGateway  = "gateway_error"
 	OutcomeRejected = "rejected"
+	// OutcomeCacheHit marks a request served from cache, which called no
+	// upstream and cost nothing.
+	OutcomeCacheHit = "cache_hit"
 )
 
 // Result is everything the gateway records about one completed request.

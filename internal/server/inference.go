@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/erickardus/ai-gateway/internal/auth"
+	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/jsonx"
 	"github.com/erickardus/ai-gateway/internal/metrics"
@@ -91,6 +92,22 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		return
 	}
 
+	// A cache hit calls no upstream, so it is served before rate limits and
+	// budgets are charged: it consumes neither provider capacity nor money, and
+	// billing for it would be charging twice for one answer.
+	cacheKey, cacheable := s.cacheKeyFor(authCtx, format, fields.Model, body)
+	if cacheable {
+		if entry, hit, err := s.cache.Get(ctx, cacheKey); err != nil {
+			s.log.Warn("cache lookup failed", "error", err, "request_id", RequestIDFrom(ctx))
+		} else if hit {
+			obs.deployment, obs.outcome = "cache", metrics.OutcomeCacheHit
+			obs.usage, obs.latency = entry.Usage, time.Since(started)
+			s.serveFromCache(w, entry, fields.Model)
+			s.metrics.Observe(obs.toResult(0))
+			return
+		}
+	}
+
 	// Refuse a key that has already spent its budget before incurring more cost.
 	if err := s.auth.CheckBudget(ctx, authCtx, s.ledger); err != nil {
 		s.reject(r, &obs, "budget_exceeded", started)
@@ -150,13 +167,26 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	defer s.metrics.InFlightAdd(obs.model, obs.deployment, -1)
 
 	provider.SanitizeResponseHeaders(w.Header(), result.Response.Header)
+	if cacheable {
+		w.Header().Set(cacheHeader, "miss")
+	}
 	w.Header().Set("x-gateway-model-id", fields.Model)
 	w.Header().Set("x-gateway-deployment", result.Deployment.ID())
 	w.Header().Set("x-gateway-attempted-retries", strconv.Itoa(result.AttemptedRetries))
 	w.Header().Set("x-gateway-attempted-fallbacks", strconv.Itoa(result.AttemptedFallback))
 	w.WriteHeader(result.Response.StatusCode)
 
-	usage, relayErr := provider.Relay(w, result.Response.Body)
+	// Tee the relay when the response is a candidate for caching. The client
+	// still receives every chunk as it arrives; the copy is only written to the
+	// cache once the stream completes successfully.
+	var relayTarget http.ResponseWriter = w
+	var tee *teeWriter
+	if cacheable && s.cacheable(result.Response.StatusCode, nil) {
+		tee = &teeWriter{ResponseWriter: w, capture: &bytes.Buffer{}, limit: s.cfg.Cache.MaxEntryBytes}
+		relayTarget = tee
+	}
+
+	usage, relayErr := provider.Relay(relayTarget, result.Response.Body)
 	if relayErr != nil {
 		// The status line is already sent, so the only thing left is to record
 		// what happened.
@@ -170,6 +200,23 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	s.router.RecordUsage(context.WithoutCancel(ctx), result.Deployment, usage)
 	if authCtx.Key != nil {
 		s.auth.Limiter().AddTokens(authCtx.Key.Hash, usage.Total())
+	}
+
+	// Store only a stream that completed. A truncated response replayed for the
+	// TTL would hand every later caller the same broken answer.
+	if tee != nil && relayErr == nil && !tee.Overflowed() {
+		entry := &cache.Entry{
+			Status: result.Response.StatusCode,
+			Header: cacheableHeaders(result.Response.Header),
+			Body:   tee.capture.Bytes(),
+			Usage:  usage,
+			// SSE is replayed through the relay path rather than written whole.
+			Streaming: fields.Stream,
+			StoredAt:  time.Now().UTC(),
+		}
+		if err := s.cache.Put(context.WithoutCancel(ctx), cacheKey, entry, s.cfg.Cache.TTL); err != nil {
+			s.log.Warn("cache store failed", "error", err, "request_id", RequestIDFrom(ctx))
+		}
 	}
 
 	obs.usage = usage

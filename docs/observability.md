@@ -177,3 +177,62 @@ outage. An unreachable Redis at startup is logged, not fatal.
 
 The local ledger is kept current even when Redis is healthy, so a fallback has
 something to fall back to and `/spend` keeps answering.
+
+## Response caching
+
+Off by default. When enabled, an identical request is served from a stored
+response instead of calling the provider.
+
+```yaml
+cache:
+  enabled: true
+  ttl: 5m
+  scope: key              # key | shared
+  max_entries: 1000
+  max_entry_bytes: 1048576
+  shared: false           # store in Redis so a hit on one instance serves all
+```
+
+### Who may see a cached response
+
+This is the decision that matters, and the default is deliberate.
+
+| Scope | Behaviour | When |
+|---|---|---|
+| `key` (default) | A virtual key only ever sees its own responses. | Any setup with more than one tenant. |
+| `shared` | Every caller reuses any cached response. | Only when all callers are equally trusted. |
+
+Prompts and completions are the most sensitive thing this gateway handles, so
+sharing them across tenants is opt-in rather than something reached by omission.
+The key hash is part of the cache key under `key` scope, so isolation is
+structural rather than a filter that could be bypassed.
+
+**`shared` is refused while any passthrough deployment is configured**, and
+validation fails at load rather than leaving it as a footgun: a passthrough
+response was generated under one person's own claude.ai subscription, and
+serving it to a different key would hand them output someone else paid for.
+
+### What is and is not cached
+
+- Only successful responses. An error describes one moment — a rate limit, an
+  overloaded upstream — and replaying it for the whole TTL would turn a blip
+  into a sticky outage.
+- Only complete streams. A response truncated mid-relay is discarded rather
+  than replayed to every later caller.
+- Nothing larger than `max_entry_bytes`, so one outsized completion cannot
+  evict everything else.
+
+Streaming works: the relayed bytes are stored and replayed through the same
+path, so the client parses an identical event sequence. The original timing is
+not reproduced — the point is that it arrives at once.
+
+### Cost
+
+A cache hit calls no upstream and costs nothing, so it records **no spend** and
+does not consume a rate limit or budget. It appears in metrics with
+`outcome="cache_hit"`. Charging for it would be billing twice for one answer.
+
+Responses carry `x-gateway-cache: hit` or `miss`.
+
+`POST /cache/purge` empties the cache; master-key only, since it affects every
+caller.

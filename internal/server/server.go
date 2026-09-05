@@ -12,6 +12,7 @@ import (
 	"net/http"
 
 	"github.com/erickardus/ai-gateway/internal/auth"
+	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/metrics"
@@ -32,6 +33,8 @@ type Server struct {
 	// shared is set when state is shared across instances, for readiness
 	// reporting. It is nil in single-instance deployments.
 	shared *rstate.Store
+	// cache is nil when response caching is disabled.
+	cache cache.Cache
 	// pricing maps a deployment ID to its price and whether the operator pays
 	// it, resolved once at construction rather than searched per request.
 	pricing map[string]deploymentPricing
@@ -47,7 +50,7 @@ type deploymentPricing struct {
 
 // New builds a Server. ledger and reg may be nil, which disables spend
 // accounting and metrics respectively.
-func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr *router.Router, log *slog.Logger, ledger spend.Store, reg *metrics.Registry, shared *rstate.Store) *Server {
+func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr *router.Router, log *slog.Logger, ledger spend.Store, reg *metrics.Registry, shared *rstate.Store, responses cache.Cache) *Server {
 	pricing := make(map[string]deploymentPricing, len(cfg.ModelList))
 	for i := range cfg.ModelList {
 		d := &cfg.ModelList[i]
@@ -58,7 +61,7 @@ func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr
 	}
 	return &Server{
 		cfg: cfg, auth: authn, store: store, router: rtr, log: log,
-		ledger: ledger, metrics: reg, pricing: pricing, shared: shared,
+		ledger: ledger, metrics: reg, pricing: pricing, shared: shared, cache: responses,
 	}
 }
 
@@ -90,6 +93,9 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.HandleFunc("GET /spend/keys", s.handleSpendKeys)
 	mux.HandleFunc("GET /spend/deployments", s.handleSpendDeployments)
+	if s.cache != nil {
+		mux.HandleFunc("POST /cache/purge", s.handleCachePurge)
+	}
 
 	// Health.
 	mux.HandleFunc("GET /health", s.handleHealth)
