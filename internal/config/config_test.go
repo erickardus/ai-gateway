@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The shipped example must load through the real code path, so a broken example
@@ -587,5 +588,75 @@ observability:
 	}
 	if o.Headers["x-tenant"] != "acme" {
 		t.Errorf("x-tenant = %q, want the environment's header kept alongside", o.Headers["x-tenant"])
+	}
+}
+
+// The postgres key store is what lets a fleet share one set of keys, so every
+// half-written version of it is refused rather than resolved into a different
+// store than the operator wrote.
+
+func TestPostgresKeyStoreWithoutADSNIsRefused(t *testing.T) {
+	_, err := Parse([]byte(minimalConfig + `
+virtual_keys:
+  store:
+    kind: postgres
+`))
+	if err == nil || !strings.Contains(err.Error(), "virtual_keys.store.dsn") {
+		t.Fatalf("want a rejection naming virtual_keys.store.dsn, got %v", err)
+	}
+}
+
+// The likely cause of an empty dsn is a ${VAR} that was never set in the
+// environment, which would otherwise start a gateway pointed at nothing.
+func TestPostgresKeyStoreWithAnUnsetEnvDSNIsRefused(t *testing.T) {
+	_, err := Parse([]byte(minimalConfig + `
+virtual_keys:
+  store:
+    kind: postgres
+    dsn: ${GATEWAY_TEST_UNSET_DSN}
+`))
+	if err == nil || !strings.Contains(err.Error(), "virtual_keys.store.dsn") {
+		t.Fatalf("want a rejection naming virtual_keys.store.dsn, got %v", err)
+	}
+}
+
+// A dsn beside a file store means the keys are not where one of those two lines
+// says they are, and leaves a database password in a file that has no use for
+// it.
+func TestADSNOnAFileKeyStoreIsRefused(t *testing.T) {
+	_, err := Parse([]byte(minimalConfig + `
+virtual_keys:
+  store:
+    kind: file
+    path: ./data/keys.json
+    dsn: postgres://gateway:secret@db:5432/gateway
+`))
+	if err == nil || !strings.Contains(err.Error(), "virtual_keys.store.dsn") {
+		t.Fatalf("want a rejection naming virtual_keys.store.dsn, got %v", err)
+	}
+}
+
+func TestPostgresKeyStoreParses(t *testing.T) {
+	t.Setenv("GATEWAY_TEST_DSN", "postgres://gateway:secret@db:5432/gateway?sslmode=require")
+	cfg, err := Parse([]byte(minimalConfig + `
+virtual_keys:
+  store:
+    kind: postgres
+    dsn: ${GATEWAY_TEST_DSN}
+    timeout: 500ms
+    max_conns: 4
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := cfg.VirtualKeys.Store
+	if s.DSN != "postgres://gateway:secret@db:5432/gateway?sslmode=require" {
+		t.Errorf("dsn = %q, want the expanded environment value", s.DSN)
+	}
+	if s.Timeout != 500*time.Millisecond {
+		t.Errorf("timeout = %s, want 500ms", s.Timeout)
+	}
+	if s.MaxConns != 4 {
+		t.Errorf("max_conns = %d, want 4", s.MaxConns)
 	}
 }

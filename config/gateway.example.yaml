@@ -171,10 +171,37 @@ virtual_keys:
   # Enables the /key/* management endpoints. Leave unset to disable them.
   master_key: ${GATEWAY_MASTER_KEY}
 
+  # Where issued keys live. Only hashes are ever stored, whichever kind you
+  # choose: the plaintext key exists once, in the response that issued it.
+  #
+  # memory   forgotten on restart. Fine when every key is declared below.
+  # file     survives a restart, and is SINGLE-NODE. Two instances pointed at
+  #          one path do not share it — each holds the whole set in memory and
+  #          rewrites the file wholesale, so a key issued on one is erased by
+  #          the next write from the other.
+  # postgres shared by every replica, which is what makes /key/generate, an SSO
+  #          login and a renewal work behind a load balancer. The gateway
+  #          creates and migrates its own virtual_keys table at startup; there
+  #          is no separate migration step.
   store:
-    # memory | file
+    # memory | file | postgres
     kind: file
     path: ./data/keys.json
+
+    # The dsn carries a password, so it comes from the environment: this file is
+    # mounted read-only into containers and committed to repositories. Setting
+    # it while kind is not postgres is refused at load rather than ignored,
+    # since the keys would not be where one of the two lines says they are.
+    #
+    # Unlike redis, an unreachable key store is not degraded around: nothing can
+    # be authenticated without it, and serving from a stale copy would keep
+    # honouring keys you had just revoked. So the gateway refuses to start if
+    # Postgres is unreachable at boot, and reports itself unready on
+    # /health/readiness if it goes away later.
+    #
+    # dsn: ${KEY_STORE_DSN}   # postgres://gateway:...@db:5432/gateway?sslmode=require
+    # timeout: 2s             # per query; longer than redis.timeout, which has a fallback
+    # max_conns: 10           # pool size per gateway process
 
   # Headers that may carry a virtual key, in precedence order. These must not
   # collide with a header the client sets itself: the whole design depends on

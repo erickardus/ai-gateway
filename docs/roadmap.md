@@ -454,10 +454,40 @@ hand-rolled surface and the classic source of authentication bypasses, or a
 dependency this project does not otherwise need. An organisation with only SAML
 provisioned can usually front it with an OIDC-speaking broker.
 
-### 🔴 Persistent key store
+### ✅ Persistent key store
 
-`memory` and `file` only. `file` is single-node: two instances with the same path
-will clobber each other. `auth.KeyStore` is ready for Postgres.
+Resolved. The store was `memory` or `file`, and `file` is single-node in a way
+that is easy to miss: it is not shared by two instances pointed at one path, it
+is taken turns overwriting, because each holds the whole set in memory and
+rewrites the file wholesale. A key from `/key/generate`, an SSO login or a
+renewal was therefore erased by the next write from the other replica — so the
+one arrangement Redis exists to support was the arrangement in which issuing a
+key did not work.
+
+`auth.PostgresStore` is `store.kind: postgres`, on `pgxpool`. Every field of
+`core.Key` round-trips, `budget_duration_ns` as the nanoseconds `time.Duration`
+actually is rather than an `interval` whose months and days have no fixed
+length. The gateway owns its schema: `virtual_keys` is created at startup under
+a transaction-scoped advisory lock, so replicas booting together apply it once
+between them, and the migration list is append-only because a rolling upgrade
+runs the old binary and the new one against one table.
+
+The connection posture is the opposite of `rstate`'s, deliberately. Redis going
+away degrades the gateway to per-instance limits; the key store going away
+leaves nothing to authenticate with, and a stale in-memory copy would keep
+honouring exactly the keys an operator had just revoked. So an unreachable
+Postgres at boot refuses to start — a gateway that came up anyway would 401
+every valid key and read, from outside, as a fleet-wide credential problem — and
+one lost later fails requests while `/health/readiness` reports the instance
+unready, which is what takes it out of the load balancer.
+
+Two residual gaps. `/health/readiness` still probes the store with `List`, which
+is a full table scan on every poll rather than the `Ping` that now exists beside
+it; harmless at the scale a key table has, wrong in shape. And keys are read
+from the database on every request, with no cache: correct, and the reason a
+revocation takes effect immediately, but it makes a key lookup a network round
+trip on the request path. A short TTL cache would want an invalidation channel
+— Redis is already there — before it is worth the staleness.
 
 ### ✅ Admin UI
 

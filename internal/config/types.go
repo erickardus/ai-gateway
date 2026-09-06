@@ -322,10 +322,33 @@ type VirtualKeysConfig struct {
 }
 
 // StoreConfig selects the key persistence backend.
+//
+// The choice is a deployment decision rather than a preference: "file" is
+// single-node, so two instances pointed at one path overwrite each other's keys
+// rather than sharing them. Anything that issues keys at runtime —
+// /key/generate, an SSO login, a renewal — needs "postgres" behind a load
+// balancer.
 type StoreConfig struct {
-	// Kind is "memory" or "file".
+	// Kind is "memory", "file" or "postgres".
 	Kind string `yaml:"kind"`
 	Path string `yaml:"path"`
+	// DSN is the Postgres connection string, e.g.
+	// "postgres://gateway:secret@db:5432/gateway?sslmode=require".
+	//
+	// It carries a password, so it is expected to arrive as ${VAR}: this file is
+	// mounted read-only into containers, copied between environments and
+	// committed to repositories, and none of those is a place for a database
+	// credential.
+	DSN string `yaml:"dsn"`
+	// Timeout bounds each query against the key store. Unlike redis.timeout it
+	// is not sized to be negligible: there is no per-instance fallback for
+	// authentication, so a query abandoned here is a request refused rather
+	// than a request served with weaker limits.
+	Timeout time.Duration `yaml:"timeout"`
+	// MaxConns caps the connection pool. A key lookup is a primary-key read, so
+	// this bounds how many callers may be authenticated at once rather than any
+	// throughput the database could sustain.
+	MaxConns int32 `yaml:"max_conns"`
 }
 
 // KeySpec declares a virtual key in configuration. The plaintext is hashed at
