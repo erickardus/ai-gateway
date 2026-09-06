@@ -392,3 +392,71 @@ func abs(f float64) float64 {
 	}
 	return f
 }
+
+// A reply produced by a server-side tool loop is several turns against the model
+// reported as one response. The totals are already summed, but the split of its
+// cache writes between the five-minute and one-hour tiers is reported only per
+// iteration — so a request whose long writes all happened inside the loop looks
+// like a request with no long writes, and is billed at a rate a third cheaper
+// than the one the provider charged.
+func TestALongWriteInsideAToolLoopIsPricedAtItsOwnTier(t *testing.T) {
+	const payload = `{"usage":{"input_tokens":120,"output_tokens":400,` +
+		`"cache_creation_input_tokens":30000,"cache_read_input_tokens":5000,` +
+		`"iterations":[` +
+		`{"cache_creation":{"ephemeral_5m_input_tokens":4000,"ephemeral_1h_input_tokens":6000}},` +
+		`{"cache_creation":{"ephemeral_5m_input_tokens":2000,"ephemeral_1h_input_tokens":18000}}]}}`
+
+	usage, ok := UsageFromBody([]byte(payload), core.FormatAnthropic)
+	if !ok {
+		t.Fatal("usage was not parsed")
+	}
+	// The totals come from the top level, which already aggregates the loop.
+	// Summing the iterations into them as well would bill the reply twice.
+	if usage.InputTokens != 120 || usage.CacheReadTokens != 5000 || usage.CacheWriteTokens != 30000 {
+		t.Errorf("totals = %+v, want the top-level figures unchanged", usage)
+	}
+	if usage.CacheWrite1hTokens != 24000 {
+		t.Errorf("one-hour writes = %d, want 24000 summed across the loop", usage.CacheWrite1hTokens)
+	}
+
+	price := core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75, CacheWrite1hPer1M: 6}
+	want := 120*3/1e6 + 400*15/1e6 + 5000*0.3/1e6 + 6000*3.75/1e6 + 24000*6/1e6
+	if got := price.Cost(usage); !closeEnough(got, want) {
+		t.Errorf("cost = %.8f, want %.8f", got, want)
+	}
+}
+
+// Whatever the per-iteration breakdowns do not account for is a write at the
+// default lifetime. Attributing an unexplained remainder to the long tier would
+// charge the premium for tokens the provider never said were written at it.
+func TestAnUnexplainedWriteRemainderIsChargedAtTheShortTier(t *testing.T) {
+	const payload = `{"usage":{"input_tokens":10,"output_tokens":20,` +
+		`"cache_creation_input_tokens":9000,` +
+		`"iterations":[{"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2000}}]}}`
+
+	usage, ok := UsageFromBody([]byte(payload), core.FormatAnthropic)
+	if !ok {
+		t.Fatal("usage was not parsed")
+	}
+	if usage.CacheWriteTokens != 9000 || usage.CacheWrite1hTokens != 2000 {
+		t.Errorf("writes = %d of which %d long, want 9000 and 2000",
+			usage.CacheWriteTokens, usage.CacheWrite1hTokens)
+	}
+}
+
+// A response reporting its own breakdown is answering the question directly, so
+// the iterations are not consulted at all.
+func TestAReportedBreakdownWinsOverTheIterations(t *testing.T) {
+	const payload = `{"usage":{"input_tokens":10,"output_tokens":20,` +
+		`"cache_creation_input_tokens":5000,` +
+		`"cache_creation":{"ephemeral_5m_input_tokens":5000,"ephemeral_1h_input_tokens":0},` +
+		`"iterations":[{"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5000}}]}}`
+
+	usage, ok := UsageFromBody([]byte(payload), core.FormatAnthropic)
+	if !ok {
+		t.Fatal("usage was not parsed")
+	}
+	if usage.CacheWrite1hTokens != 0 {
+		t.Errorf("one-hour writes = %d, want 0: the response reported its own split", usage.CacheWrite1hTokens)
+	}
+}

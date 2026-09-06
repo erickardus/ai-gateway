@@ -187,17 +187,28 @@ func (o observation) toResult(cost float64) metrics.Result {
 // and the fallback is a defensible default — but it is a log line the operator
 // can act on, naming the deployment and the key to add.
 func (s *Server) warnUnpricedCacheTier(obs observation, price core.Pricing) {
-	if obs.usage.CacheWrite1hTokens == 0 || price.CacheWrite1hPer1M > 0 {
+	if obs.usage.CacheWrite1hTokens == 0 {
 		return
 	}
-	if _, seen := s.mispriced.LoadOrStore(obs.deployment, true); seen {
+	// The rate that fell back is the one belonging to the tier this request was
+	// billed at, so a long-context deployment is told to price the long-context
+	// block rather than the base one it may already have priced correctly.
+	key, priced, fallback := "cost.cache_write_1h_per_1m", price.CacheWrite1hPer1M > 0, price.CacheWritePer1M
+	if tier := price.TierFor(obs.usage); tier != nil {
+		key, priced, fallback = "cost.long_context.cache_write_1h_per_1m", tier.CacheWrite1hPer1M > 0, tier.CacheWritePer1M
+	}
+	if priced {
 		return
 	}
-	s.log.Warn("upstream reported one-hour cache writes at a deployment priced only for five-minute ones; cost is understated until cost.cache_write_1h_per_1m is set",
+	if _, seen := s.mispriced.LoadOrStore(obs.deployment+"\x00"+key, true); seen {
+		return
+	}
+	s.log.Warn("upstream reported one-hour cache writes at a deployment priced only for five-minute ones; cost is understated until the one-hour write price is set",
 		"deployment", obs.deployment,
 		"model", obs.model,
+		"remedy", key,
 		"cache_write_1h_tokens", obs.usage.CacheWrite1hTokens,
-		"cache_write_per_1m", price.CacheWritePer1M)
+		"cache_write_per_1m", fallback)
 }
 
 // warnMissingStreamUsage reports, once per deployment, that a streamed reply

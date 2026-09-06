@@ -1008,3 +1008,97 @@ func TestACorrectlyPricedLongWriteIsSilent(t *testing.T) {
 		t.Errorf("a correctly priced deployment was warned about:\n%s", logs)
 	}
 }
+
+// TestALongContextConversationIsBilledAtTheTierItRanIn covers the premium a
+// provider charges above a prompt size, end to end and in dollars.
+//
+// It is the traffic prompt caching exists for: a long conversation, most of it
+// served from the cache. Priced at the small-request rates the bill is roughly
+// half of what the provider charged, the savings figure is understated by the
+// same proportion, and every one of those numbers looks entirely ordinary.
+func TestALongContextConversationIsBilledAtTheTierItRanIn(t *testing.T) {
+	const (
+		cached = 190_000
+		fresh  = 20_000
+		out    = 1_000
+	)
+	priced := core.Pricing{
+		InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75,
+		LongContext: &core.LongContextPricing{
+			AbovePromptTokens: 200_000,
+			InputPer1M:        6, OutputPer1M: 22.5, CacheReadPer1M: 0.6, CacheWritePer1M: 7.5,
+		},
+	}
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, pricing: &priced,
+		upstream: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"usage":{"input_tokens":%d,"output_tokens":%d,`+
+				`"cache_read_input_tokens":%d,"cache_creation_input_tokens":0}}`, fresh, out, cached)
+		},
+	})
+
+	h.do(t, claudeCodeRequest("/v1/messages", promptBody("be helpful", "hi")))
+
+	want := fresh*6/1e6 + cached*0.6/1e6 + out*22.5/1e6
+	assertLedgerCost(t, h, want)
+
+	atTheSmallRates := fresh*3/1e6 + cached*0.3/1e6 + out*15/1e6
+	if nearly(want, atTheSmallRates) {
+		t.Fatal("the two tiers are priced the same in this test, so it proves nothing")
+	}
+
+	// Savings are what the cache took off this bill, so they are measured
+	// against the input rate this request would actually have paid.
+	rows, err := h.ledger.Deployments(t.Context())
+	if err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("deployment rows = %d, want 1", len(rows))
+	}
+	wantSavings := cached * (6 - 0.6) / 1e6
+	if !nearly(rows[0].CacheSavings, wantSavings) {
+		t.Errorf("cache_savings = %.6f, want %.6f", rows[0].CacheSavings, wantSavings)
+	}
+}
+
+// The same understatement can hide one tier down. A deployment that prices
+// one-hour writes at the small size and a long-context block that does not
+// prices a large request's long writes at the long-context five-minute rate,
+// with the base one-hour price sitting there looking correct — so the warning
+// asks the question the pricing asks, which is what the tier this request was
+// billed at named, and points at the block to edit.
+func TestAnUnpricedLongWriteInTheLongContextTierIsReported(t *testing.T) {
+	const long = 250_000
+	priced := core.Pricing{
+		InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3,
+		CacheWritePer1M: 3.75, CacheWrite1hPer1M: 6,
+		LongContext: &core.LongContextPricing{
+			AbovePromptTokens: 200_000,
+			InputPer1M:        6, OutputPer1M: 22.5, CacheReadPer1M: 0.6, CacheWritePer1M: 7.5,
+		},
+	}
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, pricing: &priced,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"usage":{"input_tokens":10,"output_tokens":20,`+
+				`"cache_creation_input_tokens":%d,`+
+				`"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":%d}}}`, long, long)
+		},
+	})
+
+	if rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody("be helpful", "hi"))); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	if logs := h.logBuf.String(); !strings.Contains(logs, "cost.long_context.cache_write_1h_per_1m") {
+		t.Errorf("the warning does not name the block to edit:\n%s", logs)
+	}
+
+	// And the bill is the long-context five-minute rate, which is what the
+	// fallback resolves to rather than the base one-hour price.
+	want := float64(long)*7.5/1e6 + 10*6/1e6 + 20*22.5/1e6
+	assertLedgerCost(t, h, want)
+}

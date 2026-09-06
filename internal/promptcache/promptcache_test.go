@@ -641,3 +641,65 @@ func TestDeclaredCacheLifetimeIsRead(t *testing.T) {
 		})
 	}
 }
+
+// openAIConversation renders an OpenAI-format request, with or without the
+// leading system message most callers send.
+func openAIConversation(t testing.TB, system string, turns ...string) []byte {
+	t.Helper()
+	messages := make([]any, 0, len(turns)+1)
+	if system != "" {
+		messages = append(messages, map[string]any{"role": "system", "content": system})
+	}
+	for i, turn := range turns {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		messages = append(messages, map[string]any{"role": role, "content": turn})
+	}
+	body, err := json.Marshal(map[string]any{"model": "openai-gpt", "messages": messages})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return body
+}
+
+// A lead of two messages is stable only where a conversation has two messages
+// from its very first request, which a system message is what guarantees.
+// Without one, the opening request holds a single user turn where its second
+// holds three — so a fixed lead of two fingerprints a conversation's first
+// request differently from the rest of itself, warms an upstream nothing
+// afterwards returns to, and pays a cache write to do it.
+func TestAnOpenAIFingerprintIsStableFromTheFirstRequest(t *testing.T) {
+	for _, system := range []string{"be helpful", ""} {
+		name := "with a system message"
+		if system == "" {
+			name = "with none"
+		}
+		t.Run(name, func(t *testing.T) {
+			first, ok := Fingerprint(core.FormatOpenAI, "m", peek(t, openAIConversation(t, system, "opening question")))
+			if !ok {
+				t.Fatal("Fingerprint: ok = false")
+			}
+			later, ok := Fingerprint(core.FormatOpenAI, "m",
+				peek(t, openAIConversation(t, system, "opening question", "an answer", "second question")))
+			if !ok {
+				t.Fatal("Fingerprint on a longer conversation: ok = false")
+			}
+			if first != later {
+				t.Errorf("the opening request fingerprinted as %s and its own second turn as %s", first, later)
+			}
+		})
+	}
+}
+
+// The reason the lead is two where a system message opens the request: that
+// message is shared by every caller of one template, so reading it alone would
+// put unrelated conversations on one pin.
+func TestAnOpenAIFingerprintStillSeparatesConversationsBehindOneSystemPrompt(t *testing.T) {
+	one, _ := Fingerprint(core.FormatOpenAI, "m", peek(t, openAIConversation(t, "be helpful", "about billing")))
+	two, _ := Fingerprint(core.FormatOpenAI, "m", peek(t, openAIConversation(t, "be helpful", "about routing")))
+	if one == two {
+		t.Error("two conversations behind one shared system message share a pin")
+	}
+}

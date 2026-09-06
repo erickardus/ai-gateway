@@ -182,7 +182,7 @@ behaviour and actual behaviour diverge, these follow neither blindly:
 | In-flight counter | Can go negative | Clamped; released exactly once, on a context detached from the client's so an aborted request still decrements |
 | Wire format | Not a routing dimension | Enforced: an ingress reaches only deployments of its own format, groups must be homogeneous, and fallbacks may not cross formats |
 | Duplicate deployments | Undetectable, because the ID includes a per-group ordinal | Rejected at load: a duplicate would double that upstream's traffic share and rate limit |
-| Provider prompt cache | Not a routing dimension | Conversations are pinned to the upstream holding their warm prefix, so balancing does not turn every cache read into a cache write |
+| Provider prompt cache | An opt-in pre-call check, keyed on the messages up to and including the last `cache_control` marker — which its own injection walks forward every turn | On by default. Conversations are pinned to the upstream holding their warm prefix, on a fingerprint taken with the markers stripped, so a client walking one forward keeps its pin |
 | Rate-limit charging | At authentication, so rejected requests spend budget | After the model is resolved and authorized |
 | Error classification | Substring matching only | Structured provider error type first, substrings as fallback, both configurable |
 | `InternalServerErrorRetries` | Declared but never read | Every declared policy field is honoured |

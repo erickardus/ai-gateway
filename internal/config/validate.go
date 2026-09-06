@@ -321,62 +321,162 @@ func HostOf(rawURL string) string {
 // untouched: "unpriced" is a coherent state, and it is the one passthrough
 // requires.
 func validatePricing(path string, d *Deployment) []error {
-	var errs []error
 	cost := d.Cost
 	if cost.Zero() {
 		return nil
 	}
 
+	base := rateSet{
+		input:        cost.InputPer1M,
+		output:       cost.OutputPer1M,
+		cacheRead:    cost.CacheReadPer1M,
+		cacheWrite:   cost.CacheWritePer1M,
+		cacheWrite1h: cost.CacheWrite1hPer1M,
+	}
+	errs := validateRates(path+".cost", base, d.Params.Format, false)
+	return append(errs, validateLongContext(path, d, base)...)
+}
+
+// rateSet is one tier of a deployment's price list. The base rates and the
+// long-context rates are the same five figures under different keys, and the
+// relationships between them — a read below input, a write above it — hold
+// within a tier rather than across tiers, so they are checked per tier.
+type rateSet struct {
+	input, output, cacheRead, cacheWrite, cacheWrite1h float64
+}
+
+// validateRates checks one tier's internal consistency. block is the key path
+// the operator would edit, so an error names the line rather than the concept.
+//
+// required says whether an input price must be present. It is optional on the
+// base tier — a cost model charging output alone is a deliberate enough oddity
+// to leave alone — and mandatory on a long-context tier, which exists only to
+// override the base and cannot do so without one.
+func validateRates(block string, r rateSet, format core.Format, required bool) []error {
+	var errs []error
 	for _, f := range []struct {
 		name  string
 		value float64
 	}{
-		{"input_per_1m", cost.InputPer1M},
-		{"output_per_1m", cost.OutputPer1M},
-		{"cache_read_per_1m", cost.CacheReadPer1M},
-		{"cache_write_per_1m", cost.CacheWritePer1M},
-		{"cache_write_1h_per_1m", cost.CacheWrite1hPer1M},
+		{"input_per_1m", r.input},
+		{"output_per_1m", r.output},
+		{"cache_read_per_1m", r.cacheRead},
+		{"cache_write_per_1m", r.cacheWrite},
+		{"cache_write_1h_per_1m", r.cacheWrite1h},
 	} {
 		if f.value < 0 {
-			errs = append(errs, fmt.Errorf("%s.cost.%s: must be >= 0, got %v", path, f.name, f.value))
+			errs = append(errs, fmt.Errorf("%s.%s: must be >= 0, got %v", block, f.name, f.value))
 		}
 	}
 
-	if cost.InputPer1M <= 0 {
-		// Without an input price there is nothing to price cache reads against,
-		// and a cost model that charges output alone is a deliberate enough
-		// oddity to leave alone.
+	if r.input <= 0 {
+		if required {
+			errs = append(errs, fmt.Errorf(
+				"%s.input_per_1m: required; a tier with no input price of its own cannot price the tokens it exists to charge differently",
+				block))
+		}
+		// Without an input price there is nothing to price cache reads against.
 		return errs
 	}
 
-	if cost.CacheReadPer1M <= 0 {
+	if r.cacheRead <= 0 {
 		errs = append(errs, fmt.Errorf(
-			"%s.cost.cache_read_per_1m: required once input_per_1m is set; leaving it zero prices every cached token as free, which overstates this deployment's savings and understates its cost by the whole of its cache traffic",
-			path))
-	} else if cost.CacheReadPer1M >= cost.InputPer1M {
+			"%s.cache_read_per_1m: required once input_per_1m is set; leaving it zero prices every cached token as free, which overstates this deployment's savings and understates its cost by the whole of its cache traffic",
+			block))
+	} else if r.cacheRead >= r.input {
 		errs = append(errs, fmt.Errorf(
-			"%s.cost.cache_read_per_1m: must be below input_per_1m (got %v against %v); a cache read costing as much as fresh input means prompt caching saves nothing, which no provider charges and a gateway cannot report",
-			path, cost.CacheReadPer1M, cost.InputPer1M))
+			"%s.cache_read_per_1m: must be below input_per_1m (got %v against %v); a cache read costing as much as fresh input means prompt caching saves nothing, which no provider charges and a gateway cannot report",
+			block, r.cacheRead, r.input))
 	}
 
 	// A cache write is an Anthropic construct: it is charged at a premium over
 	// input and reported as its own counter. OpenAI-compatible providers cache
 	// automatically and charge nothing to write, so requiring a price there
 	// would be inventing one.
-	if d.Params.Format == core.FormatAnthropic {
-		if cost.CacheWritePer1M <= 0 {
+	if format == core.FormatAnthropic {
+		if r.cacheWrite <= 0 {
 			errs = append(errs, fmt.Errorf(
-				"%s.cost.cache_write_per_1m: required on an anthropic deployment once input_per_1m is set; a cache write costs a premium over input, and pricing it at zero hides the one cost that makes bad cache routing expensive",
-				path))
-		} else if cost.CacheWritePer1M <= cost.InputPer1M {
+				"%s.cache_write_per_1m: required on an anthropic deployment once input_per_1m is set; a cache write costs a premium over input, and pricing it at zero hides the one cost that makes bad cache routing expensive",
+				block))
+		} else if r.cacheWrite <= r.input {
 			errs = append(errs, fmt.Errorf(
-				"%s.cost.cache_write_per_1m: must exceed input_per_1m (got %v against %v); writing the cache is charged at a premium, and a price at or below input makes a cache miss look free",
-				path, cost.CacheWritePer1M, cost.InputPer1M))
+				"%s.cache_write_per_1m: must exceed input_per_1m (got %v against %v); writing the cache is charged at a premium, and a price at or below input makes a cache miss look free",
+				block, r.cacheWrite, r.input))
 		}
-		if h := cost.CacheWrite1hPer1M; h > 0 && h < cost.CacheWritePer1M {
+		if h := r.cacheWrite1h; h > 0 && h < r.cacheWrite {
 			errs = append(errs, fmt.Errorf(
-				"%s.cost.cache_write_1h_per_1m: must be at least cache_write_per_1m (got %v against %v); the longer-lived cache is the more expensive one to write",
-				path, h, cost.CacheWritePer1M))
+				"%s.cache_write_1h_per_1m: must be at least cache_write_per_1m (got %v against %v); the longer-lived cache is the more expensive one to write",
+				block, h, r.cacheWrite))
+		}
+	}
+	return errs
+}
+
+// validateLongContext checks the higher tier a provider charges above a prompt
+// size.
+//
+// The tier is refused rather than defaulted when it is incomplete, for the
+// reason the base tier is: a rate it leaves unset falls back to the base rate,
+// so a tier naming only its input price would charge the premium on ordinary
+// input and the small-request price on everything else. That is a bill nobody
+// can reconstruct, on the largest requests a deployment serves.
+func validateLongContext(path string, d *Deployment, base rateSet) []error {
+	long := d.Cost.LongContext
+	if long == nil {
+		return nil
+	}
+	block := path + ".cost.long_context"
+
+	if base.input <= 0 {
+		return []error{fmt.Errorf(
+			"%s: requires %s.cost.input_per_1m; a higher tier is an override of the base rates and there are none to override",
+			block, path)}
+	}
+
+	var errs []error
+	if long.AbovePromptTokens <= 0 {
+		errs = append(errs, fmt.Errorf(
+			"%s.above_prompt_tokens: must be > 0, got %d; without a threshold there is nothing to decide which tier a request falls into",
+			block, long.AbovePromptTokens))
+	}
+
+	tier := rateSet{
+		input:        long.InputPer1M,
+		output:       long.OutputPer1M,
+		cacheRead:    long.CacheReadPer1M,
+		cacheWrite:   long.CacheWritePer1M,
+		cacheWrite1h: long.CacheWrite1hPer1M,
+	}
+	errs = append(errs, validateRates(block, tier, d.Params.Format, true)...)
+
+	// An output price is required only where the base tier has one to be
+	// mispriced against: a deployment charging nothing for output at either
+	// size is coherent, one that charges for it at the small size and silently
+	// falls back to that rate at the large size is not.
+	if base.output > 0 && tier.output <= 0 {
+		errs = append(errs, fmt.Errorf(
+			"%s.output_per_1m: required once %s.cost.output_per_1m is set; a tier that leaves it unset bills long-context output at the small-request rate",
+			block, path))
+	}
+
+	// Every rate this tier names must be at least its base counterpart. A tier
+	// is what a provider charges *extra* above a threshold, so a cheaper rate
+	// here is a transposed pair of blocks rather than a deliberate discount —
+	// and it would report the largest requests as the cheapest ones.
+	for _, f := range []struct {
+		name       string
+		tier, base float64
+	}{
+		{"input_per_1m", tier.input, base.input},
+		{"output_per_1m", tier.output, base.output},
+		{"cache_read_per_1m", tier.cacheRead, base.cacheRead},
+		{"cache_write_per_1m", tier.cacheWrite, base.cacheWrite},
+		{"cache_write_1h_per_1m", tier.cacheWrite1h, base.cacheWrite1h},
+	} {
+		if f.tier > 0 && f.base > 0 && f.tier < f.base {
+			errs = append(errs, fmt.Errorf(
+				"%s.%s: must be at least %s.cost.%s (got %v against %v); the long-context tier is the more expensive one, so a lower rate here is the two blocks written the wrong way round",
+				block, f.name, path, f.name, f.tier, f.base))
 		}
 	}
 	return errs

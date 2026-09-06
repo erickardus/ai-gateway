@@ -45,26 +45,42 @@ const controlKey = "cache_control"
 // too.
 var controlMarker = []byte(`"` + controlKey + `"`)
 
-// prefixLead is how many leading messages join the fingerprint, which differs by
-// wire format because the two put their distinguishing turn in different places.
-//
-// Under the Anthropic format the first message is the opening user turn, which
-// differs per conversation and is therefore enough on its own. Under OpenAI the
-// first is often a system message shared by every caller, and the second is what
-// tells two conversations apart.
+// The roles an OpenAI-format conversation may open with that are not a turn of
+// the conversation itself. "developer" is the newer spelling of "system" and
+// occupies the same position.
+const (
+	roleSystem    = "system"
+	roleDeveloper = "developer"
+)
+
+// prefixLead is how many leading messages join the fingerprint.
 //
 // The count has to be one a conversation satisfies from its very first request,
-// not merely later on. A lead of two under the Anthropic format would read one
-// message on the opening turn and two on every turn after it, so the opening
-// turn would fingerprint differently from the conversation it begins — and the
-// upstream it warmed would be the one deployment the second turn had no reason
-// to return to. An OpenAI conversation carrying a system message already holds
-// two messages on its first request, so two is stable there from the start.
-func prefixLead(format core.Format) int {
+// not merely later on. A lead of two against a conversation that opens with a
+// single message reads one message on that first turn and two on every turn
+// after it, so the opening turn fingerprints differently from the conversation
+// it begins — and the upstream it warmed is the one deployment the second turn
+// has no reason to return to. The cost of that is one cache write per
+// conversation, paid quietly.
+//
+// So the lead is decided by what the opening message is rather than by the wire
+// format alone. Under the Anthropic format the first message is the opening
+// user turn, which differs per conversation and is enough on its own. Under
+// OpenAI the first message is usually a system prompt many callers share, and
+// the second — the first user turn — is what tells two conversations apart;
+// but a caller that sends no system message has a first request holding one
+// message where its second holds three, which is the instability above. Reading
+// the second message only when a system message precedes it is stable in both
+// cases, because a system message is present from the first request or not at
+// all.
+func prefixLead(format core.Format, firstRole string) int {
 	if format == core.FormatAnthropic {
 		return 1
 	}
-	return 2
+	if firstRole == roleSystem || firstRole == roleDeveloper {
+		return 2
+	}
+	return 1
 }
 
 // LongCacheLifetime is how long Anthropic's extended cache entry lives. A caller
@@ -150,7 +166,7 @@ func Fingerprint(format core.Format, model string, fields jsonx.Fields) (string,
 	write(stripBreakpoints(fields.System))
 	write(stripBreakpoints(fields.Tools))
 
-	lead := fields.LeadingMessages(prefixLead(format))
+	lead := fields.LeadingMessages(prefixLead(format, fields.FirstMessageRole()))
 	for _, message := range lead {
 		write(stripBreakpoints(message))
 	}

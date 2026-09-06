@@ -61,15 +61,21 @@ every `cache_control` member removed, which the structural walk under
 [injection](#cache-breakpoints) already knows how to distinguish from prompt
 text that merely mentions one.
 
-How much of the conversation joins the fingerprint depends on the format, and
-the count has to be one the *first* request already satisfies. Under Anthropic
-the opening user turn is distinctive on its own, so it is the only message read;
-reading two would mean a conversation's first request — which has one message
-where every later one has three — fingerprinting differently from its own second
-turn, and warming an upstream that nothing afterwards had a reason to return to.
+How much of the conversation joins the fingerprint has to be a count the *first*
+request already satisfies. Under Anthropic the opening user turn is distinctive
+on its own, so it is the only message read; reading two would mean a
+conversation's first request — which has one message where every later one has
+three — fingerprinting differently from its own second turn, and warming an
+upstream that nothing afterwards had a reason to return to.
+
 Under OpenAI the first message is usually a system prompt many callers share, so
-the second is read as well; a first request carrying a system message already has
-both.
+reading it alone would put unrelated conversations on one pin, and the second —
+the first user turn — is what tells them apart. That holds only where the system
+message is there: a caller that sends none has a first request carrying one
+message where its second carries three, which is the instability above. So the
+second message joins the fingerprint only behind a leading `system` or
+`developer` message, which is present from a conversation's first request or not
+at all.
 
 Two requests sharing everything that is fingerprinted share a pin even where
 they diverge later on. That is not a loss of precision: they carry the same
@@ -120,6 +126,40 @@ The pin's TTL is refreshed on every success, so it lives as long as the
 conversation is active and lapses once it stops — the same lifetime the upstream
 gives the cache entry itself. `affinity_ttl` defaults to five minutes, matching
 Anthropic's ephemeral cache.
+
+### A pin follows the evidence that there is a cache
+
+A pin says one deployment holds a warm copy of this prefix. Whether it does is
+something only the response knows, so the pin is written after the reply has
+been read rather than at the moment the upstream answers.
+
+An Anthropic response says outright what its cache did, reporting the tokens it
+served from an entry and the tokens it wrote into one. Silence there means
+nothing was cached: the prompt sat below the provider's minimum, or the caller
+sent no breakpoint and injection is off. Pinning that prefix would concentrate
+its traffic on one deployment in exchange for nothing, so it is not pinned at
+all, on any turn, until an upstream says otherwise.
+
+An OpenAI-compatible provider says no such thing. Its caching is automatic and
+its writes are free, so a first request reports no cached tokens whether or not
+the prefix was stored — and requiring evidence there would mean never
+establishing a first pin. Those are pinned on success, as is any response that
+reported no usage at all: that is an accounting gap rather than evidence, and
+losing cache hits is the more expensive way to be wrong.
+
+Deferring costs a window, between dispatch and the end of the response, in which
+a concurrent request carrying the same prefix sees no pin. A conversation cannot
+race itself — its next turn is waiting on this reply — so the window belongs to
+distinct callers sharing a prefix, which is the concentration case affinity
+already bounds.
+
+**Token counting is not pinned.** `/v1/messages/count_tokens` takes the same body
+as an inference request and never reaches the model, so it warms nothing: a pin
+taken from it names a deployment holding no warm prefix, and refreshing an
+existing pin from it would keep a conversation pointed at an upstream on the
+strength of a request that ran nothing. Claude Code counts tokens on most turns,
+so this is the ordinary case rather than an edge. It consults no pin either, and
+reports no affinity header.
 
 **A caller using the one-hour cache gets a one-hour pin**, whatever
 `affinity_ttl` says, because the pin is meant to expire with the entry it points
@@ -305,11 +345,24 @@ nothing after; the messages are what grow. A caller with a modest system prompt
 and a long history would re-read all of it at full price on every turn while
 `/metrics` reported that caching was working.
 
-It has to be the top-level field rather than a marker written into the body,
-because the marker belongs on the newest turn and would be rewritten on the next
-one — buying a cache write for every read, which is the anti-pattern this whole
-page is about. Only the API can move a breakpoint forward without rewriting it,
-and the top-level field is how it is asked to.
+It is the top-level field rather than a marker written onto the newest turn, but
+not because that marker would be wasteful. A breakpoint moved forward over a
+prefix an upstream already holds writes only the tokens past the previous one
+and reads the rest, which is why every Anthropic client walks its own marker
+forward and why [affinity](#prefix-affinity) is built to survive one doing it.
+Marking the newest turn is a documented pattern, and the one other gateways
+inject.
+
+The reasons to prefer the top-level field here are narrower. It is a member of
+the root object, so placing it edits the request beside the conversation rather
+than splicing into the largest array in it. It leaves the fourth breakpoint
+unspent. And it lands the gateway's marker nowhere: the last block of the newest
+turn may be a tool result, an image, a document or a thinking block, and hanging
+a breakpoint on a shape whose accepted form the gateway cannot check is the same
+gamble it [declines to take](#cache-breakpoints) on a server tool — except that
+here it would be taken on every request rather than on the ones with an
+unfamiliar tool. Letting the API place that breakpoint itself costs nothing and
+cannot be wrong.
 
 That is three of the four breakpoints a request may hold. The two documented
 ways of combining an explicit marker with the automatic one are both refused
@@ -351,6 +404,15 @@ It is skipped entirely when:
   system and messages — because that is what the automatic breakpoint caches;
   measuring only the static prefix would skip exactly the caller this is for,
   whose history is long and whose system prompt is not.
+
+  The provider's own minimum is counted in tokens and differs by model: 1024 for
+  the larger Claude models and 2048 for the smaller ones, where the default
+  4096 bytes is roughly 1000 tokens. A group serving only a small model wants
+  this raised to about `8192`; left at the default it marks prompts the provider
+  will ignore, which costs nothing but buys nothing either. It is a byte count
+  rather than a token count because counting tokens means running a tokenizer
+  over every request, which is a real cost per request for a threshold that only
+  decides whether an optimization is attempted.
 - the request is **not in the Anthropic format**. Breakpoints are an Anthropic
   construct.
 
@@ -527,6 +589,49 @@ deployment without the price logs a warning naming the deployment and the key to
 add, and `gateway_prompt_cache_tokens_total{outcome="write_1h"}` counts the
 tokens it is happening to.
 
+The split is read from `cache_creation` on the response. A reply produced by a
+**server-side tool loop** is several turns against the model reported as one
+response, and reports that split only per iteration, under `usage.iterations`.
+The totals there are already summed, so only the split is taken from them —
+adding the totals again would bill one reply several times over — and whatever
+the iterations leave unaccounted for is charged at the five-minute rate rather
+than at the premium. Without that, a request whose long writes all happened
+inside the loop looks like a request with no long writes at all.
+
+### The long-context tier
+
+A provider may also charge more for **every** token of a request once its prompt
+crosses a size. Anthropic's line is at 200k tokens, above which input, output,
+cache reads and cache writes all cost more:
+
+```yaml
+cost:
+  input_per_1m: 3.00
+  output_per_1m: 15.00
+  cache_read_per_1m: 0.30
+  cache_write_per_1m: 3.75
+  long_context:
+    above_prompt_tokens: 200000
+    input_per_1m: 6.00
+    output_per_1m: 22.50
+    cache_read_per_1m: 0.60
+    cache_write_per_1m: 7.50
+```
+
+This matters here more than anywhere else in the cost model, because a
+conversation long enough to cross the threshold is the conversation a prompt
+cache exists for. Priced at the small-request rates it is billed at roughly half
+what the provider charged, and `cache_savings` is understated in the same
+proportion — the discount is measured against an input rate the request never
+paid.
+
+The threshold is compared against every prompt token the response reported,
+cache reads included, since that is what the provider measures its own threshold
+against: a turn reading 190k tokens out of the cache is a large request and is
+charged as one. The block is optional, and
+[refused when incomplete](configuration.md#the-long-context-tier) for the reason
+a partial cost model is.
+
 ---
 
 ## What guards this
@@ -561,3 +666,10 @@ than on mechanism:
 | `TestAnUnpricedLongWriteIsReported` | a deployment quietly understating every long write, with nothing to say so |
 | `TestPromptCacheMetricsCarryTheirValues` | a scrape naming the right series with the wrong numbers, which looks like an answer |
 | `TestPricingValidation` | a cost model that would misreport what caching costs, accepted at load |
+| `TestALongContextConversationIsBilledAtTheTierItRanIn`, `TestALargePromptIsBilledAtItsOwnTier` | the largest requests a deployment serves billed at the small-request rates, which is about half what they cost |
+| `TestSavingsOnALargePromptUseTheTierItWasBilledAt` | a discount measured against an input rate the request never paid |
+| `TestALongWriteInsideAToolLoopIsPricedAtItsOwnTier` | a long write inside a server-tool loop billed at the five-minute rate, because the split was only reported per iteration |
+| `TestAPrefixTheProviderDidNotCacheIsNotPinned`, `TestAnUncachedPrefixIsNotPinned` | a prefix no upstream cached concentrating traffic on one deployment for nothing |
+| `TestACacheWriteEstablishesThePin`, `TestAnOpenAIPrefixIsPinnedWithoutACacheSignal`, `TestAResponseThatReportedNoUsageKeepsThePin` | the same rule read so strictly that a first pin is never established at all |
+| `TestTokenCountingLeavesNoPin` | a conversation pinned by a request that never reached the model |
+| `TestAnOpenAIFingerprintIsStableFromTheFirstRequest` | an OpenAI conversation with no system message re-pinned on its second turn |

@@ -41,8 +41,12 @@ func promptBody(system string, turns ...string) string {
 // The gateway's reason for pinning: a conversation must keep reaching the
 // upstream holding its warm prompt cache even while the group is load balanced.
 func TestPromptAffinityKeepsAConversationOnOneDeployment(t *testing.T) {
+	// Upstreams that hold a real cache, because a pin follows the evidence that
+	// one exists: an upstream reporting no cache activity is one with no warm
+	// prefix to send the next turn back to.
 	h := newHarness(t, harnessOpts{
 		authMode: "api_key", allowPassthrough: true, extraDeployments: 2,
+		upstreams: newCachingCluster(t, core.FormatAnthropic, 5_000, 3).handlers(),
 	})
 	body := promptBody("be helpful", "first turn", "answer")
 
@@ -396,6 +400,7 @@ func claudeCodeBody(system string, turns ...string) string {
 func TestPromptAffinitySurvivesAMovingBreakpoint(t *testing.T) {
 	h := newHarness(t, harnessOpts{
 		authMode: "api_key", allowPassthrough: true, extraDeployments: 2,
+		upstreams: newCachingCluster(t, core.FormatAnthropic, 5_000, 3).handlers(),
 	})
 
 	first := h.do(t, claudeCodeRequest("/v1/messages", claudeCodeBody("be helpful", "opening question")))
@@ -600,5 +605,57 @@ func TestARequestThatReadNothingCountsAsAMiss(t *testing.T) {
 	}
 	if strings.Contains(scrape, `gateway_prompt_cache_requests_total{model="anthropic-claude",deployment="`+h.deploymentID+`",outcome="hit"}`) {
 		t.Errorf("a request that read nothing was counted as a hit:\n%s", scrape)
+	}
+}
+
+// Token counting warms nothing. It takes the same body as an inference request
+// and never reaches the model, so a pin taken from it names a deployment holding
+// no warm prefix — and refreshing an existing pin from it keeps a conversation
+// pointed at an upstream on the strength of a request that ran nothing. Claude
+// Code counts tokens on most turns, so this is the ordinary case rather than an
+// edge.
+func TestTokenCountingLeavesNoPin(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, extraDeployments: 2,
+		// Upstreams that report a cache write on every request, so nothing but
+		// the endpoint itself can be what withholds the pin.
+		upstreams: newCachingCluster(t, core.FormatAnthropic, 5_000, 3).handlers(),
+	})
+	body := promptBody("be helpful", "first turn", "answer")
+
+	counted := h.do(t, claudeCodeRequest("/v1/messages/count_tokens", body))
+	if counted.Code != http.StatusOK {
+		t.Fatalf("count_tokens: status = %d, body = %s", counted.Code, counted.Body.String())
+	}
+	if got := counted.Header().Get("x-gateway-prompt-affinity"); got != "" {
+		t.Errorf("count_tokens reported affinity %q, want none: it consults no pin", got)
+	}
+
+	// The conversation's first real turn is still its first: it must find no
+	// pin to honour, and be free to land wherever the balancer sends it.
+	first := h.do(t, claudeCodeRequest("/v1/messages", body))
+	if got := first.Header().Get("x-gateway-prompt-affinity"); got != "new" {
+		t.Errorf("first inference turn affinity = %q, want new: token counting pinned the prefix", got)
+	}
+}
+
+// A prefix the provider did not cache has no warm copy anywhere, so pinning it
+// concentrates that traffic on one deployment and buys nothing back. An
+// Anthropic caller sending no breakpoints, with injection off, is that case on
+// every request it makes.
+func TestAnUncachedPrefixIsNotPinned(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, extraDeployments: 2,
+	})
+	body := promptBody("be helpful", "first turn", "answer")
+
+	if rec := h.do(t, claudeCodeRequest("/v1/messages", body)); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	// The default upstream reports no cache counters at all, which is what an
+	// unmarked prompt below the provider's minimum looks like.
+	second := h.do(t, claudeCodeRequest("/v1/messages", body))
+	if got := second.Header().Get("x-gateway-prompt-affinity"); got != "new" {
+		t.Errorf("second turn affinity = %q, want new: nothing was cached for a pin to point at", got)
 	}
 }
