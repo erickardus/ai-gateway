@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/audit"
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/core"
 )
@@ -18,6 +19,14 @@ import (
 
 // requireMaster gates the management endpoints on the master key. It reports
 // whether the request may proceed.
+//
+// A refusal here is deliberately not audited, where a refused console sign-in
+// is. The console's sign-in is a person at a form; this is an unauthenticated
+// endpoint anyone who can open a socket may call as fast as they like, and an
+// audit write fsyncs. Recording every attempt would hand a stranger a way to
+// fill the operator's disk with evidence of nothing. The access log already
+// carries the 401 with its source and request ID, which is the same fact
+// without the amplification.
 func (s *Server) requireMaster(w http.ResponseWriter, r *http.Request) bool {
 	if !s.auth.HasMasterKey() {
 		writeError(w, http.StatusNotFound, "not_found_error",
@@ -141,7 +150,20 @@ func (s *Server) keyGenerate(w http.ResponseWriter, r *http.Request) {
 		MaxBudget: req.MaxBudget, BudgetDuration: budgetDuration,
 		Scope: req.Scope,
 	}
+	// Written before the key is stored rather than after, which is what makes a
+	// failed audit write able to refuse the action: once the key is in the
+	// store, refusing is no longer available. See internal/audit.
+	ev := s.adminEvent(r, audit.Event{
+		Action:     audit.ActionKeyGenerate,
+		TargetKind: audit.TargetKey,
+		Target:     key.Hash,
+		Detail:     detail("alias", key.Alias, "scope", key.Scope),
+	})
+	if !s.recordAudit(w, r, ev) {
+		return
+	}
 	if err := s.store.Put(r.Context(), key); err != nil {
+		s.recordAuditFailure(r, ev, err)
 		s.fail(w, r, err)
 		return
 	}
@@ -213,7 +235,16 @@ func (s *Server) keyDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "a \"hash\" field is required")
 		return
 	}
+	ev := s.adminEvent(r, audit.Event{
+		Action:     audit.ActionKeyDelete,
+		TargetKind: audit.TargetKey,
+		Target:     req.Hash,
+	})
+	if !s.recordAudit(w, r, ev) {
+		return
+	}
 	if err := s.store.Delete(r.Context(), req.Hash); err != nil {
+		s.recordAuditFailure(r, ev, err)
 		s.fail(w, r, err)
 		return
 	}
@@ -374,7 +405,22 @@ func (s *Server) keyUpdate(w http.ResponseWriter, r *http.Request) {
 		updated.Scope = *req.Scope
 	}
 
+	// Blocked is stated on every update rather than only when it changed: it is
+	// the field that decides whether the credential still works, and a reader
+	// scanning for when a key was suspended should not have to reconstruct that
+	// from the absence of a mention.
+	ev := s.adminEvent(r, audit.Event{
+		Action:     audit.ActionKeyUpdate,
+		TargetKind: audit.TargetKey,
+		Target:     updated.Hash,
+		Detail: detail("alias", updated.Alias, "scope", updated.Scope,
+			"blocked", strconv.FormatBool(updated.Blocked)),
+	})
+	if !s.recordAudit(w, r, ev) {
+		return
+	}
 	if err := s.store.Put(r.Context(), &updated); err != nil {
+		s.recordAuditFailure(r, ev, err)
 		s.fail(w, r, err)
 		return
 	}

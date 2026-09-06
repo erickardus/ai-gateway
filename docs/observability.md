@@ -306,6 +306,7 @@ rejection, which is the caller's problem rather than the fleet's.
 | Metric | Type | Labels |
 |---|---|---|
 | `gateway_response_cache_requests_total` | counter | model, outcome (`hit`, `miss`) |
+| `gateway_audit_write_failures_total` | counter | action |
 | `gateway_shared_state_degradations_total` | gauge | — |
 | `gateway_virtual_keys` | gauge | — |
 | `gateway_build_info` | gauge | version, strategy |
@@ -322,6 +323,13 @@ reason it is not on a public scrape endpoint.
 
 `gateway_build_info` is always 1; the labels are the point, and a change in them
 is a deploy.
+
+`gateway_audit_write_failures_total` counts administrative actions refused
+because the audit log would not take the record — a key that could not be
+minted, a console sign-in that could not be granted. It is worth an alert rather
+than a dashboard panel: from the outside those refusals look like any other 500,
+and a non-zero value means the gateway currently cannot be administered at all.
+See [audit.md](audit.md#failure-posture).
 
 ### Outcomes and reasons
 
@@ -430,6 +438,11 @@ memory and answers those. It holds metadata only — never a request or response
 body — and lives in the process that served the traffic, so it is a debugging
 view rather than an archive. Anything that must outlive the process belongs in
 the access log. See [admin-ui.md](admin-ui.md#the-traffic-buffer).
+
+None of this describes what was done *to* the gateway. Minting a key, blocking
+one, signing in to the console: those are recorded separately, in a hash chain
+that makes an edited or missing record detectable. See
+**[audit.md](audit.md)**.
 
 ## Running more than one instance
 

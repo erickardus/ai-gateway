@@ -77,6 +77,9 @@ model_list:
 		{"prompt_cache.inject", cfg.PromptCache.Inject, false},
 		{"prompt_cache.inject_min_bytes", cfg.PromptCache.InjectMinBytes, 4096},
 
+		{"audit.enabled", cfg.Audit.On(), true},
+		{"audit.sink", cfg.Audit.SinkKind(), "stdout"},
+
 		{"observability.log_level", cfg.Observability.LogLevel, "info"},
 		{"observability.log_format", cfg.Observability.LogFormat, "text"},
 		{"observability.metrics", cfg.Observability.Metrics, false},

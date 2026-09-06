@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/audit"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/reqlog"
@@ -40,7 +41,18 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cachePurge(w http.ResponseWriter, r *http.Request) {
+	// Audited like a key mutation, and for the same reason: a purge is an
+	// administrative action with a cost — every caller's next request pays a
+	// full upstream call — and afterwards nothing in the cache says it happened.
+	ev := s.adminEvent(r, audit.Event{
+		Action:     audit.ActionCachePurge,
+		TargetKind: audit.TargetCache,
+	})
+	if !s.recordAudit(w, r, ev) {
+		return
+	}
 	if err := s.cache.Purge(r.Context()); err != nil {
+		s.recordAuditFailure(r, ev, err)
 		s.fail(w, r, err)
 		return
 	}

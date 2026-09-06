@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/audit"
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/config"
@@ -66,12 +67,20 @@ func run() error {
 		addr        = flag.String("addr", "", "override server.addr from the configuration")
 		logLevel    = flag.String("log-level", "", "override observability.log_level (debug, info, warn, error)")
 		showVersion = flag.Bool("version", false, "print the version and exit")
+		verifyAudit = flag.String("verify-audit", "", "verify the hash chain of an audit log and exit")
 	)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("ai-gateway", version)
 		return nil
+	}
+	// Before the config is read, because verifying a log is a thing you do to a
+	// file someone handed you — an archived chain, a copy pulled off a
+	// decommissioned host — and requiring a working gateway configuration to
+	// check one would be requiring the wrong thing.
+	if *verifyAudit != "" {
+		return verifyAuditLog(*verifyAudit)
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -88,6 +97,21 @@ func run() error {
 	log := newLogger(cfg.Observability)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Opened first among the gateway's dependencies. A file sink verifies the
+	// chain it is about to continue, and a gateway whose audit log does not
+	// verify should refuse to start before it has opened a socket or reached an
+	// upstream, not after.
+	auditSink, err := newAuditSink(cfg.Audit, log)
+	if err != nil {
+		return err
+	}
+	if auditSink != nil {
+		defer auditSink.Close()
+		if err := recordGatewayStart(ctx, auditSink, *configPath, cfg); err != nil {
+			return err
+		}
+	}
 
 	store, err := newKeyStore(ctx, cfg.VirtualKeys, log)
 	if err != nil {
@@ -207,6 +231,7 @@ func run() error {
 	}
 
 	gw := server.New(cfg, authn, store, rtr, log, ledger, reg, shared, responses)
+	gw.UseAudit(auditSink)
 
 	if cfg.UI.Enabled {
 		sessions, err := ui.NewSessions(cfg.VirtualKeys.MasterKey, cfg.UI.SessionTTL)
@@ -318,6 +343,23 @@ func run() error {
 	// time anything is waiting here.
 	if otlpDone != nil {
 		<-otlpDone
+	}
+
+	// Recorded only on a graceful stop, and only after the drain: a chain whose
+	// last line is a stop record is a chain that ended for a reason, which is
+	// exactly what distinguishes an orderly shutdown from a log that someone
+	// truncated. A process killed outright leaves no such line, and that
+	// difference is the point.
+	if auditSink != nil {
+		if _, err := auditSink.Record(context.Background(), audit.Event{
+			Action:     audit.ActionGatewayStop,
+			Actor:      audit.SystemActor(),
+			TargetKind: audit.TargetGateway,
+			Target:     version,
+			Outcome:    audit.OutcomeSuccess,
+		}); err != nil {
+			log.Error("could not record the gateway shutdown in the audit log", "error", err)
+		}
 	}
 
 	log.Info("gateway stopped")

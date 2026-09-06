@@ -121,6 +121,12 @@ const (
 	// ignored upstream, so placing one only adds bytes to the request.
 	DefaultInjectMinBytes = 4096
 
+	// Audit sinks. AuditSinkStdout is the default because it needs no path and
+	// introduces no failure the process's own logging does not already have;
+	// AuditSinkFile is the one that continues a hash chain across a restart.
+	AuditSinkStdout = "stdout"
+	AuditSinkFile   = "file"
+
 	// DefaultJWTAuthCacheTTL is how long a verified token is reused. It is short
 	// because the point of verifying per request is that revocation arrives
 	// quickly, and a long cache would hand back the lifetime a virtual key

@@ -26,6 +26,7 @@ type Config struct {
 	SSO           SSOConfig           `yaml:"sso"`
 	RBAC          RBACConfig          `yaml:"rbac"`
 	UI            UIConfig            `yaml:"ui"`
+	Audit         AuditConfig         `yaml:"audit"`
 
 	// scopes is the flattened hierarchy, resolved once at load. Keyed by fully
 	// qualified id, with Parent pointers already wired.
@@ -674,4 +675,44 @@ func (u UIConfig) RequestLog() int {
 		return DefaultUIRequestLogSize
 	}
 	return *u.RequestLogSize
+}
+
+// AuditConfig controls the tamper-evident record of administrative actions.
+//
+// It is on by default, which is the opposite of how the UI and the response
+// cache are treated, and for a reason those two do not share: the default sink
+// is stdout, so an audit log costs nothing to have and creates nothing the
+// operator did not ask for. A gateway that only records administration when
+// asked to is a gateway that has no record on the one occasion anybody wants
+// one, because the question is always asked afterwards.
+//
+// The file sink is the deliberate choice, and the only one that continues a
+// chain across a restart. See docs/audit.md.
+type AuditConfig struct {
+	// Enabled is a pointer so that "on unless told otherwise" is expressible.
+	// A plain bool cannot distinguish an operator writing `enabled: false` from
+	// one who never mentioned the block, and here those must differ.
+	Enabled *bool `yaml:"enabled"`
+	// Sink is "stdout" or "file".
+	Sink string `yaml:"sink"`
+	// Path is where the file sink writes. Required by that sink and meaningless
+	// to the other, which validation says rather than silently ignoring.
+	Path string `yaml:"path"`
+}
+
+// On reports whether administrative actions are recorded, with the default
+// applied.
+func (a AuditConfig) On() bool {
+	if a.Enabled == nil {
+		return true
+	}
+	return *a.Enabled
+}
+
+// SinkKind is the configured sink, with the default applied.
+func (a AuditConfig) SinkKind() string {
+	if a.Sink == "" {
+		return AuditSinkStdout
+	}
+	return a.Sink
 }
