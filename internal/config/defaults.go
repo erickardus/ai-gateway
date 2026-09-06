@@ -79,6 +79,20 @@ const (
 	// unhealthy Redis degrades the gateway rather than slowing it.
 	DefaultRedisTimeout = 250 * time.Millisecond
 
+	// DefaultKeyStoreTimeout bounds each query against a Postgres key store. It
+	// is an order of magnitude longer than DefaultRedisTimeout because the two
+	// failures are not alike: an abandoned Redis call falls back to local
+	// state, while an abandoned key lookup refuses a request from a caller
+	// holding a valid key. Long enough to ride out a reconnect or a stall,
+	// short enough to fail well inside router.timeout.
+	DefaultKeyStoreTimeout = 2 * time.Second
+	// DefaultKeyStoreMaxConns sizes the Postgres pool. A key lookup is a
+	// primary-key read on a table with as many rows as the fleet has keys, so
+	// ten connections carry far more authentication than one gateway process
+	// can produce, and a small pool is what keeps a fleet of replicas from
+	// exhausting a database's own connection limit between them.
+	DefaultKeyStoreMaxConns int32 = 10
+
 	// DefaultCacheTTL is short: an LLM response is only interchangeable with a
 	// fresh one for so long, and a long TTL turns a cache into stale answers.
 	DefaultCacheTTL = 5 * time.Minute
@@ -182,6 +196,12 @@ func (c *Config) applyDefaults() {
 	}
 	if v.Store.Kind == "" {
 		v.Store.Kind = "memory"
+	}
+	if v.Store.Timeout == 0 {
+		v.Store.Timeout = DefaultKeyStoreTimeout
+	}
+	if v.Store.MaxConns == 0 {
+		v.Store.MaxConns = DefaultKeyStoreMaxConns
 	}
 
 	for i := range c.ModelList {

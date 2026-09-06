@@ -316,11 +316,32 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.VirtualKeys.Store.Kind != "memory" && c.VirtualKeys.Store.Kind != "file" {
-		errs = append(errs, fmt.Errorf("virtual_keys.store.kind: must be \"memory\" or \"file\", got %q", c.VirtualKeys.Store.Kind))
+	store := c.VirtualKeys.Store
+	switch store.Kind {
+	case "memory", "file", "postgres":
+	default:
+		errs = append(errs, fmt.Errorf("virtual_keys.store.kind: must be \"memory\", \"file\" or \"postgres\", got %q", store.Kind))
 	}
-	if c.VirtualKeys.Store.Kind == "file" && c.VirtualKeys.Store.Path == "" {
+	if store.Kind == "file" && store.Path == "" {
 		errs = append(errs, errors.New("virtual_keys.store.path: required when store.kind is \"file\""))
+	}
+	if store.Kind == "postgres" && store.DSN == "" {
+		errs = append(errs, errors.New("virtual_keys.store.dsn: required when store.kind is \"postgres\" (unset or empty ${ENV} reference?)"))
+	}
+	// A dsn on any other kind is refused rather than ignored. The two ways to
+	// arrive here are an operator who set the connection string and forgot the
+	// kind, and one who switched back to a file store and left the dsn behind;
+	// in both cases silence would leave keys somewhere other than where the
+	// file says, and the second case leaves a live database credential in a
+	// file that now has no use for it.
+	if store.Kind != "postgres" && store.DSN != "" {
+		errs = append(errs, fmt.Errorf("virtual_keys.store.dsn: set while store.kind is %q, which never connects to a database; use kind: postgres or remove the dsn", store.Kind))
+	}
+	if store.Timeout < 0 {
+		errs = append(errs, fmt.Errorf("virtual_keys.store.timeout: must not be negative, got %s", store.Timeout))
+	}
+	if store.MaxConns < 0 {
+		errs = append(errs, fmt.Errorf("virtual_keys.store.max_conns: must be >= 0, got %d", store.MaxConns))
 	}
 
 	return errors.Join(errs...)

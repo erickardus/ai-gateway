@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -88,9 +89,15 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := newKeyStore(cfg.VirtualKeys)
+	store, err := newKeyStore(ctx, cfg.VirtualKeys, log)
 	if err != nil {
 		return err
+	}
+	// A network-backed store owns a connection pool; the in-process ones own
+	// nothing. Closing through io.Closer keeps that difference inside
+	// newKeyStore rather than making this function know which kind it built.
+	if closer, ok := store.(io.Closer); ok {
+		defer func() { _ = closer.Close() }()
 	}
 	authn, err := auth.NewAuthenticator(ctx, store, cfg.VirtualKeys, cfg.Scopes())
 	if err != nil {
@@ -330,8 +337,25 @@ func newSpendLedger(cfg config.ObservabilityConfig) (*spend.Ledger, error) {
 }
 
 // newKeyStore builds the configured key store.
-func newKeyStore(cfg config.VirtualKeysConfig) (auth.KeyStore, error) {
+//
+// The postgres case is the only one that can fail for a reason outside this
+// process, and it is allowed to stop the gateway starting. That is deliberate:
+// with no keys there is nobody the gateway can authenticate, so a process that
+// came up anyway would answer every caller with a 401 and look, from the
+// outside, like a fleet-wide credential problem rather than a database it could
+// not reach. See auth.PostgresStore for the rest of the posture.
+func newKeyStore(ctx context.Context, cfg config.VirtualKeysConfig, log *slog.Logger) (auth.KeyStore, error) {
 	switch cfg.Store.Kind {
+	case "postgres":
+		store, err := auth.NewPostgresStore(ctx, auth.PostgresOptions{
+			DSN:      cfg.Store.DSN,
+			Timeout:  cfg.Store.Timeout,
+			MaxConns: cfg.Store.MaxConns,
+		}, log)
+		if err != nil {
+			return nil, err
+		}
+		return store, nil
 	case "file":
 		store, err := auth.NewFileStore(cfg.Store.Path)
 		if err != nil {
