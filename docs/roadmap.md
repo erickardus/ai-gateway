@@ -543,14 +543,37 @@ deliberately declares no container healthcheck, because the runtime image is
 distroless and the only command available to it proves the binary runs rather
 than that it serves.
 
-### 🔴 No structured audit log
+### ✅ No structured audit log
 
-Access logs carry the key alias, model and outcome, but there is no separate
-tamper-evident audit stream. The admin console widens this: minting, blocking
-and deleting a key are now things that happen from a browser, and the only
-record is an ordinary log line saying a key changed — not who was signed in when
-it did. Every console session is the master key, so there is nobody to name yet;
-that changes the day it signs in through the identity provider.
+Resolved. Access logs carried the key alias, model and outcome, and the only
+record of a key being minted, blocked or deleted was an ordinary log line saying
+a key changed — with nothing saying who was signed in when it did, and nothing
+at all preventing that line from being edited afterwards.
+
+`internal/audit` is now a hash chain of administrative actions: key lifecycle
+from both `/key/*` and the console, console sign-in, refusal and sign-out, SSO
+grants and renewals and the refusals that follow an authenticated identity,
+cache purges, and this process starting and stopping. Each record carries the
+SHA-256 of the one before it and a sequence number, so a line altered or removed
+from the middle is detectable; `gateway -verify-audit <path>` reports where a
+chain breaks. Two sinks ship — JSONL to a file, which reads and continues its
+chain at startup and refuses to start on one that no longer verifies, and stdout
+— behind an interface a database sink slots into unchanged. Inference is
+deliberately not audited, which is what makes the writes affordable: they are
+synchronous, they fsync, and a write that fails fails the action it was
+recording. See [audit.md](audit.md).
+
+What remains is the name. The actor is modelled as a kind plus an id — master
+key, SSO subject, unauthenticated, system — and `sso.grant` already carries a
+real person. Every console action is still `master_key`, because every console
+session *is* the master key; that changes the day the console signs in through
+the identity provider, with no change to the record's shape. Two smaller gaps
+are recorded honestly rather than closed: a hash chain cannot detect truncation
+of its own tail without an anchor kept where the gateway cannot write, and the
+unauthenticated administrative endpoints are not audited on refusal because an
+fsync per attempt would be a disk-filling primitive for anyone who can open a
+socket — the same throttle
+[the sign-in form](#-sign-in-is-not-rate-limited) still wants.
 
 ### ✅ Per-key rate limits were enforced per instance
 

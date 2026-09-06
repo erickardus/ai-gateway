@@ -160,6 +160,7 @@ would take.
 - **[docs/routing.md](docs/routing.md)** — strategies, retries, cooldowns, fallbacks
 - **[docs/admin-ui.md](docs/admin-ui.md)** — the operator console, and how its session stays out of the inference plane
 - **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics, response caching
+- **[docs/audit.md](docs/audit.md)** — the tamper-evident record of who administered what
 - **[docs/prompt-caching.md](docs/prompt-caching.md)** — keeping the provider's prompt cache hittable behind a load balancer
 - **[docs/roadmap.md](docs/roadmap.md)** — what is not built, and what is unverified
 

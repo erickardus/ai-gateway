@@ -84,6 +84,7 @@ const (
 	MSharedStateDegraded  = "gateway_shared_state_degradations_total"
 	MVirtualKeys          = "gateway_virtual_keys"
 	MSSO                  = "gateway_sso_grants_total"
+	MAuditFailures        = "gateway_audit_write_failures_total"
 	MResponseCache        = "gateway_response_cache_requests_total"
 	MResponseCacheEntries = "gateway_response_cache_entries"
 
@@ -255,6 +256,8 @@ var declare = []family{
 		help: "Times shared state became unreachable and this instance fell back to per-process limits, which silently multiplies every limit by the replica count."},
 	{name: MSSO, kind: KindCounter, unit: "{grant}",
 		help: "Virtual keys issued through an SSO login, by kind and outcome. A run of renewal failures is what an identity provider outage looks like before anyone's key has expired."},
+	{name: MAuditFailures, kind: KindCounter, unit: "{record}",
+		help: "Administrative actions refused because the audit log would not take the record. Any value above zero means the gateway is currently unable to administer keys, which nothing else reports."},
 	{name: MResponseCache, kind: KindCounter, unit: "{request}",
 		help: "Response-cache lookups by outcome. A hit calls no upstream and costs nothing."},
 

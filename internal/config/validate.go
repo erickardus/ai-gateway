@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +67,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	errs = append(errs, validateUI(c)...)
+	errs = append(errs, validateAudit(c)...)
 	errs = append(errs, validateOTLP(c.Observability.OTLP)...)
 	errs = append(errs, validateSSO(c)...)
 	errs = append(errs, validateRBAC(c)...)
@@ -867,6 +869,38 @@ func validateRBAC(c *Config) []error {
 	}
 	for i, r := range c.SSO.Roles {
 		check(fmt.Sprintf("sso.roles[%d].scope", i), r.Scope)
+	}
+	return errs
+}
+
+// validateAudit checks the audit log's configuration.
+//
+// It runs whether or not the block is enabled, unlike validateUI. A typo in a
+// sink name costs nothing to catch now and is discovered at the worst possible
+// moment otherwise: the day an operator turns auditing on, which is usually the
+// day somebody has asked them to prove it was on.
+func validateAudit(c *Config) []error {
+	a := c.Audit
+	var errs []error
+	switch a.SinkKind() {
+	case AuditSinkStdout:
+		// Reported rather than ignored: an operator who names a file and gets
+		// stdout believes they have a chain that survives restarts, and will
+		// find out they do not by going to read it.
+		if a.Path != "" {
+			errs = append(errs, fmt.Errorf(
+				"audit.path: %s is set while audit.sink is %q, which writes to stdout; set audit.sink to %q or remove the path",
+				strconv.Quote(a.Path), AuditSinkStdout, AuditSinkFile))
+		}
+	case AuditSinkFile:
+		if a.Path == "" {
+			errs = append(errs, fmt.Errorf(
+				"audit.path: required when audit.sink is %q, since a file sink has nowhere to write without one",
+				AuditSinkFile))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("audit.sink: must be %q or %q, got %q",
+			AuditSinkStdout, AuditSinkFile, a.Sink))
 	}
 	return errs
 }

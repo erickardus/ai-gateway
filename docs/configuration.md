@@ -447,6 +447,41 @@ make ui && make build
 A binary built without it serves a page saying so; the gateway proxies inference
 normally either way.
 
+## `audit`
+
+A tamper-evident record of administrative actions — key lifecycle, console
+sessions, SSO grants, cache purges, startup and shutdown. **On** by default.
+
+| Key | Default | Notes |
+|---|---|---|
+| `enabled` | `true` | Records administrative actions. |
+| `sink` | `stdout` | `stdout` or `file`. |
+| `path` | — | Required by the `file` sink, refused with any other. |
+
+On by default is the opposite of `ui` above, and deliberate: the default sink is
+stdout, so the record costs nothing and creates nothing the operator did not ask
+for. A gateway that records administration only when asked has no record on the
+one occasion anybody wants one, because that question is always asked
+afterwards.
+
+The `file` sink appends JSON Lines, verifies the existing chain at startup and
+continues it, and **refuses to start** on a chain that no longer verifies. The
+`stdout` sink cannot read back what it wrote, so its chain restarts at sequence
+1 with each process.
+
+Writes are synchronous and a failed write fails the action it was recording: a
+key that could not be audited is not minted. Inference is not audited, which is
+what makes that affordable. `gateway_audit_write_failures_total` counts the
+refusals and is worth an alert.
+
+```
+gateway -verify-audit ./data/audit.jsonl
+```
+
+verifies a chain and prints its last sequence number and hash, which is the
+anchor that makes truncation of the tail detectable. Full detail in
+**[audit.md](audit.md)**.
+
 ## Endpoints
 
 | Endpoint | Auth |
