@@ -176,12 +176,92 @@ one row per person rather than one per key. `core.Key.SpendSubject` is the whole
 of that decision. Keys not issued by SSO are unaffected and still account per
 key.
 
+## Putting a role in a pool
+
+`roles[].max_budget` is granted to **each** identity the role matches. A role
+covering ten developers with a cap of 200 permits 2000 of spend — right for a
+per-person allowance, wrong for a team's.
+
+A role becomes a pool by naming a scope declared under
+[`rbac`](configuration.md#rbac):
+
+```yaml
+rbac:
+  organizations:
+    - id: acme
+      teams:
+        - id: platform
+          max_budget: 2000
+          budget_duration: 720h
+
+sso:
+  roles:
+    - match: platform-eng
+      models: ["anthropic-claude"]
+      max_budget: 200        # each person's own cap…
+      budget_duration: 720h
+      scope: acme/platform   # …inside the team's shared 2000
+```
+
+Everyone the role matches now records spend against the team as well as
+themselves, so the team's cap is one ceiling they share. Both are enforced,
+innermost first, and a refusal names which bound.
+
+Nothing else changes: entitlements still come from this file rather than from
+the token, and the scope is one more entitlement the role grants.
+
+## Authenticating with the provider's token instead
+
+`jwt_auth` accepts the identity provider's own token in the same header a
+virtual key travels in, verified on **every request** against the provider's
+published keys:
+
+```yaml
+sso:
+  jwt_auth:
+    enabled: true
+    audiences: ["api://ai-gateway"]   # defaults to client_id
+    cache_ttl: 60s
+```
+
+The trade against an issued key is revocation for moving parts:
+
+| | Issued key | `jwt_auth` |
+|---|---|---|
+| Verified | once, at login | every request |
+| Revocation reaches the gateway | when the key expires (`key_duration`) | when the caller's current token does |
+| Caller must | hold one static string | hold a live token and refresh it |
+| Works with Claude Code on a subscription | **yes** | no |
+
+The last row is why this does not replace the rest of this document. Claude
+Code's only credential channel that does not displace a claude.ai login is
+`ANTHROPIC_CUSTOM_HEADERS`, which is static — there is nowhere for a refreshing
+token to go. So `jwt_auth` is for the callers a key does not suit: CI, a
+service, a script running under a workload identity.
+
+Both paths resolve through the same `roles`, so a person gets the same models,
+limits and scope either way, and both account to `sso:<subject>` — so moving
+between them draws on one budget rather than two.
+
+Nothing is stored for a token-authenticated caller. There is no gateway
+credential to revoke because the gateway never issued one; access ends when the
+provider stops signing tokens for that person. Verification is memoized for
+`cache_ttl` or until the token expires, whichever comes first — caching makes
+the check cheaper, never longer-lived.
+
+A credential is routed by shape: a JWT is three base64url segments separated by
+dots, and a virtual key is `sk-vk-` followed by base64url, which contains no
+dot. The two cannot be confused, and a token presented to a gateway with
+`jwt_auth` off is refused as an unknown key.
+
 ## Offboarding
 
 | You want | Do |
 |---|---|
 | Cut access now | `POST /key/delete` with the key's hash, from `/key/list` |
 | Cut access at the next renewal | Disable the account, or remove them from the group, at the provider |
+| Cut access now, for a `jwt_auth` caller | Disable the account at the provider; their next token refresh fails |
+| Cut off a whole team at once | `blocked: true` on its scope under `rbac` |
 
 Disabling at the provider is the one that scales; deletion is the one that is
 immediate. Neither needs the other.
@@ -232,6 +312,10 @@ And on the client side of the flow:
 - **No SAML.** It would mean hand-rolled XML signature verification, which is a
   large surface and a classic source of auth bypasses, or a dependency this
   project does not otherwise need.
+- **`jwt_auth` reads no revocation list.** A token stays good until it expires,
+  so revocation is bounded by the provider's token lifetime rather than being
+  immediate. Checking the provider's introspection endpoint per request would
+  close that, at the cost of a network round trip on the request path.
 - **Settings key order is not preserved.** The file is decoded, edited and
   re-encoded, so keys come back alphabetised. Content is preserved exactly;
   ordering is not.

@@ -196,3 +196,84 @@ func contains(vs []string, want string) bool {
 	}
 	return false
 }
+
+func TestJWTAuthParsesAndDefaults(t *testing.T) {
+	cfg, err := Parse([]byte(ssoConfig + "  jwt_auth:\n    enabled: true\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	j := cfg.SSO.JWTAuth
+	if !j.Enabled {
+		t.Fatal("jwt_auth.enabled did not parse")
+	}
+	if len(j.Audiences) != 1 || j.Audiences[0] != "gateway" {
+		t.Errorf("audiences = %v, want the client id", j.Audiences)
+	}
+	if j.TTL() != DefaultJWTAuthCacheTTL {
+		t.Errorf("cache_ttl = %v, want %v", j.TTL(), DefaultJWTAuthCacheTTL)
+	}
+}
+
+// jwt_auth is inert without an issuer, so enabling it alone turns nothing on
+// and says nothing — the same oversight the sibling fields are guarded against.
+func TestJWTAuthWithoutAnIssuerIsRefused(t *testing.T) {
+	_, err := Parse([]byte(minimalConfig + `
+sso:
+  jwt_auth:
+    enabled: true
+`))
+	if err == nil || !strings.Contains(err.Error(), "sso.issuer") {
+		t.Fatalf("want a rejection naming sso.issuer, got %v", err)
+	}
+}
+
+// A block written out but never enabled accepts no tokens, and nothing else
+// would tell the operator that.
+func TestJWTAuthConfiguredButNotEnabledIsRefused(t *testing.T) {
+	_, err := Parse([]byte(ssoConfig + `  jwt_auth:
+    audiences: ["api://gateway"]
+`))
+	if err == nil || !strings.Contains(err.Error(), "not enabled") {
+		t.Fatalf("want a rejection of the unenabled block, got %v", err)
+	}
+}
+
+// A negative TTL expires every entry before it is read, so every request pays a
+// full signature verification — the exact cost the field exists to avoid.
+func TestJWTAuthNegativeCacheTTLIsRefused(t *testing.T) {
+	_, err := Parse([]byte(ssoConfig + `  jwt_auth:
+    enabled: true
+    cache_ttl: -5s
+`))
+	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("want a rejection of the negative TTL, got %v", err)
+	}
+}
+
+// An explicit zero means "verify every request", which is a configuration an
+// operator may genuinely want and which this gateway honours rather than
+// treating as an omitted field.
+func TestJWTAuthCacheTTLZeroIsHonoured(t *testing.T) {
+	cfg, err := Parse([]byte(ssoConfig + `  jwt_auth:
+    enabled: true
+    cache_ttl: 0s
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.SSO.JWTAuth.TTL(); got != 0 {
+		t.Errorf("cache_ttl = %v, want an explicit 0 to survive", got)
+	}
+}
+
+// There is no wildcard audience. Accepting "*" as a literal would leave an
+// operator believing they had opened this up while every token was refused.
+func TestJWTAuthWildcardAudienceIsRefused(t *testing.T) {
+	_, err := Parse([]byte(ssoConfig + `  jwt_auth:
+    enabled: true
+    audiences: ["*"]
+`))
+	if err == nil || !strings.Contains(err.Error(), "not a wildcard") {
+		t.Fatalf("want a rejection of the wildcard, got %v", err)
+	}
+}

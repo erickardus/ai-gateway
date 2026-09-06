@@ -97,14 +97,78 @@ Without it, every restart hands each key a fresh allowance. The ledger is
 flushed on the interval and once more on graceful shutdown, written atomically
 with `0600` permissions.
 
+### A shared budget
+
+`keys[].max_budget` is that key's alone. Ten developers issued the same cap can
+spend it ten times over, which is the right behaviour for a per-person allowance
+and the wrong one for a team's.
+
+A cap several callers share is a **scope** — an organisation, a team or a
+project declared under [`rbac`](configuration.md#rbac) — and keys join one by
+naming it:
+
+```yaml
+rbac:
+  organizations:
+    - id: acme
+      max_budget: 10000
+      budget_duration: 720h
+      teams:
+        - id: platform
+          max_budget: 2000
+          budget_duration: 720h
+
+virtual_keys:
+  keys:
+    - key: ${DEV_KEY}
+      max_budget: 200        # this developer's own cap
+      budget_duration: 720h
+      scope: acme/platform   # …inside the team's shared 2000
+```
+
+The difference is where the spend lands. A scope is its own subject in the
+ledger, so **every key beneath it records against the same entry**: what one
+member spends is subtracted from what the others may. One request writes four
+entries here — the key, the project, the team and the organisation — and each is
+checked, innermost first, before dispatch.
+
+A refusal names the level that bound:
+
+```
+402 the shared budget for team acme/platform is exhausted for the current window
+```
+
+which is the difference between an actionable message and a misleading one. A
+developer told their *own* budget is exhausted will ask for their own cap to be
+raised, and that request goes to the wrong person.
+
+The figures stay out of the response: what a team has spent belongs to whoever
+owns the team. They are in the log line and in `/spend/scopes`.
+
+The same pooling applies to `rpm_limit` and `tpm_limit` on a scope — one
+allowance the members share rather than one each. The key's allowance and every
+scope's are reserved in a single all-or-nothing operation, so a request the team
+refuses leaves no increment on the key's own window: a caller sitting against a
+shared limit does not burn their personal allowance doing nothing.
+
+Depth is free. The whole chain is one read and one reservation however many
+levels it has, and a chain declaring no limits anywhere costs no round trip at
+all.
+
 ## Spend endpoints
 
-Both are **master-key only** — they disclose what every developer spent.
+All three are **master-key only** — they disclose what every developer spent.
 
 | Endpoint | Reports |
 |---|---|
 | `GET /spend/keys` | Consumption per virtual key, with alias. |
+| `GET /spend/scopes` | Consumption per organisation, team and project. Empty where no hierarchy is configured. |
 | `GET /spend/deployments` | Consumption per deployment. |
+
+`/spend/scopes` is read rather than derived. Summing the `/spend/keys` rows for
+a team gives a different number and a wrong one: a key can leave a team, and its
+historical spend does not leave with it — so a pool is its own subject rather
+than a query over its current members.
 
 Both carry `cache_savings` beside `cost`: what the provider's prompt cache took
 off the bill, against the same tokens charged as ordinary input. It sits beside
@@ -383,6 +447,7 @@ docker compose -f deploy/docker-compose.yml up --build   # gateways on :4000 and
 | Key rate limits (`keys[].rpm_limit`/`tpm_limit`) | Redis | The same arithmetic, applied to the caller's allowance rather than the upstream's capacity. Counted in a separate keyspace from the deployment limits, so a key hash and a deployment id can never draw on one window. |
 | Cooldowns | Redis | An upstream ejected by one instance should be ejected everywhere. |
 | Spend and budgets | Redis | Otherwise a key spends its whole allowance once per instance. |
+| Scope pools (`rbac` budgets and rate limits) | Redis | The same arithmetic again, and worse here: a pool exists precisely to be one cap several callers share, so multiplying it by the replica count defeats the whole feature. Kept in a separate keyspace from the key subjects, so a scope named after a key hash cannot draw on that key's window. |
 | Prompt-prefix pins | Redis | Behind a load balancer the next turn of a conversation arrives at a different replica; a per-instance pin would send it to a different upstream, which is the thing the pin exists to prevent. |
 | Latency samples | **local** | Latency measures *this instance's* network path to the upstream. Blending measurements from different network positions makes the signal worse, not better. |
 | In-flight counts | **local** | It describes the load this instance is carrying, and a shared counter would leak permanently whenever an instance died mid-request. |

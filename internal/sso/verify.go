@@ -87,6 +87,28 @@ func (a audience) contains(s string) bool {
 	return false
 }
 
+// containsAny reports whether the claim names any acceptable audience. An empty
+// allowlist matches nothing, so a misconfiguration refuses tokens rather than
+// accepting all of them.
+func (a audience) containsAny(want []string) bool {
+	return len(a.matching(want)) > 0
+}
+
+// matching returns the acceptable audiences this token actually carries.
+//
+// Which ones matched is the question the authorized-party check turns on, and
+// it is not answerable from the configured list alone: a gateway accepting two
+// audiences may be handed a token naming only one of them.
+func (a audience) matching(want []string) []string {
+	var out []string
+	for _, w := range want {
+		if w != "" && a.contains(w) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 // idClaims is the subset of an ID token the gateway checks or reads. Everything
 // else is kept in the raw map, where the configured role claim is looked up.
 type idClaims struct {
@@ -109,6 +131,17 @@ type idClaims struct {
 // The order is deliberate: the signature is checked before any claim is read,
 // so nothing in an unverified token influences what the gateway does with it.
 func (p *Provider) Verify(ctx context.Context, raw, wantNonce string) (*Identity, error) {
+	return p.verify(ctx, raw, wantNonce, []string{p.cfg.ClientID})
+}
+
+// verify is the shared check behind both the login flow and per-request token
+// authentication. The two differ in one claim and one absence: which audiences
+// are acceptable, and whether there is a nonce to tie the token to a login the
+// gateway started. Everything else — the algorithm allowlist, the signature,
+// the issuer, the expiry window — is identical, and is identical because a
+// token presented on a request is not a weaker assertion than one presented at
+// login.
+func (p *Provider) verify(ctx context.Context, raw, wantNonce string, audiences []string) (*Identity, error) {
 	parts := strings.Split(raw, ".")
 	if len(parts) != 3 {
 		return nil, errorf("id token: want three dot-separated segments, got %d", len(parts))
@@ -153,13 +186,29 @@ func (p *Provider) Verify(ctx context.Context, raw, wantNonce string) (*Identity
 	if strings.TrimSuffix(c.Iss, "/") != strings.TrimSuffix(p.cfg.Issuer, "/") {
 		return nil, errorf("id token: issued by %q, want %q", c.Iss, p.cfg.Issuer)
 	}
-	if !c.Aud.contains(p.cfg.ClientID) {
+	if !c.Aud.containsAny(audiences) {
 		// A token minted for a different client of the same provider is a valid
 		// token that says nothing about this gateway. Accepting one would let
 		// any other application in the organisation issue gateway keys.
 		return nil, errorf("id token: not issued for this client")
 	}
-	if len(c.Aud) > 1 && c.Azp != "" && c.Azp != p.cfg.ClientID {
+	// The authorized-party check turns on which audience this token was
+	// actually accepted under, not on how many the operator configured.
+	//
+	// Keying it on the configured list is a hole: an operator who accepts both
+	// an ID-token audience and an access-token one — the natural config for
+	// serving logins and services together — would lose the check for the ID
+	// tokens as well, and a token another client obtained naming this gateway
+	// among its audiences would be accepted. The narrow reason to relax it is
+	// an access token, whose "aud" is the API it was minted for and whose "azp"
+	// is the client that asked; requiring azp to equal the gateway's client id
+	// there would refuse every such token.
+	//
+	// So it applies when the only thing that made this token acceptable is that
+	// it names the gateway's own client id.
+	matched := c.Aud.matching(audiences)
+	if len(c.Aud) > 1 && c.Azp != "" && c.Azp != p.cfg.ClientID &&
+		len(matched) == 1 && matched[0] == p.cfg.ClientID {
 		return nil, errorf("id token: authorized party is %q, want %q", c.Azp, p.cfg.ClientID)
 	}
 	if c.Sub == "" {
@@ -206,6 +255,7 @@ func (p *Provider) Verify(ctx context.Context, raw, wantNonce string) (*Identity
 		Email:   c.Email,
 		Name:    name,
 		Roles:   claimValues(rawClaims, p.cfg.RoleClaim),
+		Expiry:  time.Unix(c.Exp, 0).UTC(),
 	}, nil
 }
 

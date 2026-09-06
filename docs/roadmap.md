@@ -266,17 +266,31 @@ datastore behind `spend.Store`.
 ### ⚪ Cross-format translation
 
 An Anthropic ingress reaches only `anthropic` deployments; OpenAI only `openai`.
-Enforced in routing and validation.
+A model group may not mix formats, and a fallback may not cross them. Enforced in
+`router.candidates` and twice in `config.validate`.
 
-This is a **non-goal for now, not an oversight**. Anthropic's gateway rules
-require forwarding request bodies unchanged, and translation is precisely the
-opposite. Building it means mapping content blocks, `tool_use`/`tool_result`, and
-the streaming event grammar in both directions — large, and in tension with the
-guarantee that makes the passthrough path work.
+This is a **non-goal for now, not an oversight**.
+[architecture.md](architecture.md#there-is-no-cross-format-translation) records
+why. What follows is the size of the thing, so that a later decision to build it
+is taken against the real number rather than against "map the fields".
+
+| Surface | The work |
+|---|---|
+| Envelope | `system` is a top-level field one side and a message the other. `max_tokens` is required one side, optional the other. `temperature` is 0–1 against 0–2, so a faithful mapping rescales rather than copies. Each side has parameters the other cannot express — `n` and `logprobs` one way, a `thinking` budget and `cache_control` the other |
+| Content blocks | Anthropic's typed block list against OpenAI's string-or-parts plus a sibling `tool_calls` array. Tool results move from blocks inside a user message to separate `role: "tool"` messages — 1→N, so the arrays do not correspond by index and cannot be walked in step. Images move between `source.data` and a `data:` URL. `thinking` signatures have nowhere to go |
+| Tools | `input_schema` against `function.parameters`. `tool_choice` vocabularies that overlap without either containing the other: `any` and `required` are the same thing under different names |
+| Streaming | Anthropic's stateful event grammar against OpenAI's flat chunk sequence. Index-addressed tool-call fragments must be reassembled into `content_block_start`/`delta`/`stop` lifecycles with block indices the gateway invents, and `message_start` must carry an input token count that an OpenAI-compatible upstream does not report until its final chunk. Terminal reasons map unevenly too — OpenAI's `content_filter` has no `stop_reason` counterpart |
+
+It is also not a feature that finishes. Every content block type either provider
+adds afterwards is a new mapping in both directions, and a missing one degrades a
+call rather than failing it — so the cost is a permanent one, carried against
+providers that ship on their own schedule.
 
 If it is wanted, the shape is a `Transformer` between ingress and `provider`,
 applied only to deployments whose format differs from the ingress, never on the
-passthrough path.
+passthrough path. The gain that would justify it is a fallback that crosses
+vendors, which nothing else here can provide: today an Anthropic outage has no
+escape hatch, because `validate.go` refuses a fallback leaving the format.
 
 ### 🔴 OpenAI's `prompt_cache_key` is not sent
 
@@ -326,17 +340,35 @@ Note the tension: a guardrail that **modifies** a request body breaks the
 byte-preservation the passthrough path depends on. Inspection-only guardrails
 compose; rewriting ones need a deliberate exception.
 
-### 🔴 Teams and organisations
+### ✅ Teams and organisations
 
-Keys are flat. No team-level budgets, no inherited limits, no hierarchy.
-`core.Key` would gain a parent reference and budget checks would walk it.
+Resolved. Keys were flat: `sso.roles` mapped an identity to entitlements, but
+every identity matching a role received its own independent budget, so a role
+was not a pool and a cap written once was multiplied by the number of people it
+applied to.
 
-`sso.roles` is close to the shape a team would want and is deliberately not one:
-it maps an identity to entitlements, but every identity matching a role gets its
-own independent budget, so a role is not a pool. A team budget means a cap the
-members share, which is a second subject in the ledger above
-`core.Key.SpendSubject` — the seam SSO already created for exactly this kind of
-question.
+`rbac` declares organisations, teams and projects; `core.Scope` is the resolved
+node with a parent link; and a scope is **its own subject in the ledger**, so
+every key beneath one records against the same entry and the cap is a ceiling
+the members share. Budgets, `rpm` and `tpm` all pool, and model allowlists
+intersect down the chain. `/spend/scopes` reports each level, and
+`spend.Entry.Scopes` is how one request reaches all of them.
+
+The whole chain is read in one call and reserved in one atomic operation, so
+depth costs no extra round trips and a request refused by an outer scope leaves
+no increment on an inner one. The budget overshoot below does apply per level
+rather than once, since `CheckBudget` still reserves nothing.
+
+### 🟡 A scope budget is checked before the call, like a key's
+
+The concurrency overshoot described under
+[budgets](#-a-budget-is-checked-before-the-call-so-concurrency-overshoots-it)
+applies to a pool as well, and is larger there: the requests in flight when the
+boundary is crossed belong to every member of the team, not to one key. The
+bound is the team's combined concurrency rather than one caller's.
+
+It wants the same fix and the same seam — a reservation alongside `Record` in
+`spend.Store` — so it is one piece of work covering both, not two.
 
 ### 🟡 SSO covers a browser on the same machine, and nothing else
 
@@ -377,6 +409,43 @@ who can read one can read the other. But a key that must be re-obtained is
 weaker than one already in hand, and the OS keychain is where it belongs. That
 means three platform paths (Keychain, libsecret, DPAPI), which is why it is not
 here yet.
+
+### ✅ A scope chain cost a round trip per level, and reserved non-atomically
+
+Resolved, and the two halves had one fix. `CheckBudget` issued one read per
+budgeted scope and `Admit` one reservation per limited scope, each sequential —
+so a full organisation → team → project hierarchy added up to six round trips to
+every request. Worse, the reservations were separate operations, so a request
+refused by an outer scope kept the increment it had already made to an inner
+one: a key's own window ran ahead of the requests it actually served, and a
+caller sitting against a team limit burned their personal allowance doing
+nothing.
+
+Both walks are over a set known before the request starts, so neither had to be
+sequential. `spend.Store.Spends` takes a set and the Redis ledger pipelines it;
+`auth.KeyLimiter.ReserveAll` takes a set and `reserveAllScript` checks every
+limit before moving any counter. The chain is now one round trip for the read
+and one for the reservation, whatever its depth, and the reservation is
+all-or-nothing.
+
+Two things worth keeping: a chain declaring no limits anywhere short-circuits
+without touching Redis, so the common case costs nothing; and degrading to the
+local limiter keeps the all-or-nothing property rather than dropping to
+per-subject reservation while Redis is away.
+
+### 🟡 JWT auth is bounded by the token's lifetime, not by a revocation list
+
+`sso.jwt_auth` verifies the provider's own token on every request, which is the
+point: a suspended account stops working as soon as its current token does,
+where a virtual key issued at login is trusted until it expires.
+
+"As soon as its current token does" is the limit. The gateway reads no
+revocation list and calls no introspection endpoint, so a token already in hand
+stays good for its remaining life — typically under an hour, and set by the
+provider rather than by anything here. Closing that means an introspection call
+per request, which is a network round trip on the request path for a window most
+operators consider acceptable. The verified-token cache is a smaller version of
+the same trade and is already bounded by the token's own expiry, never past it.
 
 ### ⚪ No SAML
 
@@ -490,6 +559,12 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Injected breakpoints | tools, system **and** the conversation | marking only the static prefix re-reads a growing history at full price every turn |
 | An upstream that refuses an annotation | retried without it, then not annotated again | LiteLLM strips `cache_control` ahead of time per provider from a static rule and never retries, so an upstream that refuses for a reason not in that rule costs the caller their request |
 | Passthrough cost | not billed to the operator | it is billed to the caller's subscription |
+| A scope's budget | a subject in the ledger | LiteLLM derives a team's spend from its members, which changes underneath history when someone leaves the team |
+| A dangling scope reference | refuses the key | the key store outlives the config that produced it, so treating a renamed team as "unscoped" would silently drop the cap its members were issued under |
+| Model allowlists down a hierarchy | intersected, and a child widening its parent is refused at load | a grant that can never take effect is a statement the operator believes they made |
+| A pooled budget refusal | names the level that bound, not the figures | "this key has exhausted its budget" is false when a team's pool ran out, and sends the developer to ask the wrong person |
+| A model refused by a scope | names the level that withheld it | a caller whose own key lists the model has nowhere to go otherwise; widening the key's allowlist changes nothing |
+| Reserving a chain of limits | one atomic operation | reserving level by level charges the inner windows for requests an outer one refused |
 
 ---
 

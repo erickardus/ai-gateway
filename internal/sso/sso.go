@@ -48,6 +48,11 @@ type Identity struct {
 	Name  string
 	// Roles holds the values of the configured role claim.
 	Roles []string
+	// Expiry is when the token asserting this identity stops being valid. It
+	// bounds how long a per-request verification may be cached: a cache entry
+	// outliving the token it was derived from would be the gateway extending a
+	// credential the provider issued for less.
+	Expiry time.Time
 }
 
 // Display renders the identity for a log line or a terminal, preferring the
@@ -90,15 +95,21 @@ type Provider struct {
 	discAt time.Time
 	keys   map[string]any
 	keysAt time.Time
+
+	// tokens memoizes per-request token verification. It has its own lock: a
+	// cache hit must not queue behind a key-set refresh, which is the one thing
+	// under mu that can take a network round trip.
+	tokens *tokenCache
 }
 
 // New builds a Provider. The caller is expected to have validated cfg.
 func New(cfg config.SSOConfig, log *slog.Logger) *Provider {
 	return &Provider{
-		cfg: cfg,
-		hc:  &http.Client{Timeout: httpTimeout},
-		log: log,
-		now: time.Now,
+		cfg:    cfg,
+		hc:     &http.Client{Timeout: httpTimeout},
+		log:    log,
+		now:    time.Now,
+		tokens: newTokenCache(),
 	}
 }
 

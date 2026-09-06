@@ -27,7 +27,7 @@ func newTestAuthenticator(t *testing.T, rpm, tpm int) (*Authenticator, string) {
 		Keys: []config.KeySpec{{
 			Key: plaintext, Alias: "test", RPMLimit: rpm, TPMLimit: tpm,
 		}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}

@@ -113,6 +113,40 @@ func (l *Limiter) Reserve(subject string, rpm, tpm int) bool {
 	return true
 }
 
+// Claim is one subject's allowance within a set reserved together.
+type Claim struct {
+	Subject  string
+	RPM, TPM int
+}
+
+// ReserveAll records one request against every subject if it fits within all of
+// their limits, reporting the index of the first that refused or -1 on success.
+//
+// All or nothing, under one lock. Reserving each subject separately would let a
+// request refused by an outer scope keep the increment it had already made to
+// an inner one, so a key's own window would run ahead of the requests it
+// actually served.
+func (l *Limiter) ReserveAll(claims []Claim) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	counters := make([]*counter, len(claims))
+	for i, c := range claims {
+		cur := l.currentLocked(c.Subject)
+		if c.RPM > 0 && cur.requests >= c.RPM {
+			return i
+		}
+		if c.TPM > 0 && cur.tokens >= c.TPM {
+			return i
+		}
+		counters[i] = cur
+	}
+	for _, cur := range counters {
+		cur.requests++
+	}
+	return -1
+}
+
 // AddTokens records token usage reported after a response completes.
 func (l *Limiter) AddTokens(subject string, tokens int) {
 	if tokens <= 0 {

@@ -95,6 +95,12 @@ const (
 	// prompt text runs about four bytes to the token. Below it a breakpoint is
 	// ignored upstream, so placing one only adds bytes to the request.
 	DefaultInjectMinBytes = 4096
+
+	// DefaultJWTAuthCacheTTL is how long a verified token is reused. It is short
+	// because the point of verifying per request is that revocation arrives
+	// quickly, and a long cache would hand back the lifetime a virtual key
+	// already offers with none of its simplicity.
+	DefaultJWTAuthCacheTTL = 60 * time.Second
 )
 
 // Strategy names accepted by router.strategy.
@@ -375,6 +381,21 @@ func applySSODefaults(c *Config) {
 			for name := range groups {
 				s.Model = name
 			}
+		}
+	}
+
+	if s.JWTAuth.Enabled {
+		if len(s.JWTAuth.Audiences) == 0 {
+			// The client id is what an ID token carries, and it is the value the
+			// login path already checks, so a gateway that turns this on without
+			// naming an audience accepts exactly the tokens it was already
+			// prepared to verify — rather than accepting any audience, which is
+			// the one default that would be a hole.
+			s.JWTAuth.Audiences = []string{s.ClientID}
+		}
+		if s.JWTAuth.CacheTTL == nil {
+			d := DefaultJWTAuthCacheTTL
+			s.JWTAuth.CacheTTL = &d
 		}
 	}
 }

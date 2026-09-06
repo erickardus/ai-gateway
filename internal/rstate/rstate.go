@@ -49,6 +49,44 @@ if n == 1 then redis.call('EXPIRE', rpmKey, ttl) end
 return 1
 `
 
+// reserveAllScript reserves across several subjects at once, all or nothing.
+//
+// It exists for the entitlement chain: a request is charged against its key and
+// every scope above it, and doing that as a sequence of reserveScript calls is
+// both a round trip per level and non-atomic — a request refused by an outer
+// scope would keep the increment it had already made to an inner one, so a
+// key's own window would run ahead of the requests it actually served.
+//
+// KEYS holds an rpm/tpm pair per subject; ARGV an rpm/tpm pair plus the shared
+// TTL last. Every limit is checked before any counter moves, so the script
+// either admits the request everywhere or nowhere. It returns the 1-based index
+// of the subject that refused, or 0 when all fit — 0 rather than -1 because a
+// Lua number returned to Redis is what the client reads back as an integer, and
+// the sign costs a branch on both sides.
+const reserveAllScript = `
+local ttl = tonumber(ARGV[#ARGV])
+local n = #KEYS / 2
+
+for i = 1, n do
+  local rpm = tonumber(ARGV[i * 2 - 1])
+  local tpm = tonumber(ARGV[i * 2])
+  if rpm > 0 then
+    local used = tonumber(redis.call('GET', KEYS[i * 2 - 1]) or '0')
+    if used >= rpm then return i end
+  end
+  if tpm > 0 then
+    local used = tonumber(redis.call('GET', KEYS[i * 2]) or '0')
+    if used >= tpm then return i end
+  end
+end
+
+for i = 1, n do
+  local c = redis.call('INCR', KEYS[i * 2 - 1])
+  if c == 1 then redis.call('EXPIRE', KEYS[i * 2 - 1], ttl) end
+end
+return 0
+`
+
 // allowScript is the non-consuming check used while filtering candidates.
 const allowScript = `
 local rpmKey, tpmKey = KEYS[1], KEYS[2]
@@ -114,7 +152,7 @@ type Store struct {
 	timeout time.Duration
 
 	scripts struct {
-		reserve, allow, addTokens, failure *redis.Script
+		reserve, reserveAll, allow, addTokens, failure *redis.Script
 	}
 
 	// degraded is set while Redis is unreachable, so the transition back is
@@ -147,6 +185,7 @@ func New(opts Options, local *router.MemState, log *slog.Logger) *Store {
 		timeout: opts.Timeout,
 	}
 	s.scripts.reserve = redis.NewScript(reserveScript)
+	s.scripts.reserveAll = redis.NewScript(reserveAllScript)
 	s.scripts.allow = redis.NewScript(allowScript)
 	s.scripts.addTokens = redis.NewScript(addTokensScript)
 	s.scripts.failure = redis.NewScript(failureScript)

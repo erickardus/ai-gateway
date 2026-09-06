@@ -24,6 +24,16 @@ type KeyLimiter interface {
 	// Reserve charges one request against the subject, reporting whether it
 	// fit within the limits. A limit of zero means unlimited.
 	Reserve(ctx context.Context, subject string, rpm, tpm int) (bool, error)
+	// ReserveAll charges one request against every subject at once, returning
+	// the index of the first that refused or -1 where all fit.
+	//
+	// It takes a set for two reasons, and the second is why it is not merely
+	// Reserve in a loop. A request is charged against its key and every scope
+	// above it, so a loop is a round trip per level on the hot path — and a
+	// loop is not atomic, so a request refused by an outer scope keeps the
+	// increment it already made to an inner one. One call is one round trip and
+	// all-or-nothing.
+	ReserveAll(ctx context.Context, claims []limiter.Claim) (int, error)
 	// AddTokens records what a completed response consumed. It is called after
 	// the response has been relayed, so it reports rather than admits.
 	AddTokens(ctx context.Context, subject string, tokens int)
@@ -44,6 +54,11 @@ func NewLocalLimiter() *LocalLimiter { return &LocalLimiter{l: limiter.New()} }
 // in this process, so there is nothing that can be unreachable.
 func (k *LocalLimiter) Reserve(_ context.Context, subject string, rpm, tpm int) (bool, error) {
 	return k.l.Reserve(subject, rpm, tpm), nil
+}
+
+// ReserveAll implements KeyLimiter.
+func (k *LocalLimiter) ReserveAll(_ context.Context, claims []limiter.Claim) (int, error) {
+	return k.l.ReserveAll(claims), nil
 }
 
 // AddTokens implements KeyLimiter.

@@ -24,6 +24,11 @@ type Config struct {
 	Cache         CacheConfig         `yaml:"cache"`
 	PromptCache   PromptCacheConfig   `yaml:"prompt_cache"`
 	SSO           SSOConfig           `yaml:"sso"`
+	RBAC          RBACConfig          `yaml:"rbac"`
+
+	// scopes is the flattened hierarchy, resolved once at load. Keyed by fully
+	// qualified id, with Parent pointers already wired.
+	scopes map[string]*core.Scope
 }
 
 // PromptCacheConfig controls how the gateway treats the provider's own prompt
@@ -339,6 +344,11 @@ type KeySpec struct {
 	// BudgetDuration is the window MaxBudget applies over. Zero means the key's
 	// whole lifetime.
 	BudgetDuration time.Duration `yaml:"budget_duration"`
+	// Scope is the fully qualified id of a project, team or organisation
+	// declared under `rbac`. The scope's limits bind this key in addition to
+	// its own, and the scope's budget is a pool this key draws from rather
+	// than a second allowance of its own.
+	Scope string `yaml:"scope"`
 }
 
 // SSOConfig provisions virtual keys from an OpenID Connect identity provider.
@@ -394,6 +404,69 @@ type SSOConfig struct {
 	// arrives in a custom header, which is exactly this arrangement. With one
 	// model group configured it defaults to that group.
 	Model string `yaml:"model"`
+	// JWTAuth accepts the provider's own tokens on inference requests, as an
+	// alternative to exchanging one for a gateway key at login.
+	JWTAuth JWTAuthConfig `yaml:"jwt_auth"`
+}
+
+// JWTAuthConfig accepts an identity provider's own token on every request,
+// instead of the virtual key an SSO login exchanges one for.
+//
+// The two arrangements answer the same question at different times, and the
+// trade between them is revocation against moving parts. A virtual key is
+// verified once at login and then trusted for its lifetime, so disabling
+// someone at the provider does not reach the gateway until their key expires;
+// their token, by contrast, is checked on every request, so a suspended account
+// stops working as soon as its current token does — typically an hour. What it
+// costs is that every caller must hold a live token and refresh it, which is
+// ordinary for a service but is precisely what Claude Code cannot do while
+// keeping a subscription login, since the only header it will carry a gateway
+// credential in is a static one.
+//
+// So this is for the callers a key does not suit — CI, a service, a script run
+// under a workload identity — and it sits beside the key path rather than
+// replacing it. Both resolve to the same entitlements through the same roles,
+// and both account to the same subject, so a person moving between them draws
+// on one budget.
+type JWTAuthConfig struct {
+	// Enabled turns on token authentication. Off by default: accepting a
+	// provider's tokens is a second way in, and one an operator should choose.
+	Enabled bool `yaml:"enabled"`
+	// Audiences are the "aud" values a token may carry. It defaults to the
+	// gateway's own client id, which is what an ID token carries; an access
+	// token issued for an API usually names that API instead, so a deployment
+	// presenting access tokens lists its API identifier here.
+	//
+	// It is an allowlist with no wildcard for the reason the login path checks
+	// the same claim: a token minted for another client of the same provider is
+	// a valid token that says nothing about this gateway, and accepting one
+	// would let any other application in the organisation authenticate here.
+	Audiences []string `yaml:"audiences"`
+	// CacheTTL is how long a verified token's result is reused before it is
+	// verified again.
+	//
+	// Verification is a signature check against a cached key set, so this is an
+	// optimization rather than a necessity — but it is on the path of every
+	// request, and a caller sending a hundred a second would otherwise pay a
+	// hundred RSA verifications a second for an answer that cannot change. It
+	// never extends a token: an entry is dropped at the token's own expiry
+	// whenever that comes first.
+	//
+	// A pointer, so an explicit 0 — verify every request, cache nothing — is
+	// not mistaken for an omitted field. That is a configuration an operator
+	// might genuinely want, and it is the one this feature exists to make
+	// possible: the whole reason to check a token per request is that the
+	// answer can change, and an operator entitled to decide the answer changes
+	// faster than a minute should be able to say so.
+	CacheTTL *time.Duration `yaml:"cache_ttl"`
+}
+
+// TTL returns how long a verified token is reused, or the default when unset.
+func (j JWTAuthConfig) TTL() time.Duration {
+	if j.CacheTTL == nil {
+		return DefaultJWTAuthCacheTTL
+	}
+	return *j.CacheTTL
 }
 
 // Enabled reports whether SSO is configured. The endpoints are not registered
@@ -414,6 +487,15 @@ type SSORole struct {
 	AllowPassthrough bool          `yaml:"allow_passthrough"`
 	MaxBudget        float64       `yaml:"max_budget"`
 	BudgetDuration   time.Duration `yaml:"budget_duration"`
+	// Scope places everyone matching this role inside a project, team or
+	// organisation declared under `rbac`.
+	//
+	// It is what makes a role a pool rather than a template. Without it every
+	// identity the role matches receives its own copy of MaxBudget, so a cap
+	// written once is multiplied by the number of people it applies to; with
+	// it, they share the scope's budget and the role's own MaxBudget becomes a
+	// per-person cap *within* that pool.
+	Scope string `yaml:"scope"`
 }
 
 // ObservabilityConfig controls logging, metrics and spend persistence.

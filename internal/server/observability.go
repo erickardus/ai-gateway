@@ -53,6 +53,19 @@ func (s *Server) handleSpendKeys(w http.ResponseWriter, r *http.Request) {
 	s.writeSpend(w, r, func() ([]spend.Summary, error) { return s.ledger.Keys(r.Context()) })
 }
 
+// handleSpendScopes reports consumption per organisation, team and project.
+//
+// It answers the question a per-key report cannot: what a team has spent
+// between them. Summing the key rows would give a different number and a wrong
+// one — a key can leave a team, and its historical spend does not leave with
+// it — so the pool is its own subject in the ledger and is read as one.
+func (s *Server) handleSpendScopes(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w, r) {
+		return
+	}
+	s.writeSpend(w, r, func() ([]spend.Summary, error) { return s.ledger.Scopes(r.Context()) })
+}
+
 // handleSpendDeployments reports consumption per deployment.
 func (s *Server) handleSpendDeployments(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w, r) {
@@ -129,6 +142,8 @@ func (s *Server) record(r *http.Request, obs observation) {
 			Cost:         cost,
 			Billable:     pricing.billable,
 			CacheSavings: savings,
+			Scopes:       obs.scopes,
+			ScopeAliases: obs.scopeAliases,
 		}
 		if err := s.ledger.Record(ctx, entry); err != nil {
 			s.log.Warn("record spend", "error", err, "request_id", RequestIDFrom(r.Context()))
@@ -144,13 +159,18 @@ const recordTimeout = 5 * time.Second
 
 // observation is what one request produced, gathered at the point it completes.
 type observation struct {
-	model, deployment  string
-	keyHash, keyAlias  string
-	usage              core.Usage
-	outcome            string
-	rejectReason       string
-	retries, fallbacks int
-	latency            time.Duration
+	model, deployment string
+	keyHash, keyAlias string
+	// scopes are the ledger subjects of the hierarchy this request's key sits
+	// in, innermost first, with scopeAliases their labels. Empty for a key
+	// outside any hierarchy, which is what makes the pooled accounting cost
+	// nothing for a gateway that declares none.
+	scopes, scopeAliases []string
+	usage                core.Usage
+	outcome              string
+	rejectReason         string
+	retries, fallbacks   int
+	latency              time.Duration
 	// promptAffinity records whether the request went to the deployment already
 	// holding its prompt prefix. Empty when no pin was consulted.
 	promptAffinity string

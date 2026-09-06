@@ -60,6 +60,56 @@ func (k *KeyLimiter) Reserve(ctx context.Context, subject string, rpm, tpm int) 
 	return res == 1, nil
 }
 
+// ReserveAll implements auth.KeyLimiter.
+//
+// One script over the whole chain: one round trip whatever the hierarchy's
+// depth, and atomic, so a request refused by a team does not leave an increment
+// on the key's own window.
+//
+// Degrading falls back to the local limiter's ReserveAll rather than to
+// admitting the request, which keeps the all-or-nothing property while Redis is
+// unreachable — per instance, like every other limit in that state.
+func (k *KeyLimiter) ReserveAll(ctx context.Context, claims []limiter.Claim) (int, error) {
+	if len(claims) == 0 {
+		return -1, nil
+	}
+	// A chain that declares no limits anywhere has nothing to reserve, and
+	// running a script to discover that would be a round trip per request for
+	// the common case of a gateway with no rate limits configured.
+	limited := false
+	for _, c := range claims {
+		if c.RPM > 0 || c.TPM > 0 {
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		return -1, nil
+	}
+
+	s := k.store
+	rctx, cancel := s.ctx(ctx)
+	defer cancel()
+
+	keys := make([]string, 0, len(claims)*2)
+	args := make([]any, 0, len(claims)*2+1)
+	for _, c := range claims {
+		keys = append(keys,
+			s.windowKey(keyRPMNamespace, c.Subject),
+			s.windowKey(keyTPMNamespace, c.Subject))
+		args = append(args, c.RPM, c.TPM)
+	}
+	args = append(args, windowSeconds)
+
+	res, err := s.scripts.reserveAll.Run(rctx, s.client, keys, args...).Int()
+	if s.degrade(err, "key_reserve_all") {
+		return k.local.ReserveAll(claims), nil
+	}
+	s.recovered()
+	// The script answers with a 1-based index, or 0 when everything fit.
+	return res - 1, nil
+}
+
 // AddTokens implements auth.KeyLimiter.
 func (k *KeyLimiter) AddTokens(ctx context.Context, subject string, tokens int) {
 	if tokens <= 0 {
@@ -76,6 +126,37 @@ func (k *KeyLimiter) AddTokens(ctx context.Context, subject string, tokens int) 
 		return
 	}
 	s.recovered()
+}
+
+// Snapshot reports the subject's current shared counts, for diagnostics and
+// tests. It mirrors the local limiter's, so a test can ask the same question of
+// either implementation.
+//
+// It reads rather than reserves, so it is deliberately not part of
+// auth.KeyLimiter: the request path never needs a count it is not also
+// consuming, and an interface method for one would invite a check-then-act
+// pair where the script exists to avoid exactly that.
+func (k *KeyLimiter) Snapshot(ctx context.Context, subject string) (requests, tokens int) {
+	s := k.store
+	rctx, cancel := s.ctx(ctx)
+	defer cancel()
+
+	vals, err := s.client.MGet(rctx,
+		s.windowKey(keyRPMNamespace, subject),
+		s.windowKey(keyTPMNamespace, subject)).Result()
+	if err != nil || len(vals) < 2 {
+		return 0, 0
+	}
+	return atoiValue(vals[0]), atoiValue(vals[1])
+}
+
+// atoiValue reads a counter Redis returned as a string, or nil for absent.
+func atoiValue(v any) int {
+	s, ok := v.(string)
+	if !ok {
+		return 0
+	}
+	return parseInt(s)
 }
 
 // Forget implements auth.KeyLimiter.

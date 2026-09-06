@@ -87,8 +87,12 @@ type harnessOpts struct {
 	maxBodyBytes     int64
 	rpmLimit         int
 	maxBudget        float64
-	cache            bool
-	cacheScope       cache.Scope
+	// rbac declares an entitlement hierarchy, and keyScope attaches the
+	// harness's virtual key to one of its scopes.
+	rbac       config.RBACConfig
+	keyScope   string
+	cache      bool
+	cacheScope cache.Scope
 	// extraDeployments adds further upstreams to the same model group, which is
 	// what gives prompt-prefix affinity something to choose between.
 	extraDeployments int
@@ -243,8 +247,10 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 			Keys: []config.KeySpec{{
 				Key: testVirtualKey, Alias: "test-key",
 				AllowPassthrough: opts.allowPassthrough, RPMLimit: opts.rpmLimit,
+				Scope: opts.keyScope,
 			}},
 		},
+		RBAC: opts.rbac,
 	}
 	cfg.Observability.Metrics = true
 	cfg.Observability.StreamUsage = opts.streamUsage
@@ -265,7 +271,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	log := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	store := auth.NewMemStore()
-	authn, err := auth.NewAuthenticator(context.Background(), store, cfg.VirtualKeys)
+	authn, err := auth.NewAuthenticator(context.Background(), store, cfg.VirtualKeys, cfg.Scopes())
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
@@ -314,6 +320,17 @@ func (h *harness) addKey(t *testing.T, plaintext, alias string) {
 	t.Helper()
 	if err := h.store.Put(context.Background(), &core.Key{
 		Hash: auth.HashKey(plaintext), Alias: alias, AllowPassthrough: true,
+	}); err != nil {
+		t.Fatalf("add key: %v", err)
+	}
+}
+
+// addScopedKey issues a second virtual key inside a scope, for tests about what
+// members of one team share.
+func (h *harness) addScopedKey(t *testing.T, plaintext, alias, scope string) {
+	t.Helper()
+	if err := h.store.Put(context.Background(), &core.Key{
+		Hash: auth.HashKey(plaintext), Alias: alias, AllowPassthrough: true, Scope: scope,
 	}); err != nil {
 		t.Fatalf("add key: %v", err)
 	}

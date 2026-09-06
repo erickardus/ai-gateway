@@ -66,6 +66,7 @@ func (c *Config) Validate() error {
 	}
 	errs = append(errs, validateOTLP(c.Observability.OTLP)...)
 	errs = append(errs, validateSSO(c)...)
+	errs = append(errs, validateRBAC(c)...)
 
 	// A group must speak one wire format: the gateway does not translate, so a
 	// mixed group would route some requests to an upstream expecting a
@@ -607,7 +608,8 @@ func validateSSO(c *Config) []error {
 		// A block written out but missing the issuer turns nothing on. That is
 		// far likelier to be an oversight than a deliberate staging area, and
 		// the endpoints would be absent with no explanation.
-		if o.ClientID != "" || o.ClientSecret != "" || o.RedirectURL != "" || len(o.Roles) > 0 {
+		if o.ClientID != "" || o.ClientSecret != "" || o.RedirectURL != "" || len(o.Roles) > 0 ||
+			o.JWTAuth.Enabled {
 			return []error{errors.New(
 				"sso: configured without an issuer, so no SSO endpoints are served; set sso.issuer")}
 		}
@@ -716,6 +718,52 @@ func validateSSO(c *Config) []error {
 			"sso.base_url: required when sso.redirect_url is not an absolute URL; it is handed to clients as ANTHROPIC_BASE_URL"))
 	}
 
+	errs = append(errs, validateJWTAuth(o)...)
+	return errs
+}
+
+// validateJWTAuth checks the per-request token block.
+//
+// It is separate because everything here is inert until jwt_auth.enabled, and
+// an operator who has not turned it on should not be told about fields they
+// never wrote.
+func validateJWTAuth(o SSOConfig) []error {
+	j := o.JWTAuth
+	if !j.Enabled {
+		// A block written out but not enabled is the same oversight the issuer
+		// guard catches: nothing is served, and nothing says so.
+		if len(j.Audiences) > 0 || j.CacheTTL != nil {
+			return []error{errors.New(
+				"sso.jwt_auth: configured but not enabled, so the provider's tokens are not accepted; set sso.jwt_auth.enabled")}
+		}
+		return nil
+	}
+
+	var errs []error
+	// Defaults fill this from client_id, so an empty list here means the client
+	// id was empty too — which is already reported. Guarding anyway, because an
+	// empty allowlist accepts nothing and would present as every token being
+	// refused for no stated reason.
+	if len(j.Audiences) == 0 {
+		errs = append(errs, errors.New(
+			"sso.jwt_auth.audiences: empty, so no token can be accepted; it defaults to sso.client_id"))
+	}
+	for i, a := range j.Audiences {
+		switch {
+		case strings.TrimSpace(a) == "":
+			errs = append(errs, fmt.Errorf("sso.jwt_auth.audiences[%d]: must not be empty", i))
+		case a == "*":
+			// There is no wildcard, and silently treating one as a literal
+			// audience would leave an operator believing they had opened this up
+			// while every token was refused.
+			errs = append(errs, errors.New(
+				`sso.jwt_auth.audiences: "*" is not a wildcard; list each acceptable "aud" value, because a token minted for another client of the same provider says nothing about this gateway`))
+		}
+	}
+	if j.CacheTTL != nil && *j.CacheTTL < 0 {
+		errs = append(errs, fmt.Errorf(
+			"sso.jwt_auth.cache_ttl: must not be negative, got %s", *j.CacheTTL))
+	}
 	return errs
 }
 
@@ -729,4 +777,94 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
+}
+
+// validateRBAC checks the entitlement hierarchy and every reference into it.
+//
+// The structural faults — a missing id, a separator inside a segment, a
+// duplicate path — are already refused by resolveScopes, which has to reject
+// them to build a map at all. What is left here is everything about the
+// hierarchy's *contents*, and it is reported alongside the rest of the
+// configuration rather than at the first fault.
+func validateRBAC(c *Config) []error {
+	var errs []error
+
+	for _, id := range c.ScopeIDs() {
+		s := c.scopes[id]
+		where := fmt.Sprintf("rbac scope %q", id)
+
+		if s.BudgetDuration > 0 && s.MaxBudget == 0 {
+			// The same rule a key is held to: a window with nothing to cap is
+			// far likelier to be a budget the operator believes they set than a
+			// deliberate no-op.
+			errs = append(errs, fmt.Errorf(
+				"%s: budget_duration requires max_budget; a window with no cap limits nothing", where))
+		}
+		if s.MaxBudget < 0 {
+			errs = append(errs, fmt.Errorf("%s: max_budget must not be negative, got %v", where, s.MaxBudget))
+		}
+		if s.RPMLimit < 0 || s.TPMLimit < 0 {
+			errs = append(errs, fmt.Errorf("%s: rpm_limit and tpm_limit must not be negative", where))
+		}
+
+		// A model a parent withholds can never be reached from here, so listing
+		// it is a statement the hierarchy contradicts. Refusing it is the point
+		// of an intersection: an operator who writes it believes they granted
+		// something, and nothing else would tell them otherwise.
+		if parent := s.Parent; parent != nil {
+			for _, m := range s.Models {
+				if strings.HasSuffix(m, "*") {
+					// A pattern is checked against the parent's patterns rather
+					// than expanded: "claude-*" under a parent allowing
+					// "claude-sonnet" is narrower for some names and wider for
+					// others, and deciding which needs the model list, not the
+					// hierarchy. The group check below covers the concrete case.
+					continue
+				}
+				if !parent.AllowsModel(m) {
+					errs = append(errs, fmt.Errorf(
+						"%s: models lists %q, which %s %q does not allow; the chain is an intersection, so a child cannot widen its parent",
+						where, m, parent.Kind, parent.ID))
+				}
+			}
+		}
+
+		// A concrete name that matches no configured group is a typo that would
+		// otherwise present as a caller being refused a model nobody can call.
+		groups := c.Groups()
+		for _, m := range s.Models {
+			if strings.HasSuffix(m, "*") || m == "*" {
+				continue
+			}
+			if _, ok := groups[m]; !ok {
+				errs = append(errs, fmt.Errorf("%s: models lists %q, which is not a configured model_name", where, m))
+			}
+		}
+	}
+
+	// Every reference into the hierarchy is resolved here rather than at first
+	// use, so a mistyped scope fails at load rather than on the request that
+	// happens to present the key.
+	known := c.ScopeIDs()
+	check := func(where, id string) {
+		if id == "" {
+			return
+		}
+		if c.Scope(id) == nil {
+			msg := fmt.Sprintf("%s: scope %q is not declared under rbac", where, id)
+			if len(known) > 0 {
+				msg += " (declared: " + strings.Join(known, ", ") + ")"
+			} else {
+				msg += "; no rbac hierarchy is configured"
+			}
+			errs = append(errs, errors.New(msg))
+		}
+	}
+	for i, k := range c.VirtualKeys.Keys {
+		check(fmt.Sprintf("virtual_keys.keys[%d].scope", i), k.Scope)
+	}
+	for i, r := range c.SSO.Roles {
+		check(fmt.Sprintf("sso.roles[%d].scope", i), r.Scope)
+	}
+	return errs
 }

@@ -252,11 +252,14 @@ func (l *ctxSensitiveLedger) Record(ctx context.Context, e spend.Entry) error {
 	return l.inner.Record(ctx, e)
 }
 
-func (l *ctxSensitiveLedger) KeySpend(ctx context.Context, h string, w time.Duration) (float64, error) {
-	return l.inner.KeySpend(ctx, h, w)
+func (l *ctxSensitiveLedger) Spends(ctx context.Context, subjects []spend.Subject) ([]float64, error) {
+	return l.inner.Spends(ctx, subjects)
 }
 func (l *ctxSensitiveLedger) Keys(ctx context.Context) ([]spend.Summary, error) {
 	return l.inner.Keys(ctx)
+}
+func (l *ctxSensitiveLedger) Scopes(ctx context.Context) ([]spend.Summary, error) {
+	return l.inner.Scopes(ctx)
 }
 func (l *ctxSensitiveLedger) Deployments(ctx context.Context) ([]spend.Summary, error) {
 	return l.inner.Deployments(ctx)

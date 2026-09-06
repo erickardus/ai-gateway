@@ -63,6 +63,10 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// SpendSubject rather than Hash: an SSO key is reissued over its owner's
 	// life, and billing each reissue separately would reset their budget.
 	obs.keyHash, obs.keyAlias = authCtx.Key.SpendSubject(), authCtx.Key.Alias
+	// The pools this caller draws on. Resolved here rather than at accounting
+	// time because the key that named them is in hand now, and the request may
+	// yet fail in a way that still has to be charged to them.
+	obs.scopes, obs.scopeAliases = authCtx.ScopeSubjects(), authCtx.ScopeAliases()
 
 	body, err := s.readBody(r)
 	if err != nil {
@@ -252,7 +256,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// is something only the response says.
 	s.router.RecordPrefix(context.WithoutCancel(ctx), result, usage)
 	if authCtx.Key != nil {
-		s.auth.RecordKeyTokens(context.WithoutCancel(ctx), authCtx.Key.Hash, usage.Total())
+		s.auth.RecordTokens(context.WithoutCancel(ctx), authCtx, usage.Total())
 	}
 
 	// Store only a stream that completed. A truncated response replayed for the
@@ -419,6 +423,15 @@ func classify(err error, status int) (kind, message string) {
 	case errors.Is(err, core.ErrKeyBlocked):
 		return "permission_error", "virtual key is blocked or expired"
 	case errors.Is(err, core.ErrModelNotAllowed):
+		// Which level withheld it, where a scope is what did. "This key is not
+		// permitted" is true either way but leaves a caller whose key does list
+		// the model with nowhere to go: widening the key's allowlist, the
+		// obvious next step, changes nothing.
+		var scoped *core.ScopeModelError
+		if errors.As(err, &scoped) {
+			return "permission_error", string(scoped.Kind) + " " + scoped.ID +
+				" is not permitted to call the requested model"
+		}
 		return "permission_error", "this key is not permitted to call the requested model"
 	case errors.Is(err, core.ErrPassthroughNotAllowed):
 		return "permission_error", "this key is not permitted to use credential passthrough"
@@ -430,7 +443,16 @@ func classify(err error, status int) (kind, message string) {
 		return "rate_limit_error", "rate limit exceeded"
 	case errors.Is(err, core.ErrBudgetExceeded):
 		// Say what happened without disclosing the figures, which belong to the
-		// operator rather than the caller.
+		// operator rather than the caller. Which subject ran out is not a figure
+		// and is the difference between an actionable message and a misleading
+		// one: a developer refused by their team's pool has not exhausted
+		// anything of their own, and telling them they have sends them to ask
+		// the wrong person for more.
+		var scoped *core.ScopeBudgetError
+		if errors.As(err, &scoped) {
+			return "budget_error", "the shared budget for " + string(scoped.Kind) + " " +
+				scoped.ID + " is exhausted for the current window"
+		}
 		return "budget_error", "this key has exhausted its budget for the current window"
 	case errors.Is(err, core.ErrNoHealthyDeployment):
 		return "api_error", "no healthy deployment available for this model"

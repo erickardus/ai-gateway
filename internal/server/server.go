@@ -174,6 +174,10 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.HandleFunc("GET /spend/keys", s.handleSpendKeys)
 	mux.HandleFunc("GET /spend/deployments", s.handleSpendDeployments)
+	// Registered unconditionally, like the other two. A gateway with no
+	// hierarchy answers with an empty list, which is a truthful answer and one
+	// fewer thing for a client to branch on.
+	mux.HandleFunc("GET /spend/scopes", s.handleSpendScopes)
 	if s.cache != nil {
 		mux.HandleFunc("POST /cache/purge", s.handleCachePurge)
 	}
