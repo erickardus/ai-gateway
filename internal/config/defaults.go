@@ -134,6 +134,15 @@ const (
 	// well inside the router's own timeout, while an append happens when an
 	// operator mints a key and is worth waiting for.
 	DefaultAuditTimeout = 5 * time.Second
+	// Spend history. The buffer is sized to absorb a database restart at a
+	// busy gateway's request rate rather than to be large: rows waiting here
+	// are rows that are lost if the process dies, so a bigger buffer is a
+	// bigger loss, not a stronger guarantee.
+	DefaultSpendHistoryBuffer              = 8192
+	DefaultSpendHistoryBatchSize           = 500
+	DefaultSpendHistoryFlushInterval       = 2 * time.Second
+	DefaultSpendHistoryMaxConns      int32 = 4
+
 	// DefaultAuditMaxConns sizes the Postgres audit pool. Appends serialize on
 	// a fleet-wide advisory lock, so more connections buy no throughput; this
 	// is sized to hold a spare or two for the verification query and no more,
@@ -221,6 +230,20 @@ func (c *Config) applyDefaults() {
 	}
 	if v.Store.MaxConns == 0 {
 		v.Store.MaxConns = DefaultKeyStoreMaxConns
+	}
+
+	h := &c.Observability.SpendHistory
+	if h.Buffer == 0 {
+		h.Buffer = DefaultSpendHistoryBuffer
+	}
+	if h.BatchSize == 0 {
+		h.BatchSize = DefaultSpendHistoryBatchSize
+	}
+	if h.FlushInterval == 0 {
+		h.FlushInterval = DefaultSpendHistoryFlushInterval
+	}
+	if h.MaxConns == 0 {
+		h.MaxConns = DefaultSpendHistoryMaxConns
 	}
 
 	if c.Audit.Timeout == 0 {

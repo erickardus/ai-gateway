@@ -42,9 +42,10 @@ services:
   # Uncomment the postgres block under virtual_keys.store in your gateway.yaml,
   # set kind: postgres and REMOVE the path line beside it — the DSN below is
   # already in the environment — and the two instances share one set of keys. Do
-  # the same under `audit` for the chain. The gateway creates its own tables on
-  # startup, and refuses to start on a config that names both a path and a
-  # database.
+  # the same under `audit` for the chain, and under
+  # `observability.spend_history` for the per-request spend rows. The gateway
+  # creates its own tables on startup, and refuses to start on a config that
+  # names both a path and a database.
   postgres:
     image: postgres:16-alpine
     environment:
@@ -91,6 +92,9 @@ services:
       # `dsn: ${GATEWAY_AUDIT_DSN}` in your gateway.yaml, and the two instances
       # write one ordered chain instead of two unrelated ones.
       GATEWAY_AUDIT_DSN: postgres://gateway:gateway@postgres:5432/audit?sslmode=disable
+      # And the spend history. Both instances write to it, and unlike the audit
+      # chain there is no ordering to keep between them: a row is a row.
+      GATEWAY_SPEND_DSN: postgres://gateway:gateway@postgres:5432/spend?sslmode=disable
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GATEWAY_MASTER_KEY: ${GATEWAY_MASTER_KEY:-}

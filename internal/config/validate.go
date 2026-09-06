@@ -55,6 +55,8 @@ func (c *Config) Validate() error {
 		{"router.backoff.initial", c.Router.Backoff.Initial},
 		{"router.backoff.max", c.Router.Backoff.Max},
 		{"observability.spend_flush_interval", c.Observability.SpendFlushInterval},
+		{"observability.spend_history.flush_interval", c.Observability.SpendHistory.FlushInterval},
+		{"observability.spend_history.retention", c.Observability.SpendHistory.Retention},
 		{"redis.timeout", c.Redis.Timeout},
 		{"cache.ttl", c.Cache.TTL},
 		{"prompt_cache.affinity_ttl", c.PromptCache.AffinityTTL},
@@ -68,6 +70,7 @@ func (c *Config) Validate() error {
 	}
 	errs = append(errs, validateUI(c)...)
 	errs = append(errs, validateAudit(c)...)
+	errs = append(errs, validateSpendHistory(c.Observability.SpendHistory)...)
 	errs = append(errs, validateOTLP(c.Observability.OTLP)...)
 	errs = append(errs, validateSSO(c)...)
 	errs = append(errs, validateRBAC(c)...)
@@ -963,6 +966,40 @@ func validateAudit(c *Config) []error {
 	}
 	if a.MaxConns < 0 {
 		errs = append(errs, fmt.Errorf("audit.max_conns: must be >= 0, got %d", a.MaxConns))
+	}
+	return errs
+}
+
+// validateSpendHistory checks the durable spend store's configuration.
+//
+// Like the audit block, it is checked whether or not it is switched on: a
+// negative buffer discovered the day someone turns this on is discovered on the
+// day they were asked for a number they cannot produce.
+func validateSpendHistory(h SpendHistoryConfig) []error {
+	var errs []error
+	if h.Buffer < 0 {
+		errs = append(errs, fmt.Errorf("observability.spend_history.buffer: must be >= 0, got %d", h.Buffer))
+	}
+	if h.BatchSize < 0 {
+		errs = append(errs, fmt.Errorf("observability.spend_history.batch_size: must be >= 0, got %d", h.BatchSize))
+	}
+	if h.MaxConns < 0 {
+		errs = append(errs, fmt.Errorf("observability.spend_history.max_conns: must be >= 0, got %d", h.MaxConns))
+	}
+	// A batch larger than the buffer can never be filled by the buffer, so
+	// every flush would be an interval flush and the batch size would be a
+	// number that reads like a promise and does nothing.
+	if h.BatchSize > h.Buffer && h.Buffer > 0 {
+		errs = append(errs, fmt.Errorf(
+			"observability.spend_history.batch_size: %d is larger than buffer %d, so a batch can never fill; lower it or raise the buffer",
+			h.BatchSize, h.Buffer))
+	}
+	// A retention shorter than a day would drop rows the day rollup has not
+	// finished accumulating — the rollup would survive, but an export of
+	// yesterday would come back empty while the total said otherwise.
+	if h.Retention > 0 && h.Retention < 24*time.Hour {
+		errs = append(errs, fmt.Errorf(
+			"observability.spend_history.retention: %s is under a day, which would drop rows from days the rollup is still summarizing; use 24h or more", h.Retention))
 	}
 	return errs
 }

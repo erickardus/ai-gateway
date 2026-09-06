@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/erickardus/ai-gateway/internal/audit"
@@ -151,6 +154,8 @@ func (s *Server) record(r *http.Request, obs observation) {
 
 	if s.ledger != nil && obs.deployment != "" {
 		entry := spend.Entry{
+			At:           time.Now().UTC(),
+			RequestID:    RequestIDFrom(r.Context()),
 			KeyHash:      obs.keyHash,
 			KeyAlias:     obs.keyAlias,
 			ModelGroup:   obs.model,
@@ -405,4 +410,202 @@ func (s *Server) warnMissingStreamUsage(obs observation) {
 		"deployment", obs.deployment,
 		"model", obs.model,
 		"remedy", "set observability.stream_usage, or have the caller send stream_options.include_usage")
+}
+
+// UseSpendHistory attaches the durable spend store.
+//
+// Wired after construction like UseAudit and for the same reason: whether
+// history is kept, and where, is a deployment decision that the process
+// assembling the gateway is the only thing that knows.
+func (s *Server) UseSpendHistory(h spend.History) {
+	if h == nil {
+		return
+	}
+	s.history = h
+}
+
+// handleSpendHistory reports consumption bucketed over time. Master-key only,
+// like the rest of /spend: it discloses what every team and developer spent.
+//
+// It is a separate endpoint from /spend/keys rather than a parameter on it
+// because the two read different systems and answer different questions.
+// /spend/keys reads the enforcing ledger and answers "how close is this key to
+// its cap right now"; this reads the history and answers "what did they spend
+// in August". A key whose window rolled over this morning is at zero in the
+// first and unchanged in the second, and that is not a discrepancy.
+func (s *Server) handleSpendHistory(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w, r) {
+		return
+	}
+	s.writeSpendHistory(w, r)
+}
+
+func (s *Server) writeSpendHistory(w http.ResponseWriter, r *http.Request) {
+	if s.history == nil {
+		writeError(w, http.StatusNotFound, "not_found_error",
+			"spend history is not enabled; set observability.spend_history.dsn to keep one")
+		return
+	}
+	q, err := spendQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	buckets, err := s.history.Series(r.Context(), q)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	var totalCost, totalSavings float64
+	for _, b := range buckets {
+		totalCost += b.Cost
+		totalSavings += b.CacheSavings
+	}
+
+	// Every kind but one partitions the traffic: a request has one key, one
+	// deployment and one model group, so summing those buckets is summing the
+	// money once. A request has a *chain* of scopes and is charged to every
+	// level of it, so a scope report over every subject returns the same money
+	// at each depth — an organisation's total and its teams' totals, added
+	// together. That is correct data and a wrong sum, and the difference is
+	// invisible in a number, so the response says which one it handed back
+	// rather than leaving a reader to notice their spend has doubled.
+	overlapping := q.Kind == spend.KindScope && q.Subject == ""
+	note := "Buckets are UTC. Each request is counted once here, but a request is also charged to its key, its scopes, its deployment and its model group, so totals from different kinds cover the same money and must not be added together."
+	if overlapping {
+		note = "Buckets are UTC. This report covers every scope at every level, so an organisation and the teams inside it each appear: the buckets are right and their sum counts the same money once per level. Name a subject to total one scope."
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"kind":                string(q.Kind),
+		"subject":             q.Subject,
+		"interval":            string(q.Interval),
+		"from":                q.From,
+		"to":                  q.To,
+		"buckets":             buckets,
+		"count":               len(buckets),
+		"total_cost":          totalCost,
+		"total_cache_savings": totalSavings,
+		"overlapping":         overlapping,
+		"note":                note,
+	})
+}
+
+// handleSpendExport streams the per-request rows a query selects as CSV.
+//
+// CSV rather than JSON because of who asks for it: this is the artefact that
+// goes to whoever does chargeback, and it opens in the tool they already use.
+// It streams as it reads rather than building a document, because a month of a
+// fleet's traffic is millions of rows and materializing them would be a way to
+// ask the gateway to exhaust its own memory on request.
+func (s *Server) handleSpendExport(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w, r) {
+		return
+	}
+	if s.history == nil {
+		writeError(w, http.StatusNotFound, "not_found_error",
+			"spend history is not enabled; set observability.spend_history.dsn to keep one")
+		return
+	}
+	q, err := spendQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="spend-%s-%s.csv"`,
+		q.From.UTC().Format("20060102"), q.To.UTC().Format("20060102")))
+
+	cw := csv.NewWriter(w)
+	// The header is written before the first row rather than after the query
+	// succeeds, because the status line has already gone out: an error now
+	// truncates the file, and a truncated CSV with a header reads as an
+	// interrupted download rather than as a successful empty one.
+	if err := cw.Write([]string{
+		"at", "request_id", "key_hash", "key_alias", "scope", "model_group", "deployment",
+		"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+		"cost", "billable", "cache_savings",
+	}); err != nil {
+		s.log.Warn("write spend export", "error", err)
+		return
+	}
+	err = s.history.EachRow(r.Context(), q, func(row spend.Row) error {
+		return cw.Write([]string{
+			row.At.Format(time.RFC3339), row.RequestID, row.KeyHash, row.KeyAlias,
+			row.Scope, row.ModelGroup, row.Deployment,
+			strconv.Itoa(row.Usage.InputTokens), strconv.Itoa(row.Usage.OutputTokens),
+			strconv.Itoa(row.Usage.CacheReadTokens), strconv.Itoa(row.Usage.CacheWriteTokens),
+			strconv.FormatFloat(row.Cost, 'f', -1, 64),
+			strconv.FormatBool(row.Billable),
+			strconv.FormatFloat(row.CacheSavings, 'f', -1, 64),
+		})
+	})
+	cw.Flush()
+	if err == nil {
+		err = cw.Error()
+	}
+	if err != nil {
+		// Nothing can be said to the caller: the body is already going out with
+		// a 200. The truncated file is the signal, and this line is what says
+		// why.
+		s.log.Warn("spend export ended early", "error", err, "request_id", RequestIDFrom(r.Context()))
+	}
+}
+
+// spendQuery reads a history query out of the URL.
+//
+// Defaults are chosen so a bare call answers something useful: the last thirty
+// days by day, over every subject of the kind asked for. `kind` has no default
+// because the four dimensions cover the same money from different angles, and
+// picking one for the caller would be picking which number they meant.
+func spendQuery(r *http.Request) (spend.Query, error) {
+	v := r.URL.Query()
+	q := spend.Query{
+		Kind:     spend.Kind(v.Get("kind")),
+		Subject:  v.Get("subject"),
+		Interval: spend.Interval(v.Get("interval")),
+	}
+	if q.Kind == "" {
+		q.Kind = spend.KindScope
+	}
+	if q.Interval == "" {
+		q.Interval = spend.IntervalDay
+	}
+
+	now := time.Now().UTC()
+	q.To = now
+	q.From = now.AddDate(0, 0, -30)
+	for _, f := range []struct {
+		name string
+		dst  *time.Time
+	}{{"from", &q.From}, {"to", &q.To}} {
+		raw := v.Get(f.name)
+		if raw == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			// Also accepted as a bare date, because that is what somebody
+			// typing a month boundary by hand writes.
+			t, err = time.Parse("2006-01-02", raw)
+			if err != nil {
+				return q, fmt.Errorf("%s: must be RFC 3339 or YYYY-MM-DD, got %q", f.name, raw)
+			}
+		}
+		*f.dst = t.UTC()
+	}
+	if raw := v.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return q, fmt.Errorf("limit: must be a number, got %q", raw)
+		}
+		q.Limit = n
+	}
+	if err := q.Validate(); err != nil {
+		return q, err
+	}
+	return q, nil
 }

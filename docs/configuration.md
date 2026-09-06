@@ -409,6 +409,12 @@ See [prompt-caching.md](prompt-caching.md#when-an-upstream-refuses-an-annotation
 | `metrics` | `false` | Serves `GET /metrics`. |
 | `spend_store_path` | — | Persists budgets across restarts. |
 | `spend_flush_interval` | `30s` | |
+| `spend_history.dsn` | — | Postgres connection string. Empty keeps no history, so `/spend/history` and `/spend/export` answer 404. Carries a password: pass it as `${VAR}`. |
+| `spend_history.buffer` | `8192` | Completed requests that may wait to be written before further ones are dropped. |
+| `spend_history.batch_size` | `500` | Rows per transaction. Must not exceed the buffer. |
+| `spend_history.flush_interval` | `2s` | How long a row waits when traffic is too light to fill a batch, and therefore how stale a chart can be. |
+| `spend_history.max_conns` | `4` | Pool size. Writes go through one goroutine, so this is sized for reports. |
+| `spend_history.retention` | — | Drops per-request rows older than this, hourly. Zero keeps them. Day rollups are never pruned. Must be at least `24h`. |
 | `stream_usage` | `true` | Ask OpenAI-compatible upstreams to report usage on streamed replies. See [prompt-caching.md](prompt-caching.md#streamed-replies-report-nothing-unless-asked). |
 | `otlp.endpoint` | — | Collector base URL. Empty disables the exporter unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. |
 | `otlp.protocol` | `http/protobuf` | Or `http/json`. |
@@ -418,6 +424,14 @@ See [prompt-caching.md](prompt-caching.md#when-an-upstream-refuses-an-annotation
 | `otlp.service_name` | `ai-gateway` | Becomes the `service.name` resource attribute. |
 | `otlp.headers` | — | Sent on every export. |
 | `otlp.resource_attributes` | — | Added to every export. |
+
+`spend_history` is a second store beside the ledger, not a replacement for it.
+The ledger enforces budgets on the request path and reports the current window;
+this records a row per request and a day rollup, and reports a range. Writes are
+buffered, batched and best effort — a full buffer drops rows rather than making
+an inference request wait on the database that answers monthly questions, and
+`gateway_spend_history_dropped_total` is what says so. Full detail in
+**[observability.md](observability.md#spend-history)**.
 
 `stream_usage` adds `stream_options.include_usage` to a streamed request that did
 not set `stream_options` itself. Without it such a reply carries no usage at all
@@ -547,6 +561,7 @@ detail in **[audit.md](audit.md)**.
 | `POST /sso/renew` | the provider's refresh token |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/update`, `POST /key/delete` | master key |
 | `GET /spend/keys`, `GET /spend/scopes`, `GET /spend/deployments` | master key |
+| `GET /spend/history`, `GET /spend/export` | master key |
 | `POST /cache/purge` | master key |
 | `GET /ui/`, `POST /ui/api/session` | none — the sign-in page and the exchange itself. Registered only when `ui.enabled` |
 | `GET|POST /ui/api/*` | the browser session, plus `x-gateway-ui` on anything that changes state |

@@ -305,3 +305,35 @@ button.link { border: none; background: none; padding: 2px 4px; color: var(--acc
 
 .tree-indent-1 { padding-left: 20px; }
 .tree-indent-2 { padding-left: 40px; }
+
+/* The spend trend. A chart of one series, drawn as bars, so the axis is the
+   range and the only encoding is height. */
+.trend-head {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  min-height: 1.2em;
+}
+
+.trend-svg {
+  display: block;
+  width: 100%;
+  overflow: visible;
+}
+
+.trend-bar {
+  fill: var(--accent);
+  opacity: 0.75;
+  transition: opacity 0.1s ease;
+}
+
+.trend-bar:hover,
+.trend-bar.active {
+  opacity: 1;
+}
+
+.trend-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+}

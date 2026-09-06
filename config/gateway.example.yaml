@@ -491,6 +491,32 @@ observability:
   spend_store_path: ./data/spend.json
   spend_flush_interval: 30s
 
+  # Durable spend history: a row per request and a day rollup, in Postgres.
+  #
+  # Off unless a dsn is set, and separate from the ledger above rather than a
+  # mode of it. The ledger answers "may this request proceed" on the inference
+  # path and holds the current budget window; this answers "what did the
+  # Payments team spend last month", which the ledger cannot, because a window
+  # that has rolled over has taken its totals with it.
+  #
+  # Writes are buffered and batched off the request path. A full buffer drops
+  # rows and counts them in gateway_spend_history_dropped_total — deliberate,
+  # because the alternative is an inference request waiting on the database that
+  # answers monthly questions. No budget is escaped by a dropped row.
+  #
+  # Enables GET /spend/history, GET /spend/export (CSV) and the console's
+  # charts. See docs/observability.md#spend-history.
+  # spend_history:
+  #   dsn: ${GATEWAY_SPEND_DSN}
+  #   buffer: 8192
+  #   batch_size: 500
+  #   flush_interval: 2s
+  #   max_conns: 4
+  #   # Drops per-request rows older than this, hourly. Zero, the default, keeps
+  #   # them. Day rollups are never pruned, which is what makes this safe: a
+  #   # pruned month still reports its totals, only its export is gone.
+  #   retention: 2160h
+
   # Ask OpenAI-compatible upstreams to report usage on streamed replies, by
   # adding stream_options.include_usage to a request that did not set
   # stream_options itself. Without it a streamed reply carries no usage at all,

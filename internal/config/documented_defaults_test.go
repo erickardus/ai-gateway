@@ -77,6 +77,11 @@ model_list:
 		{"prompt_cache.inject", cfg.PromptCache.Inject, false},
 		{"prompt_cache.inject_min_bytes", cfg.PromptCache.InjectMinBytes, 4096},
 
+		{"observability.spend_history.buffer", cfg.Observability.SpendHistory.Buffer, 8192},
+		{"observability.spend_history.batch_size", cfg.Observability.SpendHistory.BatchSize, 500},
+		{"observability.spend_history.flush_interval", cfg.Observability.SpendHistory.FlushInterval.String(), "2s"},
+		{"observability.spend_history.max_conns", cfg.Observability.SpendHistory.MaxConns, int32(4)},
+
 		{"audit.enabled", cfg.Audit.On(), true},
 		{"audit.sink", cfg.Audit.SinkKind(), "stdout"},
 		{"audit.timeout", cfg.Audit.Timeout.String(), "5s"},

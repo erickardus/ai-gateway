@@ -106,7 +106,8 @@ claude    # /login → "Claude account with subscription"
 | `GET /health/liveliness`, `/health/readiness` | Probes, unauthenticated. |
 | `GET /sso/login`, `GET /sso/callback`, `POST /sso/exchange`, `POST /sso/renew` | SSO login, when `sso.issuer` is configured. Issues a virtual key from an OpenID Connect identity. |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/update`, `POST /key/delete` | Key management, master-key only. `update` edits a key in place, so blocking or re-budgeting one keeps the hash its spend is addressed by. |
-| `GET /spend/keys`, `GET /spend/scopes`, `GET /spend/deployments` | Usage and cost reports, master-key only. `/spend/scopes` reports each team's pooled spend. |
+| `GET /spend/keys`, `GET /spend/scopes`, `GET /spend/deployments` | Usage and cost reports over the current budget window, master-key only. `/spend/scopes` reports each team's pooled spend. |
+| `GET /spend/history`, `GET /spend/export` | What was spent over a date range, and the per-request rows behind it as CSV. Master-key only; needs `observability.spend_history.dsn`. |
 | `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. The same metrics push to an OpenTelemetry collector when `observability.otlp.endpoint` is set. |
 | `POST /cache/purge` | Empty the response cache, master-key only. |
 | `GET /ui/`, `/ui/api/*` | The admin console, when `ui.enabled`. A browser session, never a virtual key. |
@@ -133,6 +134,7 @@ interface waiting for it.
 | Streaming (SSE) | ✅ |
 | Health checks, timeouts | ✅ |
 | Spend tracking, cost attribution and budgets | ✅ |
+| Spend history — per-request rows, day rollups, range reports, CSV export | ✅ |
 | Response caching | ✅ |
 | Prompt caching — prefix affinity, breakpoints, savings reporting | ✅ |
 | Prompt-cache accounting for OpenAI-compatible providers | ✅ |
@@ -143,7 +145,7 @@ interface waiting for it.
 | Multi-instance shared state (Redis) | ✅ |
 | Multi-instance shared key store (Postgres) | ✅ |
 | Tamper-evident audit log, one chain across a fleet (Postgres) | ✅ |
-| Admin UI — health, traffic, keys, spend, budgets | ✅ |
+| Admin UI — health, traffic, keys, spend, budgets, spend trend | ✅ |
 | MCP gateway | ⏳ |
 
 There is **no cross-format translation** in v1: an Anthropic ingress routes only
@@ -186,6 +188,13 @@ at the next. See
 kinds, and
 [docs/observability.md](docs/observability.md#running-more-than-one-instance)
 for what is shared and what stays local.
+
+Spend history is separate again, and optional: `observability.spend_history.dsn`
+adds a row per request and a day rollup in Postgres, which is what makes
+`/spend/history`, the CSV export and the console's trend possible. Without it
+the gateway still enforces every budget and simply cannot say what was spent
+last month — the ledger holds the current window and nothing before it. See
+[docs/observability.md](docs/observability.md#spend-history).
 
 So does the audit log, for a reason that is easy to miss: with the `file` sink,
 two replicas do not share a chain, they keep two unrelated ones — each starting

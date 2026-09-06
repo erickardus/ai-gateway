@@ -48,6 +48,11 @@ type Server struct {
 	// always present and answers Enabled() for itself, so the recording path
 	// needs no nil check on the hot side of a request.
 	traffic *reqlog.Ring
+	// history is nil unless durable spend history is configured; see
+	// UseSpendHistory. Its absence leaves /spend/history and /spend/export
+	// answering 404, which is the honest answer: the gateway is enforcing
+	// budgets and keeping no record of last month.
+	history spend.History
 	// auditor is nil unless an audit sink is configured; see UseAudit. Its
 	// absence leaves the administrative handlers writing nothing, which is what
 	// a gateway with `audit.enabled: false` does.
@@ -206,6 +211,11 @@ func (s *Server) Handler() http.Handler {
 	// hierarchy answers with an empty list, which is a truthful answer and one
 	// fewer thing for a client to branch on.
 	mux.HandleFunc("GET /spend/scopes", s.handleSpendScopes)
+	// The two that read the durable history rather than the enforcing ledger.
+	// Registered unconditionally so a gateway without history says so, rather
+	// than answering 404 in the way an unknown path does.
+	mux.HandleFunc("GET /spend/history", s.handleSpendHistory)
+	mux.HandleFunc("GET /spend/export", s.handleSpendExport)
 	if s.cache != nil {
 		mux.HandleFunc("POST /cache/purge", s.handleCachePurge)
 	}

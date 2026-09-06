@@ -22,6 +22,17 @@ import (
 
 // Entry is one completed request's accounting.
 type Entry struct {
+	// At is when the request completed, and RequestID joins this entry to the
+	// access log line and the traffic view for the same request.
+	//
+	// Neither is used by the enforcing stores, which accumulate totals and have
+	// no per-request row to put them on. They are here because History does,
+	// and because the alternative — a second type carrying the same fields
+	// plus two — would be two things to keep in step at the one call site that
+	// fills them in.
+	At        time.Time
+	RequestID string
+
 	KeyHash      string
 	KeyAlias     string
 	ModelGroup   string
