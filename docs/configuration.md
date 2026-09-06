@@ -45,6 +45,7 @@ the router load-balances across. A group must be format-homogeneous.
 | `cost.output_per_1m` | — | |
 | `cost.cache_read_per_1m` | — | Required once `input_per_1m` is set. Not optional detail: Claude Code leans on prompt caching. |
 | `cost.cache_write_per_1m` | `input_per_1m` | Required on an `anthropic` deployment once `input_per_1m` is set. Optional on an `openai` one, where most providers write for free — but set it for Qwen or MiniMax, which charge. |
+| `params.supports_cache_control` | `false` | Declares that an `openai` upstream reads Anthropic's `cache_control` marker, which Qwen's explicit cache does and most of the ecosystem does not. Refused on an `anthropic` deployment, which always reads it, and on a passthrough one, which is never annotated. |
 | `cost.cache_write_1h_per_1m` | `cache_write_per_1m` | Anthropic's one-hour cache write, priced at 2x base input against the five-minute tier's 1.25x. |
 | `cost.long_context` | — | The higher rates a provider charges above a prompt size. Optional; see below. |
 
@@ -198,14 +199,18 @@ The **provider's** cache of a request's leading tokens, as distinct from
 | `affinity` | `true` | Pin requests sharing a cacheable prefix to the deployment that last served one. A preference, never a constraint. Inert in a group with one deployment. |
 | `affinity_ttl` | `5m` | How long a pin survives without use. Matches the lifetime of an ephemeral prompt-cache entry. A request declaring the one-hour cache is pinned for an hour regardless, so the pin does not expire before the entry it points at. |
 | `affinity_max_in_flight_lead` | `4` | A pin is passed over once the pinned deployment carries this many more in-flight requests than the idlest deployment that could serve it instead. `0` yields to any idler peer. |
-| `inject` | `false` | Place cache breakpoints on an Anthropic request that carries none of its own: the tools, the system prompt, and the top-level field that caches the conversation. |
+| `inject` | `false` | Place cache breakpoints on a request that carries none of its own. On an `anthropic` deployment: the tools, the system prompt, and the top-level field that caches the conversation. On an `openai` one declaring `supports_cache_control`: the leading system message. |
 | `inject_min_bytes` | `4096` | Prompts smaller than this are left unmarked; a provider would ignore the breakpoint anyway. Measured over tools, system **and** messages, since the conversation is cached too. |
 
 Which deployments a breakpoint reaches is decided per deployment, at dispatch. A
 passthrough deployment is never annotated — it must forward the caller's body
-unchanged — and neither is one speaking a format other than `anthropic`, so a
-mixed fleet serves both halves correctly: the API deployments get breakpoints
-and the subscription traffic is forwarded verbatim.
+unchanged — so a mixed fleet serves both halves correctly: the API deployments
+get breakpoints and the subscription traffic is forwarded verbatim.
+
+An `openai` deployment gets one only where `params.supports_cache_control` says
+its upstream reads the marker. Most of that ecosystem caches automatically and
+would ignore or refuse one; Alibaba's Qwen is the provider this is for. See
+[prompt-caching.md](prompt-caching.md#breakpoints-on-an-openai-format-upstream).
 
 `inject: true` is **refused at load** only where *no* deployment could carry a
 breakpoint, which is a setting that says one thing and does nothing.

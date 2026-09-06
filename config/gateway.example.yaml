@@ -84,6 +84,24 @@ model_list:
   # An OpenAI-format deployment, reachable at /v1/chat/completions. There is no
   # cross-format translation: an Anthropic ingress routes only to anthropic
   # deployments, and an OpenAI ingress only to openai ones.
+  # An OpenAI-format upstream whose cache is explicit rather than automatic.
+  # Alibaba's Qwen is the one that is: it reads Anthropic's cache_control marker
+  # and caches the prefix up to it, with a higher hit ratio than the implicit
+  # cache it otherwise falls back to. Most of this ecosystem is not like this,
+  # so it is declared per deployment and never guessed. The explicit cache
+  # charges for writes, so cost.cache_write_per_1m belongs on a deployment that
+  # turns it on.
+  # - model_name: qwen
+  #   params:
+  #     format: openai
+  #     api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+  #     model: qwen-max
+  #     auth_mode: api_key
+  #     auth_header: authorization
+  #     auth_scheme: Bearer
+  #     api_key: ${DASHSCOPE_API_KEY}
+  #     supports_cache_control: true
+
   - model_name: gpt
     params:
       format: openai

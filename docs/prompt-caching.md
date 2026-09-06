@@ -336,11 +336,68 @@ streamed reply reported no usage, so it is billed as nothing
 It is a log line rather than an error because the response itself is fine. Only
 the accounting is missing, and nothing else would ever mention it.
 
-**Breakpoint injection does not apply.** `cache_control` is an Anthropic
-construct, caching on an OpenAI-compatible provider is automatic, and there is
-nothing for the gateway to mark. An `openai` deployment is simply never sent a
-breakpoint, whatever `inject` says; configuration refuses the setting only where
-*no* deployment in the fleet could carry one.
+### Breakpoints on an OpenAI-format upstream
+
+For most of this ecosystem there is nothing to mark: OpenAI, Kimi, GLM and
+DeepSeek cache automatically and a marker would be ignored or refused. Alibaba's
+Qwen is the exception. It caches implicitly too, but its **explicit** cache — the
+one with the higher hit ratio and lower latency — is entered by marking a content
+block, so without a marker a caller only ever gets the implicit one.
+
+```yaml
+model_list:
+  - model_name: qwen
+    params:
+      format: openai
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      supports_cache_control: true      # this upstream reads the marker
+prompt_cache:
+  inject: true                          # and the gateway may place one
+```
+
+Both keys are required, and they say different things. `inject` is the operator
+allowing the gateway to edit a body at all; `supports_cache_control` is the
+operator naming an upstream that reads what it places. It is opt-in per
+deployment for two reasons: the gateway cannot ask an arbitrary
+OpenAI-compatible base URL which kind it is, and the explicit cache **charges for
+writes** the implicit one does not — so turning it on for traffic that does not
+reuse its prefix costs money rather than saving it.
+
+What it marks is not the Anthropic injection with a different gate. An
+OpenAI-format body has one markable place where an Anthropic one has three:
+
+| | Anthropic | OpenAI-format |
+|---|---|---|
+| The system prompt | top-level `system` field | the content of the leading `system` message |
+| The conversation | top-level `cache_control` field | nothing — that field is an Anthropic construct |
+| The tools | last tool, where it declares an `input_schema` | nothing — an OpenAI tool has no shape to check |
+
+A string `content` is promoted to the single text block that can hold a marker,
+which is what Alibaba's own documentation says to do. The marker goes *inside*
+the block, beside `type` and `text`, not on the message.
+
+Because there is no equivalent of Anthropic's automatic caching, a growing
+conversation is re-read at full price behind the prefix marker.
+[roadmap.md](roadmap.md) records that.
+
+Injection stands down where the conversation does not open with a `system` or
+`developer` message: a marker on the first user turn would cache a prefix that
+differs per conversation, buying a write and no read.
+
+**A wrong guess costs the optimization, never the accounting.** An upstream that
+refuses the marker is retried without it, as any annotation is — but a refusal
+now *demotes* rather than switching everything off, because the annotations are
+not equally important:
+
+```
+everything  →  only what billing depends on  →  nothing
+```
+
+`stream_options.include_usage` is in the second tier. Without it an
+OpenAI-compatible reply carries no usage anywhere, so the request is billed as
+nothing — and answering one refused breakpoint by dropping that too would trade a
+lost optimization for a silent lost bill. So the deployment loses its breakpoint
+and keeps its accounting, and only a second refusal stops annotation entirely.
 
 What the gateway does not yet do is pass OpenAI's `prompt_cache_key`, which
 biases that provider's own cache routing for callers sending the same prefix at
@@ -732,6 +789,10 @@ than on mechanism:
 | `TestCostAndSavingsReconstructTheUncachedBill`, `FuzzUsageAccounting` | savings that are not the difference between the bill and the one the same tokens would have run up uncached |
 | `TestInjectionCachesTheConversationToo` | a growing conversation re-read at full price behind a breakpoint that only covers tools and system |
 | `TestInjectionOnlyMarksAToolItUnderstands` | a breakpoint hung on a server tool or an MCP toolset, whose accepted shape the gateway cannot check |
+| `TestInjectOpenAIMarksTheLeadingSystemMessage`, `TestInjectOpenAIStandsDown` | a Qwen deployment left on the implicit cache, or a marker placed where it caches a prefix that never repeats |
+| `TestInjectOpenAIMarksNothingButTheSystemMessage` | an Anthropic-only field or an unmarkable tool shape sent to an OpenAI-format upstream on every request |
+| `TestOnlyTheDeclaredUpstreamIsMarked` | a fleet marking every OpenAI-format upstream rather than the one that reads a marker |
+| `TestARefusedBreakpointKeepsTheUsageOption` | a refused optimization taking the deployment's accounting with it, billing its streamed traffic at nothing |
 | `TestAnUpstreamThatRefusesAnAnnotationStillServesTheRequest` | a caller losing a request over an optimization it never asked for |
 | `TestInjectionMarksOnlyTheDeploymentsThatCanTakeIt` | a subscription body rewritten, or an API caller left uncached, because one fleet holds both |
 | `TestARefusedAnnotationIsNotAskedForAgain` | an upstream's refusal rediscovered on every request, doubling its call count for as long as it is configured |

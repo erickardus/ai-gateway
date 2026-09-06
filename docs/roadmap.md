@@ -116,6 +116,21 @@ says to raise it; a per-deployment minimum would say it for them. The
 per-deployment body transform it wanted now exists, so the remaining work is a
 `prompt_cache_min_bytes` on `DeploymentParams` read by the annotator.
 
+### 🟡 An OpenAI-format breakpoint caches the prefix, not the conversation
+
+Injection on an `openai` deployment declaring `supports_cache_control` marks the
+leading system message and nothing else. Anthropic's third breakpoint is the
+top-level `cache_control` field — the API's own automatic caching, which walks a
+marker forward as turns accumulate — and the OpenAI format has no equivalent.
+
+So a caller with a large system prompt and short turns gets the whole benefit,
+and one whose history grows re-reads that history at full price behind the prefix
+marker. Qwen documents up to four markers per request, so the shape of the fix is
+a second marker on a trailing message; the reason not to have taken it is the one
+that applies under Anthropic too — the gateway would have to move that marker
+itself every turn, and a marker it moves is a marker it must be sure the upstream
+accepts on whatever block ends the newest turn.
+
 ### 🟡 Injected breakpoints are always ephemeral, and always in the same three places
 
 Injection marks the end of the tools, the end of the system prompt and the
@@ -240,6 +255,10 @@ passthrough path.
 
 ### 🔴 OpenAI's `prompt_cache_key` is not sent
 
+Narrower than it first looks: the field is OpenAI's own, and none of Kimi, GLM,
+DeepSeek or Qwen accepts it. It biases routing inside one provider's fleet for a
+caller sending one prefix at high rates.
+
 An OpenAI-compatible provider caches automatically, keyed on the prefix itself.
 `prompt_cache_key` is an optional field that biases that provider's own internal
 routing, and it earns its keep for a caller sending one prefix at high rates —
@@ -344,6 +363,7 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Provider prompt cache | routed for, by default | LiteLLM has the same idea behind an opt-in `optional_pre_call_checks` entry, so the default arrangement pays a cache write on every hop |
 | OpenAI cached tokens | carved out of `prompt_tokens` | they are reported *inside* the input count, so adding them beside it bills every cached token twice. LiteLLM reaches the same answer by recomputing the input figure when the parts exceed the total |
 | A nested cache-write counter | read at either level | Qwen and MiniMax nest `cache_creation_input_tokens` inside `prompt_tokens_details` and charge for it. LiteLLM reads the nesting too, after a regression that billed those tokens as input |
+| A breakpoint on an OpenAI-format upstream | per-deployment capability | LiteLLM decides from a static per-provider table, which is right for the providers in it and silent about a self-hosted or unlisted one |
 | An unset cache-write price | falls back to input | a missing price means the provider names no separate one, not that the write was free. LiteLLM reaches the same conclusion for its savings figures |
 | Streamed OpenAI usage | asked for | a streamed reply reports none unless the request opted in, so the traffic is billed at zero |
 | A moving cache breakpoint | ignored when pinning | every Anthropic client walks one forward each turn, which would re-pin the conversation every time. LiteLLM's affinity key is the messages up to and including the last breakpoint, marker bytes and all, so its own injected breakpoint moves the key every turn |
