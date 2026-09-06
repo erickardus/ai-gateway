@@ -86,6 +86,9 @@ const (
 	MSSO                  = "gateway_sso_grants_total"
 	MAuditFailures        = "gateway_audit_write_failures_total"
 	MAuditSealed          = "gateway_audit_sealed"
+	MSpendHistoryRows     = "gateway_spend_history_rows_total"
+	MSpendHistoryDropped  = "gateway_spend_history_dropped_total"
+	MSpendHistoryPending  = "gateway_spend_history_pending"
 	MResponseCache        = "gateway_response_cache_requests_total"
 	MResponseCacheEntries = "gateway_response_cache_entries"
 

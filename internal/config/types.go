@@ -523,6 +523,48 @@ type SSORole struct {
 	Scope string `yaml:"scope"`
 }
 
+// SpendHistoryConfig configures durable spend history in Postgres.
+//
+// It is separate from the ledger above rather than a mode of it, because the
+// two answer different questions with different requirements. The ledger
+// answers "may this request proceed" on the inference path, for every request,
+// and wants one fast shared read; this answers "what did the Payments team
+// spend last month", for a person, and wants a range scan and an aggregate.
+// Neither store is good at the other's job — see internal/spend.
+//
+// Off unless a dsn is set. A gateway with none enforces budgets exactly as
+// before and simply cannot report on last month.
+type SpendHistoryConfig struct {
+	// DSN is the Postgres connection string. It carries a password, so it is
+	// expected to arrive as ${VAR}.
+	//
+	// It may be the same database as the key store or the audit chain, and the
+	// tables do not collide. Sharing with the audit chain is the one to avoid:
+	// this table is large and pruned, that one is small and evidence.
+	DSN string `yaml:"dsn"`
+	// Buffer is how many completed requests may wait to be written before
+	// further ones are dropped. Dropping is deliberate — a report must not
+	// block inference — and gateway_spend_history_dropped_total is how it
+	// becomes visible.
+	Buffer int `yaml:"buffer"`
+	// BatchSize is how many rows are written per transaction.
+	BatchSize int `yaml:"batch_size"`
+	// FlushInterval bounds how long a row waits when traffic is too light to
+	// fill a batch, and is therefore how stale a chart can be.
+	FlushInterval time.Duration `yaml:"flush_interval"`
+	// MaxConns caps the pool. Writes go through one goroutine, so this is
+	// sized for concurrent reports rather than for the writes.
+	MaxConns int32 `yaml:"max_conns"`
+	// Retention drops per-request rows older than this. Zero, the default,
+	// keeps them: deleting a financial record should be something an operator
+	// asked for. Day rollups are never pruned, which is what makes setting
+	// this safe — a pruned month still has its totals.
+	Retention time.Duration `yaml:"retention"`
+}
+
+// Enabled reports whether history is being recorded.
+func (s SpendHistoryConfig) Enabled() bool { return s.DSN != "" }
+
 // ObservabilityConfig controls logging, metrics and spend persistence.
 type ObservabilityConfig struct {
 	LogLevel  string `yaml:"log_level"`
@@ -534,6 +576,9 @@ type ObservabilityConfig struct {
 	SpendStorePath string `yaml:"spend_store_path"`
 	// SpendFlushInterval is how often the ledger is written to disk.
 	SpendFlushInterval time.Duration `yaml:"spend_flush_interval"`
+	// SpendHistory keeps a per-request row and a day rollup of every request,
+	// which the ledger above deliberately does not.
+	SpendHistory SpendHistoryConfig `yaml:"spend_history"`
 
 	// StreamUsage asks an OpenAI-compatible upstream to report token usage on a
 	// streamed reply, by adding stream_options.include_usage to requests that

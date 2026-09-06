@@ -173,6 +173,43 @@ export type SpendResponse = {
   cache_savings_note: string
 }
 
+// A bucket of consumption over one interval, from the durable spend history.
+//
+// It is a different endpoint from SpendResponse above, and deliberately: that
+// one reads the ledger that enforces budgets and reports the current window,
+// this one reads the history and reports what was spent whether or not the
+// window it fell in has since rolled over.
+export type SpendBucket = {
+  start: string
+  subject: string
+  alias?: string
+  requests: number
+  billable_requests: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  cost: number
+  cache_savings: number
+}
+
+export type SpendHistoryResponse = {
+  kind: string
+  subject: string
+  interval: string
+  from: string
+  to: string
+  buckets: SpendBucket[] | null
+  count: number
+  total_cost: number
+  total_cache_savings: number
+  // True when the buckets cover the same money at more than one level — a
+  // scope report over every subject returns an organisation and its teams —
+  // so total_cost is a sum of what was returned rather than what was spent.
+  overlapping: boolean
+  note: string
+}
+
 export type Usage = {
   input_tokens?: number
   output_tokens?: number

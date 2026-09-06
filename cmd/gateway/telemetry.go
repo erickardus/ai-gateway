@@ -11,6 +11,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/otlp"
 	"github.com/erickardus/ai-gateway/internal/router"
 	"github.com/erickardus/ai-gateway/internal/rstate"
+	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
 // gaugeReadTimeout bounds one live gauge read. A gauge that consults shared
@@ -27,7 +28,7 @@ const gaugeReadTimeout = 2 * time.Second
 // them into counters here would create a second copy to keep in step, and the
 // copy would be wrong exactly when something updated the original by a path
 // nobody remembered to instrument.
-func registerLiveGauges(reg *metrics.Registry, cfg *config.Config, rtr *router.Router, store auth.KeyStore, shared *rstate.Store, auditSink audit.Sink, version string) {
+func registerLiveGauges(reg *metrics.Registry, cfg *config.Config, rtr *router.Router, store auth.KeyStore, shared *rstate.Store, auditSink audit.Sink, history *spend.PostgresHistory, version string) {
 	if reg == nil {
 		return
 	}
@@ -103,6 +104,36 @@ func registerLiveGauges(reg *metrics.Registry, cfg *config.Config, rtr *router.R
 					sealed = 1
 				}
 				return []metrics.Point{{Value: sealed}}
+			})
+	}
+
+	// What the durable spend history has managed to write, and what it has had
+	// to throw away.
+	//
+	// Rows are a gauge of a running total rather than a counter for the reason
+	// the degradation counter below is: the number is owned by the writer and
+	// read from it. Dropped is the one to alert on — it is the difference
+	// between a chargeback that adds up and one that quietly does not, and it
+	// is invisible everywhere else, because dropping is exactly what keeps a
+	// reporting outage from becoming a serving one.
+	if history != nil {
+		reg.RegisterGauge(metrics.MSpendHistoryRows,
+			"Per-request spend rows written to the durable history since this process started.", "{row}",
+			func() []metrics.Point {
+				written, _, _ := history.Stats()
+				return []metrics.Point{{Value: float64(written)}}
+			})
+		reg.RegisterGauge(metrics.MSpendHistoryDropped,
+			"Spend rows dropped because the write buffer was full or the database stayed unreachable. Budgets are unaffected — enforcement does not read this table — but reports and chargeback are short by this many requests.", "{row}",
+			func() []metrics.Point {
+				_, dropped, _ := history.Stats()
+				return []metrics.Point{{Value: float64(dropped)}}
+			})
+		reg.RegisterGauge(metrics.MSpendHistoryPending,
+			"Spend rows waiting to be written. A value that stays near the configured buffer is the warning that comes before rows are dropped.", "{row}",
+			func() []metrics.Point {
+				_, _, pending := history.Stats()
+				return []metrics.Point{{Value: float64(pending)}}
 			})
 	}
 

@@ -16,3 +16,9 @@
 -- privileges — so the grant belongs with whoever owns the database, not with
 -- the container that starts it. See docs/audit.md.
 CREATE DATABASE audit OWNER gateway;
+
+-- And a third for spend history, for a different reason: this one is the large
+-- table. A row per request and a day rollup grow with traffic rather than with
+-- administration, and it is the only one of the three with a retention setting,
+-- so it wants its own storage, its own backup schedule and its own bad day.
+CREATE DATABASE spend OWNER gateway;

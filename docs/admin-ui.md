@@ -89,9 +89,23 @@ grouping SSO-issued keys by the person who holds them. One developer signing in
 from a laptop and a desktop holds two keys that share one spend subject, so
 offboarding them means revoking both; a flat list makes that a search problem.
 
-**Spend** — the three ledgers as tabs. A scope's row is the pool, not the sum of
-its keys: a key can leave a team and its historical spend does not leave with
-it, so the pool is its own ledger subject and is read as one.
+**Spend** — a daily trend over the last week, month or quarter, and the three
+ledgers as tabs beneath it. A scope's row is the pool, not the sum of its keys:
+a key can leave a team and its historical spend does not leave with it, so the
+pool is its own ledger subject and is read as one.
+
+The trend and the tables read different systems, and the page says so. The
+tables read the ledger that enforces budgets and show the window it is enforcing
+over, so a key whose window rolled over this morning shows as zero; the trend
+reads the durable history, where a day keeps its figure afterwards. That is what
+makes it a line rather than a number — and where no history is configured, the
+panel says which setting turns one on rather than drawing an empty chart. See
+[observability.md](observability.md#spend-history).
+
+The trend is charted over deployments whichever tab is open. A request has one
+deployment, so those buckets sum the money once; it is charged to every scope
+above it as well, so a scope chart over every subject would draw an organisation
+and its teams on top of each other and double the height of every bar.
 
 **Deployments** and **Organisations** — read-only. Both are declared in
 `gateway.yaml` and resolved at load, and a console that edited them would be a

@@ -157,13 +157,23 @@ all.
 
 ## Spend endpoints
 
-All three are **master-key only** — they disclose what every developer spent.
+All of them are **master-key only** — they disclose what every developer spent.
 
 | Endpoint | Reports |
 |---|---|
-| `GET /spend/keys` | Consumption per virtual key, with alias. |
-| `GET /spend/scopes` | Consumption per organisation, team and project. Empty where no hierarchy is configured. |
-| `GET /spend/deployments` | Consumption per deployment. |
+| `GET /spend/keys` | Consumption per virtual key, with alias. Current budget window. |
+| `GET /spend/scopes` | Consumption per organisation, team and project. Current budget window. Empty where no hierarchy is configured. |
+| `GET /spend/deployments` | Consumption per deployment. Current budget window. |
+| `GET /spend/history` | Consumption bucketed over a date range, from the durable history. |
+| `GET /spend/export` | The per-request rows a range selects, as CSV. |
+
+The first three and the last two read different systems, and the difference is
+the point rather than an implementation detail. The first three read the ledger
+that **enforces** budgets and report the window it is enforcing over, so a key
+whose window rolled over this morning reads as zero. The last two read the
+**history**, and report what was spent whether or not that window has since
+rolled over. Neither is wrong; they answer different questions, and a gateway
+with no history configured can only answer the first.
 
 `/spend/scopes` is read rather than derived. Summing the `/spend/keys` rows for
 a team gives a different number and a wrong one: a key can leave a team, and its
@@ -175,7 +185,132 @@ off the bill, against the same tokens charged as ordinary input. It sits beside
 cost rather than inside it — cost is what was charged, and this is what was not.
 See [prompt-caching.md](prompt-caching.md#seeing-whether-it-works).
 
-Revoking a key drops its ledger record and its rate-limit counter.
+Revoking a key drops its ledger record and its rate-limit counter. It does
+**not** drop the key's history: that record is what a chargeback is built from,
+and erasing it would make revoking a key a way to erase a month of somebody's
+costs.
+
+## Spend history
+
+```yaml
+observability:
+  spend_history:
+    dsn: ${GATEWAY_SPEND_DSN}
+```
+
+Off unless a dsn is set. With one, every completed request also becomes a row in
+`spend_requests` and is added to a day rollup in `spend_daily`, and the gateway
+can answer what a team spent last month, chart a trend, and export the rows
+behind a figure.
+
+### Why this is not the ledger
+
+The ledger answers *may this request proceed*: on the inference path, for every
+request, across a fleet. That is a current-window number, it wants to be one
+fast shared read, and Redis is the right shape for it. History answers *what did
+the Payments team spend in August*: off the request path, for a person, as a
+range scan and an aggregation — which is the shape Redis is worst at and a
+relational database is best at.
+
+Serving both from one store makes each worse. A Postgres ledger would put an
+`INSERT` and a `SUM` on every inference request; a Redis history would need a
+key per bucket per subject and still could not answer a range query without
+scanning them. So the two run side by side and every entry is recorded to both.
+
+### What it costs
+
+**Writes are buffered and batched.** Entries go onto a channel, one goroutine
+drains it, and each batch is one transaction that copies the rows in and upserts
+the day rollups they belong to. Accounting runs inline on the request path, so a
+synchronous `INSERT` per request would put a database round trip between a
+response being relayed and the handler returning.
+
+**A full buffer drops rows and counts them.** That is the deliberate end of the
+trade: a row here is a report, and blocking until the database caught up would
+make an inference request wait on the system that answers monthly questions. No
+budget is escaped by a dropped row — enforcement never reads this table.
+`gateway_spend_history_dropped_total` is how that becomes visible, and it is
+worth an alert: it is the difference between a chargeback that adds up and one
+that quietly does not. `gateway_spend_history_pending` is the warning that comes
+before it.
+
+**A failed write is retried, not discarded.** Batches that could not commit are
+carried forward and written with the next flush, so a database restart costs
+latency rather than rows. Five batches deep, the oldest is dropped and counted.
+
+**A database that cannot be reached at startup refuses to start**, like the key
+store and the audit chain. A gateway that came up regardless would serve traffic
+whose cost nothing was recording, which is discovered a month later, when the
+report is asked for.
+
+### Rollups, and why they are written with the rows
+
+`spend_daily` holds one row per subject per UTC day, maintained **in the same
+transaction as the rows it summarizes** rather than by a scheduled job. A job
+would be a second thing to run and to alert on, would leave today's figures
+missing until it ran, and would have to be idempotent against rows it might see
+twice. Doing it in the write transaction makes double counting impossible rather
+than merely unlikely: either both halves commit or neither does.
+
+It also means rollups outlive the rows, which is what makes `retention` safe to
+set — a pruned month still has its totals.
+
+### Reading it
+
+```bash
+# what each team spent last month, by day
+curl -s "localhost:4000/spend/history?kind=scope&from=2026-08-01&to=2026-09-01" \
+  -H "x-gateway-key: $GATEWAY_MASTER_KEY"
+
+# one team, by hour, to find a spike
+curl -s "localhost:4000/spend/history?kind=scope&subject=acme/payments&interval=hour&from=2026-08-14&to=2026-08-15" \
+  -H "x-gateway-key: $GATEWAY_MASTER_KEY"
+
+# the rows behind the figure, for whoever does chargeback
+curl -s "localhost:4000/spend/export?kind=scope&subject=acme/payments&from=2026-08-01&to=2026-09-01" \
+  -H "x-gateway-key: $GATEWAY_MASTER_KEY" -o august.csv
+```
+
+| Parameter | Meaning |
+|---|---|
+| `kind` | `key`, `scope`, `deployment` or `model`. Defaults to `scope`. |
+| `subject` | One key hash, scope id, deployment id or model group. Omitted, every subject of that kind. |
+| `from`, `to` | RFC 3339 or `YYYY-MM-DD`. `from` is inclusive and `to` exclusive, so consecutive months tile without counting a boundary request twice. Default: the last thirty days. |
+| `interval` | `day` (from the rollups) or `hour` (aggregated from the rows, so bounded by their retention). |
+| `limit` | Caps rows or buckets returned. Exports default to 10,000. |
+
+Two things to know before adding a total up.
+
+**Buckets are UTC days.** A fleet spans time zones, and a rollup keyed on the
+operator's local day would move under a gateway deployed in another region. A
+finance team that needs local months converts at the edge.
+
+**A scope report over every subject returns the same money more than once.** A
+request is charged to its key, to *every scope above it*, to its deployment and
+to its model group — the same deliberate duplication `/spend/scopes` makes, and
+for the same reason. So an organisation and the teams inside it each appear, and
+adding those buckets together counts the money once per level. The response says
+`"overlapping": true` when that is what it handed back. `key`, `deployment` and
+`model` each count a request exactly once, as does `scope` with a named subject.
+
+### Retention
+
+```yaml
+observability:
+  spend_history:
+    retention: 2160h    # 90 days of per-request rows
+```
+
+Zero, the default, keeps every row: deleting a financial record should be
+something an operator asked for rather than something that happens quietly. When
+set, rows older than the window are dropped hourly and **the day rollups are
+kept**, so a pruned month still reports its totals and only its per-request
+export is gone.
+
+The arithmetic worth doing first: a few hundred engineers running an agent all
+day produce on the order of 100,000 rows a day, or tens of millions a year at a
+few hundred bytes each. That is unremarkable for Postgres and not nothing, and
+it is the number that should decide the setting.
 
 ## Metrics
 

@@ -69,6 +69,10 @@ func (s *Server) registerUI(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+uiPrefix+"/api/spend/deployments", s.uiGated(func(w http.ResponseWriter, r *http.Request) {
 		s.writeSpend(w, r, func() ([]spend.Summary, error) { return s.ledger.Deployments(r.Context()) })
 	}))
+	// The console's charts. It reads the same history the master-key endpoint
+	// does, through the session cookie rather than through a key — the third
+	// credential plane, as everywhere else under /ui.
+	mux.HandleFunc("GET "+uiPrefix+"/api/spend/history", s.uiGated(s.writeSpendHistory))
 
 	mux.HandleFunc("POST "+uiPrefix+"/api/cache/purge", s.uiGated(func(w http.ResponseWriter, r *http.Request) {
 		if s.cache == nil {

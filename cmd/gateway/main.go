@@ -175,6 +175,33 @@ func run() error {
 		authn.UseKeyLimiter(shared.KeyLimiter())
 	}
 
+	// Durable spend history, alongside whichever ledger is enforcing budgets.
+	//
+	// Deliberately not a replacement for it: the ledger answers "may this
+	// request proceed" on the inference path and wants one fast shared read,
+	// while this answers "what did this team spend last month" and wants a
+	// range scan. WithHistory feeds one entry to both. See internal/spend.
+	var history *spend.PostgresHistory
+	if cfg.Observability.SpendHistory.Enabled() {
+		h := cfg.Observability.SpendHistory
+		history, err = spend.OpenPostgres(ctx, spend.PostgresOptions{
+			DSN:           h.DSN,
+			BufferSize:    h.Buffer,
+			BatchSize:     h.BatchSize,
+			FlushInterval: h.FlushInterval,
+			MaxConns:      h.MaxConns,
+			Retention:     h.Retention,
+		}, log)
+		if err != nil {
+			return err
+		}
+		// Closed before the pool it borrows nothing from, and after the server
+		// has stopped: Close drains what is buffered, so closing it early would
+		// throw away the rows for requests still being served.
+		defer func() { _ = history.Close() }()
+		ledger = spend.WithHistory(ledger, history)
+	}
+
 	// A shared cache means a hit on one instance serves them all; a local cache
 	// is per-process but needs no dependency.
 	var responses cache.Cache
@@ -203,7 +230,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initialize router: %w", err)
 	}
-	registerLiveGauges(reg, cfg, rtr, store, shared, auditSink, version)
+	registerLiveGauges(reg, cfg, rtr, store, shared, auditSink, history, version)
 
 	// Push the same snapshot /metrics serves to an OTLP collector. The two are
 	// independent: either, both or neither may be on, and both render the same
@@ -232,6 +259,9 @@ func run() error {
 
 	gw := server.New(cfg, authn, store, rtr, log, ledger, reg, shared, responses)
 	gw.UseAudit(auditSink)
+	if history != nil {
+		gw.UseSpendHistory(history)
+	}
 
 	if cfg.UI.Enabled {
 		sessions, err := ui.NewSessions(cfg.VirtualKeys.MasterKey, cfg.UI.SessionTTL)
@@ -306,6 +336,7 @@ func run() error {
 		"metrics", cfg.Observability.Metrics,
 		"otlp", cfg.Observability.OTLP.Endpoint,
 		"spend_store", cfg.Observability.SpendStorePath != "",
+		"spend_history", cfg.Observability.SpendHistory.Enabled(),
 		"shared_state", cfg.Redis.Enabled(),
 		"cache", cfg.Cache.Enabled,
 		"cache_scope", cfg.Cache.Scope,

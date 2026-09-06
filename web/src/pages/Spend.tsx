@@ -1,9 +1,27 @@
 import { useState } from 'react'
-import type { SpendResponse } from '../api'
+import type { SpendHistoryResponse, SpendResponse } from '../api'
 import { useApi } from '../useApi'
 import { Empty, Notice, PageHead, Panel } from '../components/ui'
+import { Trend } from '../components/Trend'
 import { count, dateTime, money, tokens } from '../format'
 import type { PageProps } from './Overview'
+
+// The trend is charted over deployments regardless of which tab is open, and
+// that is deliberate rather than lazy.
+//
+// A request has one deployment, so summing deployment buckets sums the money
+// once. It also has a *chain* of scopes and is charged to every level, so a
+// scope chart over every subject would draw an organisation and its teams on
+// top of each other and double the height of every bar. Keys would total
+// correctly too, but the trend asks one question — is the gateway's spend
+// rising — and that question has one answer whichever table sits below it.
+const TREND_KIND = 'deployment'
+
+const RANGES = [
+  { days: 7, label: '7d' },
+  { days: 30, label: '30d' },
+  { days: 90, label: '90d' },
+] as const
 
 const TABS = [
   { id: 'keys', label: 'Keys', note: 'What each virtual key consumed.' },
@@ -17,9 +35,23 @@ const TABS = [
 
 export function Spend({ onUnauthorized }: PageProps) {
   const [tab, setTab] = useState<(typeof TABS)[number]['id']>('keys')
+  const [days, setDays] = useState<number>(30)
   const { data, error } = useApi<SpendResponse>(`/spend/${tab}`, 15_000, onUnauthorized)
+  // Polled far more slowly than the ledger above it: this is a month of
+  // history, it moves by the day, and refetching every fifteen seconds would be
+  // a range scan every fifteen seconds for a picture that had not changed.
+  const from = new Date(Date.now() - days * 86_400_000).toISOString()
+  const history = useApi<SpendHistoryResponse>(
+    `/spend/history?kind=${TREND_KIND}&from=${encodeURIComponent(from)}&interval=day`,
+    120_000,
+    onUnauthorized,
+  )
   const active = TABS.find((t) => t.id === tab)!
   const rows = data?.entries ?? []
+  // A gateway keeping no history answers 404 here, which is not an error worth
+  // showing as one: it is a feature that was not switched on, and the panel
+  // says so in its own words.
+  const historyOff = history.error !== null && !history.data
 
   return (
     <>
@@ -30,6 +62,43 @@ export function Spend({ onUnauthorized }: PageProps) {
       </PageHead>
 
       {error && <Notice tone="bad">{error}</Notice>}
+
+      <Panel
+        title="Trend"
+        actions={
+          !historyOff && (
+            <div className="tabs">
+              {RANGES.map((r) => (
+                <button
+                  key={r.days}
+                  className={`tab${r.days === days ? ' active' : ''}`}
+                  onClick={() => setDays(r.days)}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          )
+        }
+        note={
+          historyOff
+            ? undefined
+            : 'Daily cost across the whole gateway, from the durable history. Unlike the table below, a day here keeps its figure after the budget window it fell in has rolled over, which is what makes it a line rather than a number.'
+        }
+      >
+        <div className="panel-body">
+          {historyOff ? (
+            <p className="hint">
+              No spend history is being kept, so there is nothing to chart. Set{' '}
+              <code className="mono">observability.spend_history.dsn</code> to record one — the
+              ledger below holds only the current budget window, which is why every figure on this
+              page is a number rather than a line.
+            </p>
+          ) : (
+            <Trend buckets={history.data?.buckets ?? []} />
+          )}
+        </div>
+      </Panel>
 
       <Panel
         title={

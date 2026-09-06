@@ -253,11 +253,43 @@ A key's budget window resets on its **first request after** the window elapses,
 not on a timer. A key that goes quiet for a month and returns sees its window
 reset then. Correct for enforcement, slightly surprising in reports.
 
-### 🔴 No spend history
+### ✅ No spend history
 
-The ledger holds current-window totals only. There is no per-request log and no
-way to answer "what did this key spend last Tuesday". That needs a real
-datastore behind `spend.Store`.
+Resolved. The ledger held current-window totals only, so there was no
+per-request record and no way to answer "what did this key spend last Tuesday" —
+and a window that had rolled over had taken its totals with it.
+
+`spend.PostgresHistory` keeps a row per request in `spend_requests` and a day
+rollup per subject in `spend_daily`, and `spend.WithHistory` records one entry
+to it and to the enforcing ledger at once. `GET /spend/history` reports a range
+by day or hour, `GET /spend/export` streams the rows behind a figure as CSV, and
+the console draws a trend.
+
+The load-bearing decision is that this is a **second store, not a replacement**.
+The ledger answers "may this request proceed" on the inference path, for every
+request, across a fleet: a current-window number that wants one fast shared
+read, which is what Redis is for. History answers "what did the Payments team
+spend in August": off the request path, for a person, as a range scan and an
+aggregation, which is what a relational database is for. Serving both from one
+store makes each worse — a Postgres ledger puts an `INSERT` and a `SUM` on every
+inference request, and a Redis history cannot answer a range query without
+scanning a key per bucket per subject.
+
+Two consequences worth stating. Writes are buffered and batched off the request
+path, and a full buffer **drops rows and counts them** rather than making an
+inference request wait on the database that answers monthly questions — no
+budget is escaped by a dropped row, and
+`gateway_spend_history_dropped_total` is what makes the loss visible. And the
+day rollups are upserted in the same transaction as the rows they summarize,
+which makes double counting impossible rather than unlikely, and lets `retention`
+prune the rows while every historical total survives.
+
+Three things it does not do. Buckets are UTC days, so a finance team wanting
+local months converts at the edge. A scope report over every subject returns the
+same money once per level of the hierarchy — correct data, wrong sum — and says
+`"overlapping": true` rather than leaving a reader to notice. And a revoked key
+keeps its history: forgetting the window is enforcement, forgetting the history
+would be a way to erase a month of somebody's costs.
 
 ---
 
@@ -529,17 +561,23 @@ it that sets a session cookie instead of returning a key to a CLI, and a role
 that grants console access. Until then the form should stay behind an operator's
 deliberate `enabled: true`.
 
-### 🔴 The console has no history, so it has no charts
+### ✅ The console has no history, so it has no charts
 
-The ledger holds current-window totals only, so every figure the console shows
-is a number rather than a line. "Spend is $40" cannot be read as rising or
-falling, which is the question an operator actually has.
+Resolved by the same work. Every figure the console showed was a number rather
+than a line, so "spend is $40" could not be read as rising or falling — the
+question an operator actually has.
 
-The traffic ring is not the answer: it is a fixed thousand requests in one
-process, sized for reading rather than archiving. Charting needs the same thing
-[No spend history](#-no-spend-history) needs — time-bucketed rollups behind
-`spend.Store` — after which the console is a rendering problem rather than a
-data one.
+The spend page now leads with a daily trend, drawn from the history over a
+seven, thirty or ninety day range, and says so plainly when no history is being
+kept rather than showing an empty chart. It is hand-drawn SVG: one series of
+bars, whose whole implementation is shorter than the import of a charting
+library would be.
+
+The trend is charted over deployments whichever tab is open, which is deliberate.
+A request has one deployment, so those buckets sum the money once; it has a
+*chain* of scopes and is charged to every level, so a scope chart over every
+subject would draw an organisation and its teams on top of each other and double
+the height of every bar.
 
 ### 🟡 Sign-in is not rate limited
 
