@@ -125,23 +125,33 @@ func TestPricingCacheSavings(t *testing.T) {
 			want:  2.7,
 		},
 		{
-			// A cache write costs a premium and saves nothing; only reads do.
-			name:  "cache writes save nothing",
+			// A write costs a premium over the input it replaces, so a turn that
+			// established a cache and read nothing back is worse off than one
+			// that never cached. 3.75 against 3.00 on a million tokens.
+			name:  "a write with no read costs the premium",
 			price: p,
 			usage: Usage{CacheWriteTokens: 1_000_000},
-			want:  0,
+			want:  -0.75,
+		},
+		{
+			// The one-hour tier is twice input rather than 1.25x, so the same
+			// unread write costs more to have made.
+			name:  "a long write with no read costs twice the premium",
+			price: Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75, CacheWrite1hPer1M: 6},
+			usage: Usage{CacheWriteTokens: 1_000_000, CacheWrite1hTokens: 1_000_000},
+			want:  -3,
+		},
+		{
+			// The healthy shape: a large read against the small write that
+			// extends the entry. This is what the figure is for.
+			name:  "a read against a small write is a net saving",
+			price: p,
+			usage: Usage{CacheReadTokens: 1_000_000, CacheWriteTokens: 100_000},
+			want:  2.7 - 0.075,
 		},
 		{
 			name:  "an unpriced deployment saves nothing it can report",
 			price: Pricing{},
-			usage: Usage{CacheReadTokens: 1_000_000},
-			want:  0,
-		},
-		{
-			// Pricing a cache read above input is a configuration mistake, not
-			// a loss to report.
-			name:  "a cache read priced above input is not a negative saving",
-			price: Pricing{InputPer1M: 1, CacheReadPer1M: 5},
 			usage: Usage{CacheReadTokens: 1_000_000},
 			want:  0,
 		},

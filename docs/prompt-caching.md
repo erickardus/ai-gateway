@@ -118,16 +118,43 @@ false` already does that.
 
 The pin's TTL is refreshed on every success, so it lives as long as the
 conversation is active and lapses once it stops — the same lifetime the upstream
-gives the cache entry itself. The default matches Anthropic's ephemeral cache.
+gives the cache entry itself. `affinity_ttl` defaults to five minutes, matching
+Anthropic's ephemeral cache.
+
+**A caller using the one-hour cache gets a one-hour pin**, whatever
+`affinity_ttl` says, because the pin is meant to expire with the entry it points
+at rather than on a schedule of its own. The extended entry costs twice base
+input to write against the default tier's 1.25x, and it survives gaps the
+default would not: a conversation that pauses for ten minutes still has its
+cache, and a five-minute pin would hand that turn back to the load balancer to
+write the same prefix somewhere else at the same premium. It is the most
+expensive cache miss the gateway can arrange, on the traffic that opted into the
+most expensive writes.
+
+The declared lifetime is read from the breakpoints on the tools and the system
+prompt. Both are small and already walked to fingerprint the request, and the
+API requires longer-lived entries to appear before shorter-lived ones, so a
+one-hour breakpoint that coexists with any five-minute one is in one of them.
+Scanning the message history for the remaining case would cost a walk over the
+largest part of every request, which is the expense the fingerprint itself is
+shaped to avoid.
 
 ### What it does not do
 
 - **Nothing, in a group with one deployment.** There is nothing to choose
-  between, so the fingerprint is not even computed. `/health` reports affinity
-  as inactive with a note saying why, rather than claiming to be doing something
-  it is not.
+  between, so the fingerprint is not even computed. The question is asked per
+  group rather than per fleet: a gateway fronting one balanced group and a dozen
+  single-deployment ones would otherwise hash the prompt of every request to all
+  thirteen. `/health` reports affinity as inactive, with a note saying why,
+  where no group can use it.
 - **Nothing across model groups.** Pins are scoped by group, so a fallback hop
   never inherits a pin for an upstream that cannot serve it.
+- **Nothing about deployments that already share a cache.** A cache belongs to
+  the workspace behind the credential and is scoped to one model at one
+  endpoint, so two deployments in a group could only share one by naming the
+  same endpoint and model — which is [refused at
+  load](configuration.md) as a duplicate. Two spellings of one endpoint would
+  slip through, and cost some balance rather than any cache hits.
 
 ### More than one instance
 
@@ -262,11 +289,46 @@ prompt_cache:
   inject_min_bytes: 4096
 ```
 
-With this on, the gateway places an ephemeral breakpoint at the end of the tool
-definitions and at the end of the system prompt — together, the part of a
-request that does not change between turns. It never marks a trailing message: a
-breakpoint there is rewritten every turn, buying one cache write for every cache
-read.
+With this on, the gateway marks three things.
+
+**The end of the tool definitions and the end of the system prompt** get an
+explicit ephemeral breakpoint. Together they are the part of a request that does
+not change between turns, and each is a read point that survives whatever
+happens later in the conversation.
+
+**The conversation itself** is covered by the top-level `cache_control` field —
+Anthropic's automatic caching, which places a breakpoint on the last cacheable
+block and walks it forward as turns accumulate. This is the part the explicit
+markers cannot reach. Render order is tools, then system, then messages, so a
+breakpoint at the end of the system prompt caches everything before it and
+nothing after; the messages are what grow. A caller with a modest system prompt
+and a long history would re-read all of it at full price on every turn while
+`/metrics` reported that caching was working.
+
+It has to be the top-level field rather than a marker written into the body,
+because the marker belongs on the newest turn and would be rewritten on the next
+one — buying a cache write for every read, which is the anti-pattern this whole
+page is about. Only the API can move a breakpoint forward without rewriting it,
+and the top-level field is how it is asked to.
+
+That is three of the four breakpoints a request may hold. The two documented
+ways of combining an explicit marker with the automatic one are both refused
+with a 400 — all four slots taken, and an explicit marker on the last block
+whose lifetime differs from the top-level field's — and neither can arise here:
+injection runs only on a body carrying no breakpoint of its own, and every
+marker it places has the same default lifetime.
+
+Two things it deliberately does not mark:
+
+- **A trailing message**, for the reason above.
+- **A tool it does not recognize.** A custom tool declares an `input_schema`. A
+  server tool — web search, code execution — is named by `type` alone, and an
+  MCP toolset names a server; both are shapes the gateway cannot validate a
+  breakpoint against, and hanging one there to find out costs a 400 on a request
+  that would otherwise have been served. Skipping it costs nothing, which is
+  what makes this cheap rather than a compromise: tools render before the system
+  prompt, so the breakpoint at the end of the system prompt already caches every
+  tool in the list whether or not the tools themselves carry one.
 
 It is skipped entirely when:
 
@@ -283,11 +345,39 @@ It is skipped entirely when:
   word in a message. The cheap byte scan is kept as a prefilter, so the walk
   that distinguishes a member name from prose runs only where the name appears
   at all.
-- the prefix is **shorter than `inject_min_bytes`**. Anthropic ignores a
+- the prompt is **shorter than `inject_min_bytes`**. Anthropic ignores a
   breakpoint below its own minimum rather than rejecting it, so this is an
-  economy, not a correctness rule.
+  economy, not a correctness rule. It is measured over the whole prompt — tools,
+  system and messages — because that is what the automatic breakpoint caches;
+  measuring only the static prefix would skip exactly the caller this is for,
+  whose history is long and whose system prompt is not.
 - the request is **not in the Anthropic format**. Breakpoints are an Anthropic
   construct.
+
+The top-level field additionally goes only to `/v1/messages`. Token counting
+takes the same body and answers a different question, so asking it to cache the
+conversation is at best inert.
+
+### When an upstream refuses an annotation
+
+Every marker above is something the gateway added for its own benefit; the
+caller asked for none of it. Which shapes a breakpoint may legally hang on
+differs between providers and changes over time — the legacy Bedrock
+integration, for one, rejects the top-level field outright — so a wrong guess
+must not cost the request.
+
+An upstream answering `400` to an annotated body gets one more attempt with the
+request exactly as it arrived, and the deployment is named once in the log:
+
+```
+upstream rejected an annotated request; retrying without the annotation costs a
+round trip on every request until it is turned off
+  deployment=… remedy=unset prompt_cache.inject or observability.stream_usage
+```
+
+The retry applies to any body the gateway annotated, the streamed-usage field
+included. A `400` the caller earned is still relayed to them, wording intact —
+it just costs one extra round trip to establish that it was theirs.
 
 A string `system` prompt has nowhere to hang a breakpoint, so it is promoted to
 the single text block the API defines it to equal. The original string's bytes
@@ -369,7 +459,25 @@ In `/spend`:
 tokens charged as ordinary input. It sits **beside** cost rather than inside it:
 cost is what was charged, and this is what was not. It needs the price of the
 deployment that actually served each request, which is why it is recorded here
-rather than inferred from a hit rate on a dashboard.
+rather than inferred from a hit rate on a dashboard. The identity it is defined
+by:
+
+```
+cost + cache_savings = what the same tokens would have cost as ordinary input
+```
+
+**It is net of the write premium, so it goes negative.** Establishing an entry
+costs 1.25x base input, or twice at the one-hour tier, so a request that writes
+a cache and never reads one back is dearer than the same request with no caching
+at all. That is every turn of a conversation scattered across deployments, and
+reported as a floor of zero it was invisible: the reads that never happened
+simply did not appear, and the premiums paid for them looked like ordinary cost.
+A negative `cache_savings` says prompt caching is currently costing this operator
+money, which is the one number on this page that says it outright.
+
+A steady negative is worth alerting on. Read it beside
+`gateway_prompt_affinity_total{outcome="miss"}`: the affinity metric says routing
+is scattering conversations, and this says what that is worth.
 
 Passthrough traffic reports no savings, for the same reason it reports no cost:
 the caller's own subscription was billed, not the operator.
@@ -440,4 +548,10 @@ than on mechanism:
 | `TestPromptAffinitySurvivesAMovingBreakpoint` | a conversation re-pinned every turn because its caller's breakpoint moved, which is what every Anthropic client's does |
 | `TestFingerprintIgnoresAMovingBreakpoint`, `TestFingerprintReadsTheTurnThatDiscriminates` | the same at the fingerprint, in both wire formats |
 | `TestAStreamedOpenAIConversationIsBilled`, `TestAnUnaskedStreamIsBilledAtNothing` | a streamed OpenAI-compatible workload billed at zero, and the proof that the first test would notice |
+| `TestAWriteNobodyReadsIsReportedAsALoss` | a cache written and never read reported as a saving, or as nothing, rather than as the premium it cost |
+| `TestCostAndSavingsReconstructTheUncachedBill`, `FuzzUsageAccounting` | savings that are not the difference between the bill and the one the same tokens would have run up uncached |
+| `TestInjectionCachesTheConversationToo` | a growing conversation re-read at full price behind a breakpoint that only covers tools and system |
+| `TestInjectionOnlyMarksAToolItUnderstands` | a breakpoint hung on a server tool or an MCP toolset, whose accepted shape the gateway cannot check |
+| `TestAnUpstreamThatRefusesAnAnnotationStillServesTheRequest` | a caller losing a request over an optimization it never asked for |
+| `TestAPinOutlivesTheCacheItPointsAt` | a five-minute pin on a one-hour cache, which pays the long tier's premium twice |
 | `TestPricingValidation` | a cost model that would misreport what caching costs, accepted at load |

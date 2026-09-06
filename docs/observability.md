@@ -18,6 +18,13 @@ This distinction is why `Totals` reports `requests` and `billable_requests`
 separately: a key serving only subscription traffic is visibly busy but free,
 which a bare cost of `0` could not distinguish from an idle key.
 
+`cache_savings`, reported beside cost, is **net of the prompt cache's write
+premium** and therefore goes negative where caches were written and never read
+back. That is not a fault to filter out: it is the report that caching is
+currently costing more than it saves, which is what a conversation scattered
+across deployments looks like in money. See
+[prompt-caching.md](prompt-caching.md#seeing-whether-it-works).
+
 There is one way a billable request can nonetheless record nothing, and it is
 worth knowing before reading a zero as good news: a **streamed**
 OpenAI-compatible reply carries no usage unless the request asked for it. The

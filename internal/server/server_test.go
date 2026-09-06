@@ -26,6 +26,10 @@ import (
 
 const testVirtualKey = "sk-vk-TESTKEY"
 
+// soloModel is the group harnessOpts.soloGroup registers: one deployment, in a
+// fleet that also holds a balanced group.
+const soloModel = "solo-model"
+
 // captured records what a fake upstream received.
 type captured struct {
 	mu     sync.Mutex
@@ -88,7 +92,11 @@ type harnessOpts struct {
 	// extraDeployments adds further upstreams to the same model group, which is
 	// what gives prompt-prefix affinity something to choose between.
 	extraDeployments int
-	promptCache      config.PromptCacheConfig
+	// soloGroup registers a second model group holding a single deployment, so a
+	// test can ask what a fleet does for a group with nothing to choose between
+	// while another group is balanced.
+	soloGroup   bool
+	promptCache config.PromptCacheConfig
 	// format selects the wire protocol of the deployments, defaulting to
 	// anthropic. An openai group is reachable at /v1/chat/completions and is
 	// named separately, since a group's deployments must share one format.
@@ -183,6 +191,11 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		extraParams.APIBase = extra.URL
 		deployments = append(deployments, config.Deployment{
 			ModelName: opts.modelGroup(), Params: extraParams, Weight: intPtr(1),
+		})
+	}
+	if opts.soloGroup {
+		deployments = append(deployments, config.Deployment{
+			ModelName: soloModel, Params: params, Weight: intPtr(1),
 		})
 	}
 	if mode == "api_key" {

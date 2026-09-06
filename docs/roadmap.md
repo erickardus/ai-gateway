@@ -83,6 +83,35 @@ response-cache key, so it was not worth doing before the feature had users.
 Claude Code places its own breakpoints, so nothing is lost on the traffic this
 gateway primarily carries.
 
+### 🟡 A deployment that refuses an annotation is retried, not remembered
+
+Injection marks three positions, one of which — the top-level `cache_control`
+field — is not accepted everywhere; the legacy Bedrock integration rejects it.
+An upstream answering `400` to an annotated body is retried once with the
+request as it arrived, so the caller never loses a request, and the deployment
+is named in the log.
+
+The round trip is paid on **every** request until an operator acts on that line.
+Remembering the rejection per deployment would avoid it, but injection is decided
+before the router picks one, so the body would have to be annotated per attempt
+rather than per request — the same per-deployment body transform the entry above
+wants. Until then the log line is the mechanism, which is why it names the
+setting to unset rather than just reporting the status.
+
+### 🟡 A declared one-hour cache is read from the prefix only
+
+A pin lives as long as the cache entry it points at, so a request declaring the
+one-hour breakpoint is pinned for an hour rather than for `affinity_ttl`. The
+declaration is read from the tools and the system prompt, which are small and
+already walked. The API requires longer-lived entries to precede shorter-lived
+ones, so a one-hour breakpoint sharing a request with any five-minute one is in
+those; a request whose *only* breakpoint is a one-hour marker further into the
+message history is pinned for the default instead.
+
+Catching that case means walking the whole message array on every request, which
+is the cost the fingerprint is deliberately shaped to avoid. The consequence is a
+pin that lapses early on an unusual request shape, not a wrong one.
+
 ### 🟡 Prefix affinity concentrates load, bounded by in-flight rather than share
 
 A fingerprint covers a request's prefix, not a conversation, so all traffic
@@ -254,6 +283,9 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Streamed OpenAI usage | asked for | a streamed reply reports none unless the request opted in, so the traffic is billed at zero |
 | A moving cache breakpoint | ignored when pinning | every Anthropic client walks one forward each turn, which would re-pin the conversation every time |
 | Anthropic cache-write tiers | priced apart | the one-hour cache costs 2x base input against the five-minute tier's 1.25x |
+| Pin lifetime | follows the declared cache TTL | a five-minute pin on a one-hour entry pays the long tier's premium a second time |
+| `cache_savings` | net of the write premium | a gross figure cannot report that caching is costing money, which is what scattering looks like |
+| Injected breakpoints | tools, system **and** the conversation | marking only the static prefix re-reads a growing history at full price every turn |
 | Passthrough cost | not billed to the operator | it is billed to the caller's subscription |
 
 ---

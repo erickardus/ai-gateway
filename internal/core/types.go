@@ -216,22 +216,34 @@ func (p Pricing) write1hRate() float64 {
 	return p.CacheWrite1hPer1M
 }
 
-// CacheSavings returns what the prompt cache saved on this request: the
-// difference between what its cache reads cost and what those same tokens would
-// have cost as ordinary input.
+// CacheSavings returns what the prompt cache did to this request's bill: what
+// its cached tokens would have cost as ordinary input, less what they actually
+// cost.
+//
+// It is a **net** figure, so the write premium is inside it. Establishing an
+// entry costs more than the input it replaces — 1.25x at the five-minute tier,
+// twice at the one-hour one — so a request that writes a cache and never reads
+// it back is dearer than one that did not cache at all. This reports that as a
+// negative number rather than as nothing, and the sign is the point: a
+// conversation scattered across deployments pays writes nobody reads, and there
+// is no other figure in the gateway where that failure shows up as money. A
+// counter of it, summed over a window, is the whole feature's report card.
+//
+// The identity it is defined by, which the accounting fuzz test holds it to:
+//
+//	Cost(u) + CacheSavings(u) == Cost(everything billed as ordinary input)
 //
 // It is reported rather than inferred because the alternative — reading a cache
 // hit rate off a dashboard and multiplying — needs the price of the deployment
 // that actually served each request, which a dashboard does not have. Zero when
-// the deployment is unpriced, and never negative: a cache read priced above
-// input is a configuration mistake, not a loss to report.
+// the deployment is unpriced, since there is then no arithmetic to do.
 func (p Pricing) CacheSavings(u Usage) float64 {
 	const perMillion = 1_000_000.0
-	saved := float64(u.CacheReadTokens) * (p.InputPer1M - p.CacheReadPer1M) / perMillion
-	if saved < 0 {
-		return 0
-	}
-	return saved
+	write1h := min(max(u.CacheWrite1hTokens, 0), u.CacheWriteTokens)
+	write5m := u.CacheWriteTokens - write1h
+	return float64(u.CacheReadTokens)*(p.InputPer1M-p.CacheReadPer1M)/perMillion +
+		float64(write5m)*(p.InputPer1M-p.CacheWritePer1M)/perMillion +
+		float64(write1h)*(p.InputPer1M-p.write1hRate())/perMillion
 }
 
 // Cost returns what a request cost, in the currency the pricing was written in.

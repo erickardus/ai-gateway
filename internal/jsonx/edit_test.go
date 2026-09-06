@@ -410,3 +410,59 @@ func FuzzStripObjectKey(f *testing.F) {
 		}
 	})
 }
+
+func TestHasMember(t *testing.T) {
+	cases := []struct {
+		name   string
+		object string
+		key    string
+		want   bool
+	}{
+		{"present", `{"name":"read","input_schema":{"type":"object"}}`, "input_schema", true},
+		{"absent", `{"type":"web_search_20260209","name":"web_search"}`, "input_schema", false},
+		{"empty object", `{}`, "input_schema", false},
+		// Only the object's own members count. A schema nested deeper describes
+		// something else, and reading it as this object's own would mistake a
+		// server tool for a custom one.
+		{"nested only", `{"type":"mcp_toolset","config":{"input_schema":{}}}`, "input_schema", false},
+		{"name in a value", `{"description":"takes an input_schema"}`, "input_schema", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := HasMember([]byte(tc.object), tc.key)
+			if err != nil {
+				t.Fatalf("HasMember: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("HasMember = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMemberValues(t *testing.T) {
+	doc := []byte(`{"system":[{"text":"s","cc":{"type":"ephemeral","ttl":"1h"}}],` +
+		`"tools":[{"name":"a","cc":{"type":"ephemeral"}}],"note":"cc is not a member here"}`)
+
+	got, err := MemberValues(doc, "cc")
+	if err != nil {
+		t.Fatalf("MemberValues: %v", err)
+	}
+	want := []string{`{"type":"ephemeral","ttl":"1h"}`, `{"type":"ephemeral"}`}
+	if len(got) != len(want) {
+		t.Fatalf("got %d values, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if string(got[i]) != want[i] {
+			t.Errorf("value %d = %s, want %s", i, got[i], want[i])
+		}
+	}
+
+	none, err := MemberValues([]byte(`{"a":1}`), "cc")
+	if err != nil {
+		t.Fatalf("MemberValues: %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("got %q, want none", none)
+	}
+}

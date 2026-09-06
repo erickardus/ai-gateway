@@ -186,9 +186,10 @@ const longSystem = "You are a careful assistant. " +
 	"Repeat this guidance until it is long enough to be worth caching upstream. "
 
 func TestInjectMarksToolsAndSystem(t *testing.T) {
-	body := []byte(`{"model":"m","system":[{"type":"text","text":"` + longSystem + `"}],"tools":[{"name":"a"},{"name":"b"}],"messages":[]}`)
+	body := []byte(`{"model":"m","system":[{"type":"text","text":"` + longSystem + `"}],` +
+		`"tools":[{"name":"a","input_schema":{"type":"object"}},{"name":"b","input_schema":{"type":"object"}}],"messages":[]}`)
 
-	got, changed, err := Inject(body, 0)
+	got, changed, err := Inject(body, 0, true)
 	if err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
@@ -203,10 +204,10 @@ func TestInjectMarksToolsAndSystem(t *testing.T) {
 	}
 	// The breakpoint belongs at the end of the prefix, not the start: a
 	// breakpoint on the first tool caches only that tool.
-	if !strings.Contains(string(got), `{"name":"b","cache_control":{"type":"ephemeral"}}`) {
+	if !strings.Contains(string(got), `{"name":"b","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}`) {
 		t.Errorf("breakpoint is not on the last tool: %s", got)
 	}
-	if strings.Contains(string(got), `{"name":"a","cache_control"`) {
+	if strings.Contains(string(got), `{"name":"a","input_schema":{"type":"object"},"cache_control"`) {
 		t.Errorf("breakpoint placed on a tool that is not last: %s", got)
 	}
 	if !strings.Contains(string(got), `"messages":[]`) {
@@ -220,7 +221,7 @@ func TestInjectMarksToolsAndSystem(t *testing.T) {
 func TestInjectPromotesAStringSystemPrompt(t *testing.T) {
 	body := []byte(`{"model":"m","system":` + jsonString(longSystem) + `}`)
 
-	got, changed, err := Inject(body, 0)
+	got, changed, err := Inject(body, 0, true)
 	if err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
@@ -276,7 +277,7 @@ func TestInjectLeavesRequestsAlone(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, changed, err := Inject([]byte(tt.body), tt.minBytes)
+			got, changed, err := Inject([]byte(tt.body), tt.minBytes, true)
 			if err != nil {
 				t.Fatalf("Inject: %v", err)
 			}
@@ -294,7 +295,7 @@ func TestInjectLeavesRequestsAlone(t *testing.T) {
 // optimization that cannot be applied is not a reason to refuse a request.
 func TestInjectReturnsTheOriginalBodyOnError(t *testing.T) {
 	body := []byte(`{"system":`)
-	got, changed, err := Inject(body, 0)
+	got, changed, err := Inject(body, 0, true)
 	if err == nil {
 		t.Error("err = nil, want an error for a malformed body")
 	}
@@ -311,7 +312,7 @@ func TestInjectReturnsTheOriginalBodyOnError(t *testing.T) {
 func TestInjectPreservesEverythingElse(t *testing.T) {
 	body := []byte("{\n  \"model\": \"m\",\n  \"temperature\": 1.50,\n  \"system\": [{\"type\":\"text\",\"text\":\"" + longSystem + "\"}]\n}")
 
-	got, changed, err := Inject(body, 0)
+	got, changed, err := Inject(body, 0, true)
 	if err != nil || !changed {
 		t.Fatalf("Inject: changed=%v err=%v", changed, err)
 	}
@@ -365,7 +366,7 @@ func BenchmarkInject(b *testing.B) {
 	b.SetBytes(int64(len(body)))
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, changed, err := Inject(body, 4096); err != nil || !changed {
+		if _, changed, err := Inject(body, 4096, true); err != nil || !changed {
 			b.Fatalf("changed=%v err=%v", changed, err)
 		}
 	}
@@ -474,5 +475,169 @@ func TestFingerprintStillSeparatesDifferentPrompts(t *testing.T) {
 	}
 	if fingerprint(body("one prompt")) == fingerprint(body("another prompt")) {
 		t.Error("two different system prompts share a fingerprint")
+	}
+}
+
+// TestInjectionCachesTheConversationToo covers what the two explicit
+// breakpoints cannot reach.
+//
+// Render order is tools, then system, then messages, so a breakpoint at the end
+// of the system prompt caches everything before it and nothing after. The
+// messages are the part that grows, and a caller with a long history and a
+// modest system prompt would re-read all of it at full price on every turn while
+// the gateway reported that caching was working. The top-level field is
+// Anthropic's automatic caching, which walks its own breakpoint forward as the
+// conversation grows — the one marker a gateway cannot maintain by writing it
+// into the body.
+func TestInjectionCachesTheConversationToo(t *testing.T) {
+	body := []byte(`{"model":"m","system":[{"type":"text","text":"` + longSystem + `"}],` +
+		`"messages":[{"role":"user","content":"one"},{"role":"assistant","content":"two"}]}`)
+
+	got, changed, err := Inject(body, 0, true)
+	if err != nil || !changed {
+		t.Fatalf("Inject: changed=%v err=%v", changed, err)
+	}
+
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(got, &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(doc["cache_control"]) != `{"type":"ephemeral"}` {
+		t.Errorf("no automatic breakpoint on the request: %s", got)
+	}
+	// It is a field of the request, never a marker written into a turn: one
+	// written there would be rewritten on the next turn, buying a cache write
+	// for every read.
+	for i, m := range decodeMessages(t, got) {
+		if strings.Contains(string(m), "cache_control") {
+			t.Errorf("message %d was marked: %s", i, m)
+		}
+	}
+}
+
+// Token counting takes the same body and answers a different question, so it is
+// not asked to cache anything.
+func TestInjectionLeavesTheConversationAloneWhenNotAsked(t *testing.T) {
+	body := []byte(`{"model":"m","system":[{"type":"text","text":"` + longSystem + `"}],` +
+		`"messages":[{"role":"user","content":"one"}]}`)
+
+	got, changed, err := Inject(body, 0, false)
+	if err != nil || !changed {
+		t.Fatalf("Inject: changed=%v err=%v", changed, err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(got, &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := doc["cache_control"]; ok {
+		t.Errorf("an automatic breakpoint was added where none was asked for: %s", got)
+	}
+}
+
+// TestInjectionOnlyMarksAToolItUnderstands covers the tools a request may carry
+// besides the caller's own.
+//
+// A server tool is named by type and declares no input_schema; so does an MCP
+// toolset. Hanging a breakpoint on one to find out whether it is accepted costs
+// a 400 on a request that would otherwise have been served, and skipping it
+// costs nothing: tools render before the system prompt, so the breakpoint at the
+// end of the system prompt already caches every tool in the list.
+func TestInjectionOnlyMarksAToolItUnderstands(t *testing.T) {
+	cases := []struct {
+		name       string
+		tools      string
+		wantMarked bool
+	}{
+		{"custom tool last", `[{"name":"read","input_schema":{"type":"object"}}]`, true},
+		{"server tool last", `[{"name":"read","input_schema":{"type":"object"}},{"type":"web_search_20260209","name":"web_search"}]`, false},
+		{"mcp toolset last", `[{"type":"mcp_toolset","mcp_server_name":"docs"}]`, false},
+		{"code execution only", `[{"type":"code_execution_20260521","name":"code_execution"}]`, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"m","system":[{"type":"text","text":"` + longSystem + `"}],` +
+				`"tools":` + tc.tools + `,"messages":[{"role":"user","content":"hi"}]}`)
+
+			got, changed, err := Inject(body, 0, true)
+			if err != nil || !changed {
+				t.Fatalf("Inject: changed=%v err=%v", changed, err)
+			}
+
+			var doc struct {
+				Tools  []json.RawMessage `json:"tools"`
+				System []json.RawMessage `json:"system"`
+			}
+			if err := json.Unmarshal(got, &doc); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			last := doc.Tools[len(doc.Tools)-1]
+			if marked := strings.Contains(string(last), "cache_control"); marked != tc.wantMarked {
+				t.Errorf("last tool marked = %v, want %v: %s", marked, tc.wantMarked, last)
+			}
+			// Whatever happens among the tools, the system prompt is marked —
+			// and that breakpoint caches the tools regardless.
+			if !strings.Contains(string(doc.System[len(doc.System)-1]), "cache_control") {
+				t.Errorf("the system prompt lost its breakpoint: %s", got)
+			}
+		})
+	}
+}
+
+func decodeMessages(t *testing.T, body []byte) []json.RawMessage {
+	t.Helper()
+	var doc struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return doc.Messages
+}
+
+// TestDeclaredCacheLifetimeIsRead covers what decides how long a pin lives.
+func TestDeclaredCacheLifetimeIsRead(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "no breakpoints at all",
+			body: `{"model":"m","system":[{"type":"text","text":"s"}]}`,
+		},
+		{
+			name: "the default five-minute breakpoint",
+			body: `{"model":"m","system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}]}`,
+		},
+		{
+			name: "a one-hour breakpoint on the system prompt",
+			body: `{"model":"m","system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`,
+			want: true,
+		},
+		{
+			name: "a one-hour breakpoint on the tools",
+			body: `{"model":"m","tools":[{"name":"a","input_schema":{},"cache_control":{"type":"ephemeral","ttl":"1h"}}],` +
+				`"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}]}`,
+			want: true,
+		},
+		{
+			// The lifetime is a member of a breakpoint, not a word in a prompt.
+			name: "prose about the one-hour cache",
+			body: `{"model":"m","system":[{"type":"text","text":"use ttl 1h with cache_control for long prefixes"}],` +
+				`"messages":[{"role":"user","content":"is the 1h ttl worth it?"}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fields, err := jsonx.Peek([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("Peek: %v", err)
+			}
+			if got := DeclaresLongCacheTTL(fields); got != tc.want {
+				t.Errorf("DeclaresLongCacheTTL = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

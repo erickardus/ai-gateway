@@ -188,6 +188,13 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 	if r.prompt.AffinityEnabled() && overrides.PromptPrefix != "" && len(deployments) > 1 {
 		affinityKey = model + "\x00" + overrides.PromptPrefix
 	}
+	// A pin should outlive nothing and outlast nothing: it is meant to expire
+	// with the cache entry it points at, which is longer than the default where
+	// the caller asked for the extended lifetime.
+	pinTTL := r.prompt.AffinityTTL
+	if overrides.PromptPinTTL > pinTTL {
+		pinTTL = overrides.PromptPinTTL
+	}
 	pinned := ""
 	if affinityKey != "" {
 		id, ok, err := r.state.Affinity(ctx, affinityKey)
@@ -231,7 +238,7 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 				// the TTL keeps an active conversation pinned for as long as it
 				// runs, and lets it lapse once it stops — the same lifetime the
 				// upstream gives the cache entry itself.
-				if err := r.state.SetAffinity(ctx, affinityKey, dep.ID(), r.prompt.AffinityTTL); err != nil {
+				if err := r.state.SetAffinity(ctx, affinityKey, dep.ID(), pinTTL); err != nil {
 					r.log.Warn("record prompt affinity", "deployment", dep.ID(), "error", err)
 				}
 			}

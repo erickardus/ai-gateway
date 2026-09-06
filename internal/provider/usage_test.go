@@ -344,8 +344,21 @@ func FuzzUsageAccounting(f *testing.F) {
 		if cost := price.Cost(usage); cost < 0 {
 			t.Fatalf("negative cost %v from %+v", cost, usage)
 		}
-		if saved := price.CacheSavings(usage); saved < 0 {
-			t.Fatalf("negative savings %v from %+v", saved, usage)
+		// Savings are net, so a negative one is a real report rather than a
+		// fault. What must hold on every input is the identity they are defined
+		// by: what was charged plus what caching took off it is the bill the
+		// same tokens would have run up as ordinary input. The bound keeps the
+		// sum below from overflowing on counters no provider would report.
+		const sane = 1 << 40
+		if usage.InputTokens < sane && usage.CacheReadTokens < sane && usage.CacheWriteTokens < sane {
+			uncached := core.Usage{
+				InputTokens:  usage.InputTokens + usage.CacheReadTokens + usage.CacheWriteTokens,
+				OutputTokens: usage.OutputTokens,
+			}
+			got, want := price.Cost(usage)+price.CacheSavings(usage), price.Cost(uncached)
+			if diff := got - want; diff > 1e-6*(1+abs(want)) || diff < -1e-6*(1+abs(want)) {
+				t.Fatalf("cost plus savings = %v, want the uncached bill %v, from %+v", got, want, usage)
+			}
 		}
 	})
 }
@@ -371,4 +384,11 @@ func TestOneFigureUnderTwoNamesIsNotAdded(t *testing.T) {
 	if got != want {
 		t.Errorf("usage = %+v, want %+v", got, want)
 	}
+}
+
+func abs(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
 }

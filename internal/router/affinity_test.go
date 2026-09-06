@@ -519,3 +519,70 @@ func TestAffinityKeepsThePinWhenLoadCannotBeRead(t *testing.T) {
 		}
 	}
 }
+
+// ttlRecorder captures the lifetime each pin is written with.
+type ttlRecorder struct {
+	StateStore
+	ttl time.Duration
+}
+
+func (r *ttlRecorder) SetAffinity(ctx context.Context, fingerprint, id string, ttl time.Duration) error {
+	r.ttl = ttl
+	return r.StateStore.SetAffinity(ctx, fingerprint, id, ttl)
+}
+
+// TestAPinOutlivesTheCacheItPointsAt covers the caller who paid for the extended
+// prompt cache.
+//
+// The one-hour entry costs twice base input to write, against 1.25x for the
+// default. A pin that expired after five minutes would hand the next turn back
+// to the load balancer while that entry was still warm, and the deployment it
+// landed on would write the same prefix again at the same premium — the exact
+// arithmetic affinity exists to prevent, on the traffic where it costs most.
+func TestAPinOutlivesTheCacheItPointsAt(t *testing.T) {
+	tests := []struct {
+		name string
+		ttl  time.Duration
+		want time.Duration
+	}{
+		{"a default breakpoint pins for the configured lifetime", 0, time.Minute},
+		{"a one-hour breakpoint pins for an hour", time.Hour, time.Hour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &ttlRecorder{StateStore: NewMemState()}
+			exec := &fakeExec{replies: map[string]error{}}
+			r, _ := buildAffinityRouter(t, []int{1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+			res, err := r.Route(context.Background(), "g", &provider.Request{},
+				Overrides{PromptPrefix: "prefix-a", PromptPinTTL: tt.ttl})
+			if err != nil {
+				t.Fatalf("Route: %v", err)
+			}
+			res.Response.Body.Close()
+
+			if state.ttl != tt.want {
+				t.Errorf("pin written with a %s lifetime, want %s", state.ttl, tt.want)
+			}
+		})
+	}
+}
+
+// A request must never shorten a pin below what the operator configured: the
+// lifetime is a floor the caller may raise, not a value it may set.
+func TestAShorterRequestedPinDoesNotShortenTheConfiguredOne(t *testing.T) {
+	state := &ttlRecorder{StateStore: NewMemState()}
+	exec := &fakeExec{replies: map[string]error{}}
+	r, _ := buildAffinityRouter(t, []int{1, 1}, config.PromptCacheConfig{AffinityTTL: 10 * time.Minute}, 0, exec, state)
+
+	res, err := r.Route(context.Background(), "g", &provider.Request{},
+		Overrides{PromptPrefix: "prefix-a", PromptPinTTL: time.Second})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	res.Response.Body.Close()
+
+	if state.ttl != 10*time.Minute {
+		t.Errorf("pin written with a %s lifetime, want the configured 10m", state.ttl)
+	}
+}

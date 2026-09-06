@@ -84,7 +84,7 @@ func (s *Server) writeSpend(w http.ResponseWriter, r *http.Request, fetch func()
 		"total_cost":          totalCost,
 		"total_cache_savings": totalSavings,
 		"note":                "Cost covers only deployments the operator pays for. Passthrough traffic bills the caller's own subscription and is reported as usage with no cost.",
-		"cache_savings_note":  "What the provider's prompt cache took off the bill, against the same tokens charged as ordinary input. It is not included in cost, which is what was actually charged.",
+		"cache_savings_note":  "What the provider's prompt cache took off the bill, against the same tokens charged as ordinary input. Net of the write premium, so it goes negative where caches were written and never read back — which is what a conversation scattered across deployments costs. It is not included in cost, which is what was actually charged.",
 	})
 }
 

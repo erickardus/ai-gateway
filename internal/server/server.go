@@ -39,11 +39,10 @@ type Server struct {
 	// pricing maps a deployment ID to its price and whether the operator pays
 	// it, resolved once at construction rather than searched per request.
 	pricing map[string]deploymentPricing
-	// balanced reports whether any model group holds more than one deployment.
-	// Prompt-prefix fingerprinting is skipped when none does: with a single
-	// upstream per group every request already lands on the same prompt cache,
-	// so hashing the prefix of every request would buy nothing.
-	balanced bool
+	// pinnable reports, per model group, whether a prompt-prefix pin has
+	// anything to decide. Fingerprinting is skipped for a group where it does
+	// not: hashing the prefix of every request would buy nothing.
+	pinnable map[string]bool
 	// mispriced records the deployments already warned about for reporting a
 	// token counter their cost model does not price. The warning belongs in a
 	// log once per deployment, not once per request.
@@ -52,6 +51,10 @@ type Server struct {
 	// streamed request with no usage at all. Like mispriced, it is a fact about
 	// the deployment rather than the request, so it is worth one log line.
 	unmeasured sync.Map
+	// rejectedAnnotation records the deployments already warned about for
+	// refusing a body the gateway annotated. Also once per deployment: it is a
+	// fact about what that upstream accepts.
+	rejectedAnnotation sync.Map
 }
 
 // deploymentPricing is what one deployment costs the operator.
@@ -73,18 +76,46 @@ func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr
 			billable: d.Params.AuthMode != core.AuthModePassthrough,
 		}
 	}
-	balanced := false
-	for _, group := range cfg.Groups() {
-		if len(group) > 1 {
-			balanced = true
-			break
-		}
+	groups := cfg.Groups()
+	pinnable := make(map[string]bool, len(groups))
+	for name, group := range groups {
+		pinnable[name] = worthPinning(group)
 	}
 	return &Server{
 		cfg: cfg, auth: authn, store: store, router: rtr, log: log,
 		ledger: ledger, metrics: reg, pricing: pricing, shared: shared, cache: responses,
-		balanced: balanced,
+		pinnable: pinnable,
 	}
+}
+
+// worthPinning reports whether pinning a prefix inside this group can change
+// where a request lands.
+//
+// It is a question about the group rather than the fleet, which is the whole
+// reason it is asked per group: a gateway fronting one balanced group and a
+// dozen single-deployment ones would otherwise fingerprint the prompt of every
+// request to all thirteen, and twelve of those have one upstream to choose from.
+//
+// A group of two or more is enough, because deployments within one are
+// guaranteed to be distinct upstream targets. A prompt cache belongs to the
+// workspace behind the credential and is scoped to one model at one endpoint, so
+// two deployments could only share one by naming the same endpoint and model —
+// which is refused at load as a duplicate. What remains is two spellings of one
+// endpoint, which nothing here can detect and which costs some balance rather
+// than any cache hits.
+func worthPinning(group []*config.Deployment) bool {
+	return len(group) > 1
+}
+
+// anyPinnable reports whether affinity is doing anything anywhere, which is what
+// /health distinguishes from affinity merely being configured.
+func (s *Server) anyPinnable() bool {
+	for _, ok := range s.pinnable {
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Handler returns the fully wired HTTP handler.

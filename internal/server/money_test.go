@@ -454,9 +454,12 @@ func TestSavingsAreWhatWasNotChargedRatherThanAGuess(t *testing.T) {
 	}
 
 	price := harnessOpts{}.defaultPricing()
-	// Two of the three turns read the cache; each saved the gap between input
-	// and cache-read pricing on the whole prefix.
-	want := 2 * float64(prefix) * (price.InputPer1M - price.CacheReadPer1M) / 1e6
+	// Two of the three turns read the cache, each saving the gap between input
+	// and cache-read pricing on the whole prefix. The first turn wrote it, at a
+	// premium over the input it replaced — the figure is net, so that comes back
+	// off.
+	want := 2*float64(prefix)*(price.InputPer1M-price.CacheReadPer1M)/1e6 +
+		float64(prefix)*(price.InputPer1M-price.CacheWritePer1M)/1e6
 
 	rows, err := h.ledger.Deployments(t.Context())
 	if err != nil {
@@ -736,4 +739,47 @@ func TestAnUnaskedStreamIsBilledAtNothing(t *testing.T) {
 	}
 	// Four turns of real traffic, worth real money, recorded as nothing at all.
 	t.Logf("four streamed turns over a 25k-token prefix billed $0.00")
+}
+
+// TestAWriteNobodyReadsIsReportedAsALoss covers the direction the savings figure
+// could not previously express.
+//
+// Writing a cache costs more than the input it replaces. A request that
+// establishes an entry and never reads one back is therefore dearer than the
+// same request with no caching at all — which is exactly what every turn of a
+// scattered conversation looks like. Reported as a floor of zero it was
+// invisible; reported as the negative number it is, it is the one figure that
+// says prompt caching is currently costing this operator money.
+func TestAWriteNobodyReadsIsReportedAsALoss(t *testing.T) {
+	const written = 40_000
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"id":"msg_1","type":"message","usage":`+
+				`{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,`+
+				`"cache_creation_input_tokens":%d}}`, written)
+		},
+	})
+
+	if rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody("be helpful", "hi"))); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	price := harnessOpts{}.defaultPricing()
+	want := float64(written) * (price.InputPer1M - price.CacheWritePer1M) / 1e6
+	if want >= 0 {
+		t.Fatal("this test needs a write priced above input to mean anything")
+	}
+
+	rows, err := h.ledger.Deployments(t.Context())
+	if err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("deployment rows = %d, want 1", len(rows))
+	}
+	if !nearly(rows[0].CacheSavings, want) {
+		t.Errorf("cache savings = %.6f, want %.6f", rows[0].CacheSavings, want)
+	}
 }

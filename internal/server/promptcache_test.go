@@ -2,9 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/erickardus/ai-gateway/internal/config"
@@ -25,7 +27,7 @@ func promptBody(system string, turns ...string) string {
 	body, err := json.Marshal(map[string]any{
 		"model":    "anthropic-claude",
 		"system":   []any{map[string]any{"type": "text", "text": system}},
-		"tools":    []any{map[string]any{"name": "read_file"}},
+		"tools":    []any{map[string]any{"name": "read_file", "input_schema": map[string]any{"type": "object"}}},
 		"messages": messages,
 	})
 	if err != nil {
@@ -101,11 +103,67 @@ func TestInjectionMarksTheStablePrefix(t *testing.T) {
 	}
 
 	_, forwarded, _, _ := h.seen.get()
-	if n := strings.Count(string(forwarded), `"cache_control"`); n != 2 {
-		t.Fatalf("upstream saw %d breakpoints, want 2:\n%s", n, forwarded)
+	// Three: the end of the tools, the end of the system prompt, and the
+	// top-level field that follows the conversation. One short of the cap the
+	// API imposes, which is the room a caller's own would have needed — and a
+	// caller with any of its own is never injected into at all.
+	if n := strings.Count(string(forwarded), `"cache_control"`); n != 3 {
+		t.Fatalf("upstream saw %d breakpoints, want 3:\n%s", n, forwarded)
 	}
 	if !json.Valid(forwarded) {
 		t.Fatalf("forwarded body is not valid JSON: %s", forwarded)
+	}
+
+	var doc struct {
+		CacheControl json.RawMessage   `json:"cache_control"`
+		System       []json.RawMessage `json:"system"`
+		Tools        []json.RawMessage `json:"tools"`
+		Messages     []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(forwarded, &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(doc.CacheControl) != `{"type":"ephemeral"}` {
+		t.Errorf("the conversation is not cached: %s", forwarded)
+	}
+	for _, section := range []struct {
+		name   string
+		blocks []json.RawMessage
+	}{{"system", doc.System}, {"tools", doc.Tools}} {
+		if !strings.Contains(string(section.blocks[len(section.blocks)-1]), "cache_control") {
+			t.Errorf("the last %s block carries no breakpoint: %s", section.name, forwarded)
+		}
+	}
+	for i, m := range doc.Messages {
+		if strings.Contains(string(m), "cache_control") {
+			t.Errorf("message %d was marked; a breakpoint on a turn is rewritten on the next: %s", i, m)
+		}
+	}
+}
+
+// Token counting takes the same body as inference and answers a different
+// question. Asking it to cache the conversation is at best inert, so the field
+// that does is confined to the endpoint it belongs to.
+func TestCountTokensIsNotAskedToCacheTheConversation(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		promptCache: config.PromptCacheConfig{Inject: true},
+	})
+
+	h.do(t, claudeCodeRequest("/v1/messages/count_tokens", promptBody(longSystem, "hi")))
+
+	_, forwarded, _, _ := h.seen.get()
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(forwarded, &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := doc["cache_control"]; ok {
+		t.Errorf("count_tokens was asked to cache the conversation: %s", forwarded)
+	}
+	// The explicit breakpoints still go on, since they describe the prompt
+	// rather than ask the endpoint to do anything.
+	if !strings.Contains(string(forwarded), "cache_control") {
+		t.Errorf("no breakpoint reached count_tokens at all: %s", forwarded)
 	}
 }
 
@@ -218,8 +276,10 @@ func TestSpendReportsPromptCacheSavings(t *testing.T) {
 		t.Fatalf("got %d entries, want 1", len(report.Entries))
 	}
 
-	// 2000 cache-read tokens at $3.00/M input against $0.30/M cache read.
-	const want = 2000 * (3.0 - 0.3) / 1_000_000
+	// 2000 cache-read tokens at $3.00/M input against $0.30/M cache read, less
+	// the premium on the 100 tokens this request wrote: $3.75/M against the
+	// $3.00/M they would have cost as input.
+	const want = 2000*(3.0-0.3)/1_000_000 + 100*(3.0-3.75)/1_000_000
 	if diff := report.Entries[0].CacheSavings - want; diff > 1e-12 || diff < -1e-12 {
 		t.Errorf("cache_savings = %v, want %v", report.Entries[0].CacheSavings, want)
 	}
@@ -358,5 +418,103 @@ func TestPromptAffinitySurvivesAMovingBreakpoint(t *testing.T) {
 		if got := rec.Header().Get("x-gateway-deployment"); got != pinned {
 			t.Errorf("turn %d went to %s, leaving the warm cache on %s", i+2, got, pinned)
 		}
+	}
+}
+
+// TestAnUpstreamThatRefusesAnAnnotationStillServesTheRequest covers the risk
+// injection creates rather than the money it saves.
+//
+// The gateway annotates a body for its own benefit: the caller asked for none of
+// it. Which shapes a breakpoint may legally hang on differs between providers
+// and changes over time — the legacy Bedrock integration refuses the top-level
+// field outright — so a guess that turns out to be wrong must cost a round trip
+// rather than the request.
+func TestAnUpstreamThatRefusesAnAnnotationStillServesTheRequest(t *testing.T) {
+	var calls atomic.Int64
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		promptCache: config.PromptCacheConfig{Inject: true},
+		upstream: func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			calls.Add(1)
+			if strings.Contains(string(body), "cache_control") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"cache_control: unexpected field"}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"msg_1","type":"message","usage":{"input_tokens":5,"output_tokens":9}}`)
+		},
+	})
+
+	rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody(longSystem, "hi")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s: the caller lost a request over an optimization it never asked for", rec.Code, rec.Body.String())
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream saw %d requests, want 2: the annotated attempt and the plain retry", got)
+	}
+
+	_, forwarded, _, _ := h.seen.get()
+	if strings.Contains(string(forwarded), "cache_control") {
+		t.Errorf("the retry carried the annotation that was just refused: %s", forwarded)
+	}
+	if logs := h.logBuf.String(); !strings.Contains(logs, "upstream rejected an annotated request") {
+		t.Errorf("nothing in the log names the deployment paying an extra round trip:\n%s", logs)
+	}
+}
+
+// A 400 the caller earned is still a 400. Retrying it once costs a round trip;
+// hiding it would cost the caller their error.
+func TestACallersOwnBadRequestIsStillRelayed(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		promptCache: config.PromptCacheConfig{Inject: true},
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: required"}}`)
+		},
+	})
+
+	rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody(longSystem, "hi")))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "max_tokens: required") {
+		t.Errorf("the upstream's own wording did not reach the caller: %s", rec.Body.String())
+	}
+}
+
+// TestAffinityIsSkippedForAGroupWithNothingToChoose covers a fleet holding both
+// kinds of group at once.
+//
+// Fingerprinting a prompt is not free — it hashes the system blocks, the tool
+// definitions and the opening turn of every request — and it buys nothing for a
+// group with one deployment, where every request already lands on the same
+// upstream and therefore the same cache. Asking the question per group rather
+// than per fleet is what keeps a single balanced group from imposing that cost
+// on all the others.
+func TestAffinityIsSkippedForAGroupWithNothingToChoose(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		extraDeployments: 2, soloGroup: true,
+	})
+
+	solo := strings.Replace(promptBody("be helpful", "first turn", "answer"),
+		`"model":"anthropic-claude"`, `"model":"`+soloModel+`"`, 1)
+	rec := h.do(t, claudeCodeRequest("/v1/messages", solo))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("x-gateway-prompt-affinity"); got != "" {
+		t.Errorf("affinity = %q, want no pin: this group has one deployment", got)
+	}
+
+	// The balanced group in the same fleet is unaffected.
+	balanced := h.do(t, claudeCodeRequest("/v1/messages", promptBody("be helpful", "first turn", "answer")))
+	if got := balanced.Header().Get("x-gateway-prompt-affinity"); got != "new" {
+		t.Errorf("affinity = %q on the balanced group, want new", got)
 	}
 }

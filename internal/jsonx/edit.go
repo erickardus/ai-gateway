@@ -218,6 +218,27 @@ func AddMember(object []byte, key string, value []byte) ([]byte, bool, error) {
 	return out, true, nil
 }
 
+// HasMember reports whether an object carries a member with the given name.
+//
+// It looks only at the object's own members, which is what separates it from
+// ContainsObjectKey: the question here is what kind of thing this object is, and
+// a name buried in a nested schema does not answer that.
+func HasMember(object []byte, key string) (bool, error) {
+	if !json.Valid(object) {
+		return false, errors.New("value is not valid JSON")
+	}
+	found := false
+	if err := walkObject(object, func(m member) error {
+		if m.key == key {
+			found = true
+		}
+		return nil
+	}); err != nil {
+		return false, fmt.Errorf("read member %q: %w", key, err)
+	}
+	return found, nil
+}
+
 // walkObject visits each member of an object that is already known to be valid
 // JSON. walkTopLevel is the same walk over a whole document; this one skips the
 // validation so a nested object can be edited without re-scanning it.
@@ -428,6 +449,55 @@ func collectMembers(value []byte, key string, base int, out *[][2]int) error {
 	}
 	// A scalar holds no members. A string in particular is prompt text, which is
 	// exactly what must not be searched for a key name.
+	return nil
+}
+
+// MemberValues returns the raw value of every member named key, wherever it
+// appears in doc, in document order.
+//
+// It answers what those members say, where StripObjectKey removes them and
+// ContainsObjectKey only reports that one exists. Prompt-cache pinning uses it
+// to read the lifetime a caller asked its breakpoints to have, which is a few
+// dozen bytes inside a request that may be megabytes.
+func MemberValues(doc []byte, key string) ([][]byte, error) {
+	if !json.Valid(doc) {
+		return nil, errors.New("value is not valid JSON")
+	}
+	var out [][]byte
+	if err := visitMembers(doc, key, func(raw []byte) { out = append(out, raw) }); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// visitMembers calls fn with the value of every member named key within value.
+// It shares collectMembers' walk and differs only in what it keeps: the value
+// rather than the extent to cut out.
+func visitMembers(value []byte, key string, fn func([]byte)) error {
+	i := skipSpace(value, 0)
+	if i >= len(value) {
+		return nil
+	}
+	switch value[i] {
+	case '{':
+		return walkObject(value[i:], func(m member) error {
+			if m.key == key {
+				fn(m.raw)
+				return nil
+			}
+			return visitMembers(m.raw, key, fn)
+		})
+	case '[':
+		spans, err := elements(value[i:])
+		if err != nil {
+			return err
+		}
+		for _, s := range spans {
+			if err := visitMembers(value[i+s[0]:i+s[1]], key, fn); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
