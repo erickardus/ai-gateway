@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/erickardus/ai-gateway/internal/auth"
@@ -50,6 +51,9 @@ type generateRequest struct {
 	// BudgetDuration is the window MaxBudget applies over, as a Go duration
 	// string. Empty means the key's whole lifetime.
 	BudgetDuration string `json:"budget_duration"`
+	// Scope places the key in a project, team or organisation declared under
+	// `rbac`, so its spend draws down that pool and its limits bind.
+	Scope string `json:"scope"`
 }
 
 // handleKeyGenerate mints a new virtual key. The plaintext is returned exactly
@@ -104,6 +108,16 @@ func (s *Server) handleKeyGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An unknown scope is refused here rather than at first use. The endpoint
+	// hands back a key that looks correct, so a mistyped team would otherwise
+	// present as the key being rejected later, by which point whoever typed it
+	// has moved on.
+	if req.Scope != "" && s.cfg.Scope(req.Scope) == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error",
+			"scope "+strconv.Quote(req.Scope)+" is not declared under rbac")
+		return
+	}
+
 	plaintext, hash, err := auth.Generate()
 	if err != nil {
 		s.fail(w, r, err)
@@ -115,6 +129,7 @@ func (s *Server) handleKeyGenerate(w http.ResponseWriter, r *http.Request) {
 		AllowPassthrough: req.AllowPassthrough,
 		CreatedAt:        time.Now().UTC(), ExpiresAt: expiresAt,
 		MaxBudget: req.MaxBudget, BudgetDuration: budgetDuration,
+		Scope: req.Scope,
 	}
 	if err := s.store.Put(r.Context(), key); err != nil {
 		s.fail(w, r, err)

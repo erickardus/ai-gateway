@@ -96,3 +96,53 @@ func (e *UpstreamError) Retryable() bool {
 	}
 	return e.StatusCode >= 500
 }
+
+// ScopeBudgetError is a refusal by a shared budget rather than by the caller's
+// own, carrying which level refused.
+//
+// It exists because the two are not the same fact and a caller acts on them
+// differently. "This key has exhausted its budget" sends a developer to ask for
+// their own cap to be raised; if what actually happened is that their team's
+// pool ran out, that request is addressed to the wrong person and the answer
+// will not help them. Naming the level is what makes the refusal actionable.
+//
+// It wraps ErrBudgetExceeded, so every existing check — the 402 status above
+// included — keeps working without knowing this type exists. The figures stay
+// out of it deliberately: what a team has spent belongs to whoever owns the
+// team, and the caller learning which scope refused them learns the name of a
+// group they are already in.
+type ScopeBudgetError struct {
+	Kind ScopeKind
+	ID   string
+}
+
+func (e *ScopeBudgetError) Error() string {
+	return string(e.Kind) + " " + e.ID + " has exhausted its shared budget"
+}
+
+// Unwrap makes errors.Is(err, ErrBudgetExceeded) true, so the status mapping
+// and every other caller stay unchanged.
+func (e *ScopeBudgetError) Unwrap() error { return ErrBudgetExceeded }
+
+// ScopeModelError is a model refused by a scope rather than by the key's own
+// allowlist, carrying which level withheld it.
+//
+// "This key is not permitted to call the requested model" is true either way,
+// which is why this took longer to matter than the budget case — but it is not
+// actionable. A developer whose key lists the model and is refused anyway has
+// no way to discover that their team's allowlist is what stopped them, and the
+// natural next step, asking for the key's allowlist to be widened, changes
+// nothing. The scope id is the name of a group the caller is already in.
+type ScopeModelError struct {
+	Kind  ScopeKind
+	ID    string
+	Model string
+}
+
+func (e *ScopeModelError) Error() string {
+	return string(e.Kind) + " " + e.ID + " does not allow " + e.Model
+}
+
+// Unwrap makes errors.Is(err, ErrModelNotAllowed) true, so the 403 mapping and
+// every other caller stay unchanged.
+func (e *ScopeModelError) Unwrap() error { return ErrModelNotAllowed }

@@ -103,6 +103,14 @@ type Key struct {
 	// second laptop gets a second key rather than invalidating the first, so
 	// re-issuing on one machine cannot silently sign them out of another.
 	Device string `json:"device,omitempty"`
+	// Scope is the fully qualified id of the project, team or organisation this
+	// key belongs to, or empty for a key that belongs to no hierarchy.
+	//
+	// It is what turns a per-key cap into a shared one. A key's own MaxBudget
+	// is its alone; the scope's is a pool every key beneath it draws from, so
+	// ten developers on one team spend one team budget rather than ten copies
+	// of it. See Scope.
+	Scope string `json:"scope,omitempty"`
 }
 
 // SpendSubject is the identity a key's spend and budget accumulate under.
@@ -144,12 +152,7 @@ func (k *Key) AllowsModel(model string) bool {
 	if len(k.Models) == 0 {
 		return true
 	}
-	for _, pattern := range k.Models {
-		if matchPattern(pattern, model) {
-			return true
-		}
-	}
-	return false
+	return matchAny(k.Models, model)
 }
 
 // matchPattern matches an exact name or a trailing-"*" prefix pattern. A bare

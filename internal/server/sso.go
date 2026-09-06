@@ -305,20 +305,17 @@ func (s *Server) issueSSOKey(ctx context.Context, id *sso.Identity, role config.
 	}
 	now := time.Now().UTC()
 	expires := now.Add(s.sso.Config().KeyDuration)
-	key := &core.Key{
-		Hash:             hash,
-		Alias:            ssoAlias(id, device),
-		Models:           role.Models,
-		RPMLimit:         role.RPMLimit,
-		TPMLimit:         role.TPMLimit,
-		AllowPassthrough: role.AllowPassthrough,
-		CreatedAt:        now,
-		ExpiresAt:        &expires,
-		MaxBudget:        role.MaxBudget,
-		BudgetDuration:   role.BudgetDuration,
-		Subject:          id.Subject,
-		Device:           device,
-	}
+	// The entitlements come from the shared helper rather than being spelled
+	// out here, so an identity authenticating with the provider's own token
+	// gets exactly what its issued key would have granted. Two copies of this
+	// mapping would drift, and the drift would be a person holding two
+	// credentials that permit different things.
+	key := sso.KeyForRole(id, role)
+	key.Hash = hash
+	key.Alias = ssoAlias(id, device)
+	key.CreatedAt = now
+	key.ExpiresAt = &expires
+	key.Device = device
 	if err := s.store.Put(ctx, key); err != nil {
 		return "", nil, err
 	}

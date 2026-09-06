@@ -157,9 +157,77 @@ group of a different wire format.
 | `keys[].models` | any | Exact names or a trailing `*`. |
 | `keys[].rpm_limit`, `tpm_limit` | unlimited | |
 | `keys[].allow_passthrough` | `false` | Required to reach a passthrough deployment. |
-| `keys[].max_budget` | unlimited | Only billable traffic counts. |
+| `keys[].max_budget` | unlimited | Only billable traffic counts. This key's alone; see `rbac` for a cap several keys share. |
 | `keys[].budget_duration` | lifetime | Window the budget applies over. |
+| `keys[].scope` | — | A project, team or organisation declared under `rbac`. Its limits bind this key, and its budget is a pool this key draws from. |
 | `keys[].blocked`, `expires_at` | — | |
+
+## `rbac`
+
+Absent means keys are flat and every check below is skipped. Declaring it gives
+keys somewhere to belong, and gives budgets and rate limits somewhere to be
+shared.
+
+```yaml
+rbac:
+  organizations:
+    - id: acme
+      max_budget: 10000
+      budget_duration: 720h
+      models: ["anthropic-*"]
+      teams:
+        - id: platform
+          alias: Platform Engineering
+          max_budget: 2000
+          budget_duration: 720h
+          rpm_limit: 600
+          projects:
+            - id: gateway
+              max_budget: 500
+              budget_duration: 720h
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `organizations[].id` | required | One path segment. Must not contain `/`. |
+| `…teams[].id`, `…projects[].id` | required | Likewise. Nesting builds the qualified id: `acme/platform/gateway`. |
+| `alias` | — | Label for `/spend/scopes`. The id is what everything keys on. |
+| `models` | — | Restricts what may be called beneath this scope. |
+| `rpm_limit`, `tpm_limit` | unlimited | One allowance shared by every key beneath the scope, not one each. |
+| `max_budget` | unlimited | A pool. Every key beneath the scope draws from it. |
+| `budget_duration` | forever | Window `max_budget` applies over. |
+| `blocked` | `false` | Disables every key beneath the scope at once. |
+
+The hierarchy is expressed by nesting rather than by parent references, so a
+team cannot be declared under an organisation that does not exist and a
+membership is stated once. The qualified id — the path — is what a key, a role
+or `/key/generate` names.
+
+### Entitlements narrow going down
+
+A scope's limits bind every key beneath it **in addition to** the key's own, and
+never instead of them. Three consequences worth stating:
+
+- **Models intersect.** A key listing a model its team withholds may not call
+  it, and the refusal names the level that withheld it rather than blaming the
+  key. A scope naming no models abstains rather than granting everything, so a
+  parent's list still applies. A child listing a concrete model its parent
+  withholds is refused at load: it can never work, and nothing else would say so.
+- **Budgets are pools, and every level is charged.** One request records against
+  the key, its project, its team and its organisation — four subjects. A refusal
+  names the innermost cap that bound, because that is the level whose owner can
+  act on it.
+- **Rate limits are pools too**, and the chain is reserved in one all-or-nothing
+  operation — so a request a team refuses charges nothing to the key's own
+  window, and depth costs no extra round trips.
+
+A key naming a scope that is not configured is **refused**, not treated as
+unscoped. The key store outlives the config that produced it, so a renamed team
+would otherwise silently drop the cap its members were issued under.
+
+`/spend/scopes` reports each level's pooled totals. Summing the `/spend/keys`
+rows gives a different and wrong number: a key can leave a team, and its
+historical spend does not leave with it.
 
 ## `sso`
 
@@ -179,12 +247,63 @@ the `/sso/*` endpoints entirely. See **[sso.md](sso.md)**.
 | `role_claim` | `groups` | Claim matched against `roles[].match`. A string or a list of them. |
 | `roles[].match` | required | First match wins; `*` matches anything, so a catch-all belongs last. No match is refused. |
 | `roles[].models`, `rpm_limit`, `tpm_limit`, `allow_passthrough`, `max_budget`, `budget_duration` | — | The same fields as `virtual_keys.keys[]`. |
+| `roles[].scope` | — | Places everyone matching the role in a scope declared under `rbac`. This is what makes a role a pool rather than a template — see below. |
 | `base_url` | origin of `redirect_url` | Handed to clients as `ANTHROPIC_BASE_URL`. |
 | `model` | the only group, if there is one | Handed to clients as `ANTHROPIC_MODEL`. Required when several groups exist. |
+| `jwt_auth.enabled` | `false` | Accept the provider's own tokens on inference requests, as well as issued keys. |
+| `jwt_auth.audiences` | `[client_id]` | The `aud` values a token may carry. An access token issued for an API names that API rather than the gateway's client id. No wildcard: `"*"` is refused at load rather than read as a literal audience. |
+| `jwt_auth.cache_ttl` | `60s` | How long a verified token's result is reused. Never past the token's own expiry. An explicit `0` is honoured and means "verify every request". |
 
 Entitlements are read from this file and never from the token. A claim that
 could grant a model or raise a budget would make any claim-mapping mistake at
 the provider a privilege escalation here.
+
+### A role without a scope is not a pool
+
+`roles[].max_budget` is granted to **each** identity the role matches, so a role
+covering ten developers with a `max_budget` of 200 permits 2000 of spend. That
+is right for a per-person allowance and wrong for a team's.
+
+Naming a `scope` fixes it without changing what the role means: every identity
+matching the role now records its spend against that scope as well as its own,
+so the scope's `max_budget` is one cap they share and the role's own becomes a
+per-person cap *within* it. Both are enforced, innermost first.
+
+### `jwt_auth`
+
+With it on, a caller may present the provider's own token in the same header a
+virtual key travels in. The gateway verifies it against the provider's published
+keys on every request, maps it through the same `roles`, and authenticates it as
+an ephemeral key that is never stored.
+
+The trade against an issued key is revocation for moving parts:
+
+| | Issued key | `jwt_auth` |
+|---|---|---|
+| Verified | once, at login | every request |
+| Revocation reaches the gateway | when the key expires (`key_duration`, default 30 days) | when the caller's current token does, typically an hour |
+| Caller must | hold one static string | hold a live token and refresh it |
+| Works with Claude Code + subscription | yes | no — the credential header is static |
+
+So this is for callers a key does not suit: CI, a service, a script running under
+a workload identity. It sits **beside** the key path rather than replacing it,
+and the two share a spend subject, so one person moving between them draws on
+one budget.
+
+Where a token names several audiences and the only one the gateway accepts is
+its own `client_id`, the `azp` claim must also be the `client_id` — otherwise a
+token another application in the organisation obtained, which happens to name
+this gateway among its audiences, would authenticate here. The check stands down
+only where the audience that matched is *not* the client id, which is the access
+token case: there `aud` is the API and `azp` is legitimately the calling client.
+
+A credential is routed by shape. A JWT is three base64url segments separated by
+dots whose first segment decodes to a JSON object naming an algorithm; a virtual
+key generated here is `sk-vk-` followed by base64url, which contains no dot. The
+header check is what makes this safe for a key you wrote by hand: `team.gateway.2024`
+is three base64url runs separated by dots, and without it, enabling `jwt_auth`
+would start rejecting that key. A token presented to a gateway with `jwt_auth`
+off is refused as an unknown key.
 
 ## `redis`
 
@@ -293,7 +412,7 @@ configures this too.
 | `POST /sso/exchange` | none — a single-use code and the client's PKCE verifier |
 | `POST /sso/renew` | the provider's refresh token |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | master key |
-| `GET /spend/keys`, `GET /spend/deployments` | master key |
+| `GET /spend/keys`, `GET /spend/scopes`, `GET /spend/deployments` | master key |
 | `POST /cache/purge` | master key |
 
 ## Error responses

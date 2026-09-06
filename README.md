@@ -57,6 +57,20 @@ copies a key anywhere — see **[docs/sso.md](docs/sso.md)**:
 gateway login --gateway http://localhost:4000
 ```
 
+Put those keys in a team, and the team's budget is one pool its members share
+rather than a copy each of them receives — see
+**[docs/configuration.md](docs/configuration.md#rbac)**:
+
+```yaml
+rbac:
+  organizations:
+    - id: acme
+      teams:
+        - id: platform
+          max_budget: 2000
+          budget_duration: 720h
+```
+
 Then point Claude Code at it:
 
 ```bash
@@ -79,7 +93,7 @@ claude    # /login → "Claude account with subscription"
 | `GET /health/liveliness`, `/health/readiness` | Probes, unauthenticated. |
 | `GET /sso/login`, `GET /sso/callback`, `POST /sso/exchange`, `POST /sso/renew` | SSO login, when `sso.issuer` is configured. Issues a virtual key from an OpenID Connect identity. |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | Key management, master-key only. |
-| `GET /spend/keys`, `GET /spend/deployments` | Usage and cost reports, master-key only. |
+| `GET /spend/keys`, `GET /spend/scopes`, `GET /spend/deployments` | Usage and cost reports, master-key only. `/spend/scopes` reports each team's pooled spend. |
 | `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. The same metrics push to an OpenTelemetry collector when `observability.otlp.endpoint` is set. |
 | `POST /cache/purge` | Empty the response cache, master-key only. |
 
@@ -99,6 +113,8 @@ interface waiting for it.
 | Rate limits — per deployment and per key | ✅ |
 | Virtual keys — issue, revoke, model allowlists | ✅ |
 | SSO — OIDC login issues a key and configures Claude Code | ✅ |
+| JWT auth — verify the provider's own token on every request | ✅ |
+| Organisations, teams and projects, with **shared** budgets and limits | ✅ |
 | Credential isolation + subscription passthrough | ✅ |
 | Streaming (SSE) | ✅ |
 | Health checks, timeouts | ✅ |
@@ -111,7 +127,7 @@ interface waiting for it.
 | Guardrails | ⏳ |
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
 | Multi-instance shared state (Redis) | ✅ |
-| Admin UI, teams, MCP gateway | ⏳ |
+| Admin UI, MCP gateway | ⏳ |
 
 There is **no cross-format translation** in v1: an Anthropic ingress routes only
 to `anthropic` deployments, an OpenAI ingress only to `openai` ones. That is a

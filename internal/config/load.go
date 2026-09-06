@@ -61,6 +61,12 @@ func Finalize(cfg *Config) error {
 	for i := range cfg.ModelList {
 		cfg.ModelList[i].setID()
 	}
+	// The hierarchy is resolved before validation because validation reads it:
+	// a key naming a scope is checked against the resolved map rather than
+	// against the nesting it came from.
+	if err := cfg.resolveScopes(); err != nil {
+		return err
+	}
 
 	return cfg.Validate()
 }

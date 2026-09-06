@@ -94,6 +94,18 @@ model_list:
 		documentedDefault{"sso.role_claim", ssoCfg.SSO.RoleClaim, "groups"},
 	)
 
+	// The jwt_auth defaults only exist once it is enabled, and the audience
+	// default is derived from the client id rather than written down.
+	jwtCfg, err := Parse([]byte(ssoConfig + "  jwt_auth:\n    enabled: true\n"))
+	if err != nil {
+		t.Fatalf("Parse jwt_auth config: %v", err)
+	}
+	documented = append(documented,
+		documentedDefault{"sso.jwt_auth.enabled", ssoCfg.SSO.JWTAuth.Enabled, false},
+		documentedDefault{"sso.jwt_auth.cache_ttl", jwtCfg.SSO.JWTAuth.TTL().String(), "1m0s"},
+		documentedDefault{"sso.jwt_auth.audiences", strings.Join(jwtCfg.SSO.JWTAuth.Audiences, ","), jwtCfg.SSO.ClientID},
+	)
+
 	for _, d := range documented {
 		if d.got != d.want {
 			t.Errorf("%s = %v, but docs/configuration.md says %v — update both together", d.field, d.got, d.want)
@@ -126,7 +138,7 @@ func TestDocsReferenceRealEndpoints(t *testing.T) {
 
 	for _, route := range []string{
 		"/v1/messages", "/v1/messages/count_tokens", "/v1/chat/completions",
-		"/v1/models", "/api/hello", "/metrics",
+		"/v1/models", "/api/hello", "/metrics", "/spend/scopes",
 		"/health", "/health/liveliness", "/health/readiness",
 		"/key/generate", "/key/info", "/key/list", "/key/delete",
 		"/spend/keys", "/spend/deployments", "/cache/purge",

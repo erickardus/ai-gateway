@@ -88,7 +88,21 @@ func (l *Ledger) Record(ctx context.Context, e spend.Entry) error {
 	rctx, cancel := l.ctx(ctx)
 	defer cancel()
 
-	for kind, subject := range map[string]string{"key": e.KeyHash, "deployment": e.DeploymentID} {
+	// Ordered rather than ranged over a map: a scope subject must be written
+	// with the same kind every time, and a map's iteration order is one more
+	// thing that could differ between the write and a later read.
+	type target struct{ kind, subject, alias string }
+	targets := []target{{"key", e.KeyHash, e.KeyAlias}, {"deployment", e.DeploymentID, ""}}
+	for i, subject := range e.Scopes {
+		alias := ""
+		if i < len(e.ScopeAliases) {
+			alias = e.ScopeAliases[i]
+		}
+		targets = append(targets, target{"scope", subject, alias})
+	}
+
+	for _, t := range targets {
+		kind, subject := t.kind, t.subject
 		if subject == "" {
 			continue
 		}
@@ -103,9 +117,9 @@ func (l *Ledger) Record(ctx context.Context, e spend.Entry) error {
 		if l.degraded.degrade(err, "spend_record") {
 			return nil // already recorded locally
 		}
-	}
-	if e.KeyAlias != "" && e.KeyHash != "" {
-		_ = l.client.HSet(rctx, l.key("key", e.KeyHash), "alias", e.KeyAlias).Err()
+		if t.alias != "" {
+			_ = l.client.HSet(rctx, l.key(kind, subject), "alias", t.alias).Err()
+		}
 	}
 	l.degraded.recovered()
 	return nil
@@ -118,34 +132,103 @@ func (l *Ledger) Record(ctx context.Context, e spend.Entry) error {
 // starts at a key's first request, and a TTL set at that moment would expire
 // mid-window if the key went briefly idle.
 func (l *Ledger) KeySpend(ctx context.Context, keyHash string, window time.Duration) (float64, error) {
+	return l.subjectSpend(ctx, "key", keyHash, window, l.local.KeySpend)
+}
+
+// ScopeSpend implements spend.Store.
+//
+// It is the read that makes a scope budget a shared cap rather than a per-key
+// one: every instance sees the same pooled total, so a team's allowance is not
+// silently multiplied by the replica count any more than a key's is.
+func (l *Ledger) ScopeSpend(ctx context.Context, subject string, window time.Duration) (float64, error) {
+	return l.subjectSpend(ctx, "scope", subject, window, l.local.ScopeSpend)
+}
+
+func (l *Ledger) subjectSpend(ctx context.Context, kind, subject string, window time.Duration,
+	fallback func(context.Context, string, time.Duration) (float64, error),
+) (float64, error) {
+	got, err := l.Spends(ctx, []spend.Subject{{Kind: spend.Kind(kind), ID: subject, Window: window}})
+	if err != nil {
+		return fallback(ctx, subject, window)
+	}
+	return got[0], nil
+}
+
+// Spends implements spend.Store.
+//
+// Every subject is read in one pipeline rather than one round trip each. A
+// request is checked against its key and every scope above it, so the
+// sequential shape cost a round trip per level on the hot path — up to four
+// under a full organisation/team/project hierarchy, before the reservation that
+// follows it.
+//
+// The window rollovers the reads discover are cleared in a second pipeline, not
+// one call each, for the same reason. They are rare — once per window per
+// subject — but they arrive together when a fleet restarts, which is exactly
+// when the extra round trips would be least welcome.
+func (l *Ledger) Spends(ctx context.Context, subjects []spend.Subject) ([]float64, error) {
+	if len(subjects) == 0 {
+		return nil, nil
+	}
 	rctx, cancel := l.ctx(ctx)
 	defer cancel()
-	key := l.key("key", keyHash)
 
-	vals, err := l.client.HMGet(rctx, key, "cost", "window_start").Result()
-	if l.degraded.degrade(err, "key_spend") {
-		return l.local.KeySpend(ctx, keyHash, window)
+	pipe := l.client.Pipeline()
+	cmds := make([]*redis.SliceCmd, len(subjects))
+	for i, s := range subjects {
+		cmds[i] = pipe.HMGet(rctx, l.key(string(s.Kind), s.ID), "cost", "window_start")
+	}
+	// Exec reports the first command error; each command carries its own, and a
+	// pipeline against an unreachable Redis fails them all the same way. One
+	// check is enough to decide whether the store is usable.
+	if _, err := pipe.Exec(rctx); err != nil {
+		if l.degraded.degrade(err, "spends") {
+			return l.local.Spends(ctx, subjects)
+		}
+		return nil, fmt.Errorf("read spend: %w", err)
 	}
 	l.degraded.recovered()
 
-	cost := parseFloat(vals[0])
-	if window > 0 {
+	out := make([]float64, len(subjects))
+	var elapsed []string
+	for i, s := range subjects {
+		vals, err := cmds[i].Result()
+		if err != nil || len(vals) < 2 {
+			// A subject that could not be read is reported as having spent
+			// nothing, which admits the request. The alternative — refusing —
+			// would turn a partial read into an outage for every caller with a
+			// budget, and the degrade path above already covers a Redis that is
+			// actually gone.
+			continue
+		}
+		out[i] = parseFloat(vals[0])
+		if s.Window <= 0 {
+			continue
+		}
 		started := int64(parseFloat(vals[1]))
-		if started > 0 && time.Since(time.Unix(started, 0)) >= window {
+		if started > 0 && time.Since(time.Unix(started, 0)) >= s.Window {
 			// The window elapsed: clear the record so the reported spend
 			// matches what is enforced from here on.
-			if err := l.client.Del(rctx, key).Err(); err != nil {
-				l.log.Warn("reset spend window", "error", err)
-			}
-			return 0, nil
+			elapsed = append(elapsed, l.key(string(s.Kind), s.ID))
+			out[i] = 0
 		}
 	}
-	return cost, nil
+	if len(elapsed) > 0 {
+		if err := l.client.Del(rctx, elapsed...).Err(); err != nil {
+			l.log.Warn("reset spend window", "error", err, "subjects", len(elapsed))
+		}
+	}
+	return out, nil
 }
 
 // Keys implements spend.Store.
 func (l *Ledger) Keys(ctx context.Context) ([]spend.Summary, error) {
 	return l.summaries(ctx, "key", func() ([]spend.Summary, error) { return l.local.Keys(ctx) })
+}
+
+// Scopes implements spend.Store.
+func (l *Ledger) Scopes(ctx context.Context) ([]spend.Summary, error) {
+	return l.summaries(ctx, "scope", func() ([]spend.Summary, error) { return l.local.Scopes(ctx) })
 }
 
 // Deployments implements spend.Store.

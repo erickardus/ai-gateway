@@ -202,6 +202,56 @@ virtual_keys:
       budget_duration: 720h
       # Required before this key may reach a passthrough deployment.
       allow_passthrough: true
+      # Put the key in a team, so its spend draws down that team's shared
+      # budget as well as its own cap above. See the rbac block below.
+      # scope: acme/platform
+
+# ---------------------------------------------------------------------------
+# rbac — organisations, teams and projects, so a budget can be a pool.
+#
+# Without this, keys are flat: every key carries its own max_budget and ten
+# developers issued the same allowance can spend it ten times over. A scope is a
+# subject in the ledger, not a template — every key beneath it records against
+# the same entry, so its cap is one pool the members draw down together.
+#
+# Nesting is the hierarchy. The qualified id a key or an sso role names is built
+# from it: acme, acme/platform, acme/platform/gateway.
+#
+# Entitlements narrow going down and never widen: a scope's models, rate limits
+# and budget bind every key beneath it in addition to the key's own. A key
+# naming a scope that is not declared here is refused rather than treated as
+# unscoped, because the key store outlives this file.
+# ---------------------------------------------------------------------------
+# rbac:
+#   organizations:
+#     - id: acme
+#       alias: Acme Inc
+#       # The whole company's ceiling. Reached by every team's traffic together.
+#       max_budget: 10000
+#       budget_duration: 720h
+#       models: ["anthropic-*"]
+#
+#       teams:
+#         - id: platform
+#           alias: Platform Engineering
+#           # One pool the team shares, not an allowance each member receives.
+#           max_budget: 2000
+#           budget_duration: 720h
+#           # Shared the same way: 600 requests a minute across the team.
+#           rpm_limit: 600
+#
+#           projects:
+#             - id: gateway
+#               max_budget: 500
+#               budget_duration: 720h
+#
+#         - id: contractors
+#           # A narrower model list than the organisation above. It may narrow
+#           # what its parent allows and never widen it; a child naming a model
+#           # its parent withholds is refused at load.
+#           models: ["anthropic-claude-haiku"]
+#           max_budget: 250
+#           budget_duration: 720h
 
 # Share state across gateway instances. Without this every replica enforces its
 # own limits, so a rate limit is silently multiplied by the replica count and a
@@ -380,14 +430,48 @@ observability:
 #       models: ["anthropic-claude", "anthropic-claude-haiku"]
 #       allow_passthrough: true      # required to reach the passthrough deployment
 #       rpm_limit: 120
+#       # Without a scope this is a cap EACH person matching the role receives,
+#       # so a role covering ten developers permits ten times it. Naming a scope
+#       # makes the team's budget the shared ceiling and leaves this as a
+#       # per-person cap inside it. Both are enforced, innermost first.
 #       max_budget: 200
 #       budget_duration: 720h
+#       scope: acme/platform
 #
 #     - match: contractors
 #       models: ["anthropic-claude-haiku"]
 #       max_budget: 25
 #       budget_duration: 720h
+#       scope: acme/contractors
 #
 #   # There is deliberately no "*" catch-all: an identity matching no role is
 #   # refused, and a provider covering the whole company authenticates the whole
 #   # company. Add one last only if that is what you mean.
+#
+#   # Accept the provider's own tokens on inference requests, as well as the
+#   # keys a login issues.
+#   #
+#   # The trade is revocation against moving parts. An issued key is verified
+#   # once at login and trusted until it expires, so disabling someone at the
+#   # provider does not reach the gateway for up to key_duration. A token is
+#   # verified on every request, so a suspended account stops working as soon as
+#   # its current token does — usually within the hour. What it costs is that
+#   # the caller must hold a live token and refresh it, which Claude Code cannot
+#   # do while keeping a subscription login: its only credential channel that
+#   # does not displace one is a static header.
+#   #
+#   # So this is for the callers a key does not suit — CI, a service, a script
+#   # under a workload identity — and it sits beside the key path rather than
+#   # replacing it. Both resolve through the roles above, and both account to
+#   # the same person, so moving between them draws on one budget.
+#   jwt_auth:
+#     enabled: true
+#     # The aud values a token may carry, defaulting to client_id — which is
+#     # what an ID token carries. An access token minted for an API names that
+#     # API instead, so list its identifier here. No wildcard: a token issued
+#     # for another client of the same provider says nothing about this gateway.
+#     audiences: ["api://ai-gateway"]
+#     # How long a verified token is reused before it is checked again. Never
+#     # past the token's own expiry. An explicit 0 means what it says: verify
+#     # every request and cache nothing.
+#     cache_ttl: 60s

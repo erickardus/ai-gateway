@@ -91,9 +91,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	authn, err := auth.NewAuthenticator(ctx, store, cfg.VirtualKeys)
+	authn, err := auth.NewAuthenticator(ctx, store, cfg.VirtualKeys, cfg.Scopes())
 	if err != nil {
 		return fmt.Errorf("initialize authentication: %w", err)
+	}
+	if cfg.RBAC.Enabled() {
+		log.Info("rbac hierarchy loaded", "scopes", len(cfg.Scopes()),
+			"organizations", len(cfg.RBAC.Organizations))
 	}
 
 	local := router.NewMemState()
@@ -205,9 +209,19 @@ func run() error {
 		if shared != nil {
 			pending = shared.SSOStore()
 		}
-		gw.UseSSO(sso.New(cfg.SSO, log), pending)
+		provider := sso.New(cfg.SSO, log)
+		gw.UseSSO(provider, pending)
 		log.Info("sso enabled", "issuer", cfg.SSO.Issuer, "roles", len(cfg.SSO.Roles),
 			"key_duration", cfg.SSO.KeyDuration, "shared_state", shared != nil)
+
+		// The same provider verifies tokens presented on requests. It shares the
+		// key set the login path already fetches, so turning this on adds a
+		// signature check rather than a second client of the provider.
+		if cfg.SSO.JWTAuth.Enabled {
+			authn.UseTokenVerifier(provider)
+			log.Info("jwt auth enabled",
+				"audiences", cfg.SSO.JWTAuth.Audiences, "cache_ttl", cfg.SSO.JWTAuth.CacheTTL)
+		}
 	}
 
 	srv := gw.HTTPServer()
