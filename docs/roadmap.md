@@ -340,10 +340,27 @@ beyond the endpoints themselves.
 Access logs carry the key alias, model and outcome, but there is no separate
 tamper-evident audit stream.
 
-### 🟡 Metrics have no build info
+### ✅ Metrics have no build info
 
-No `gateway_build_info` series, so a dashboard cannot distinguish versions
-during a rollout.
+Resolved. `gateway_build_info` carries the version and the active routing
+strategy as labels.
+
+### 🟡 Only the metrics signal is exported
+
+`observability.otlp` pushes metrics over OTLP/HTTP. Traces and logs are not
+exported: each would be another schema and another exporter, and the gateway
+already emits structured logs carrying a request ID that a collector can
+correlate on. A span per request, with the retry and fallback hops as children,
+is the piece that would actually add something metrics cannot say.
+
+### 🟡 A permanently unreachable deployment is never ejected
+
+Connection errors and timeouts deliberately do not count toward cooldown — see
+[routing.md](routing.md#cooldowns). The cost is that a deployment whose host has
+gone away stays in the rotation indefinitely, and every request to its group
+keeps paying a wasted attempt plus backoff. `gateway_deployment_available` makes
+the state visible; it does not act on it. A separate active health check, rather
+than a change to what counts as a failure, is the shape of the fix.
 
 ---
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/erickardus/ai-gateway/internal/core"
 )
@@ -24,27 +25,41 @@ const relayBufferSize = 4 << 10
 // traffic during long thinking pauses. So nothing here filters, coalesces or
 // reinterprets the stream: bytes are passed straight through.
 //
-// It returns any usage reported by the upstream, for token accounting. The
-// format decides how those counters are read: the two disagree about whether a
-// reported input figure includes the tokens that came from the prompt cache,
-// and reading one with the other's rule bills cached tokens twice.
-func Relay(w http.ResponseWriter, body io.Reader, format core.Format) (core.Usage, error) {
+// It returns what it observed while passing the bytes through. Usage is what
+// the upstream reported, for token accounting: the format decides how those
+// counters are read, because the two disagree about whether a reported input
+// figure includes the tokens that came from the prompt cache, and reading one
+// with the other's rule bills cached tokens twice.
+//
+// Bytes and FirstChunkAt are measurements only this loop can take. Time to
+// first token is the latency a user actually feels, and it is invisible in a
+// request's total duration — a fast first token followed by a long generation
+// and a slow first token followed by a short one produce the same total.
+func Relay(w http.ResponseWriter, body io.Reader, format core.Format) (Stats, error) {
 	rc := http.NewResponseController(w)
 	sniffer := newUsageSniffer(format)
 	buf := make([]byte, relayBufferSize)
+	var stats Stats
 
 	for {
 		n, readErr := body.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
-			if _, writeErr := w.Write(chunk); writeErr != nil {
-				return sniffer.usage, fmt.Errorf("write to client: %w", writeErr)
+			written, writeErr := w.Write(chunk)
+			stats.Bytes += int64(written)
+			if stats.FirstChunkAt.IsZero() && written > 0 {
+				stats.FirstChunkAt = time.Now()
+			}
+			if writeErr != nil {
+				stats.Usage = sniffer.usage
+				return stats, fmt.Errorf("write to client: %w", writeErr)
 			}
 			// Ignore an unsupported flush: some ResponseWriters in tests do not
 			// implement it, and failing to flush is not a reason to drop the
 			// response.
 			if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
-				return sniffer.usage, fmt.Errorf("flush to client: %w", err)
+				stats.Usage = sniffer.usage
+				return stats, fmt.Errorf("flush to client: %w", err)
 			}
 			// Sniff only after the bytes are on their way, so parsing never
 			// sits between the upstream and the client.
@@ -55,11 +70,29 @@ func Relay(w http.ResponseWriter, body io.Reader, format core.Format) (core.Usag
 				// A non-streaming body is a single object with no trailing
 				// newline, so the last line is still buffered here.
 				sniffer.flush()
-				return sniffer.usage, nil
+				stats.Usage = sniffer.usage
+				return stats, nil
 			}
-			return sniffer.usage, fmt.Errorf("read from upstream: %w", readErr)
+			stats.Usage = sniffer.usage
+			return stats, fmt.Errorf("read from upstream: %w", readErr)
 		}
 	}
+}
+
+// Stats is what one relay observed. It is returned even when the relay fails
+// part way, because a stream that died after ten seconds and 3 kB still
+// happened and still cost money.
+type Stats struct {
+	// Usage is the token accounting the upstream reported, or the zero value
+	// where it reported none.
+	Usage core.Usage
+	// Bytes is what was actually written to the client.
+	Bytes int64
+	// FirstChunkAt is when the first byte reached the client, or the zero time
+	// if nothing did. It is a wall-clock instant rather than a duration because
+	// the interval that matters — how long the caller waited — starts before
+	// this function is entered, and only the caller knows when.
+	FirstChunkAt time.Time
 }
 
 // maxSnifferBuffer bounds the sniffer's carry-over so a stream with no newlines

@@ -37,6 +37,10 @@ type Router struct {
 	rndMu sync.Mutex
 	rnd   *rand.Rand
 
+	// ejected reports a deployment leaving the rotation. Nil where the caller
+	// asked for no notification.
+	ejected func(model, deployment string)
+
 	now func() time.Time
 }
 
@@ -44,6 +48,13 @@ type Router struct {
 // timing determinism comes from testing/synctest, so there is no clock seam.
 type Options struct {
 	Seed uint64
+	// Ejected is called when a failure puts a deployment into cooldown.
+	//
+	// The router publishes this rather than the server because an ejection is
+	// not a property of any one request: the request that triggered it usually
+	// succeeds elsewhere on a retry, so nothing the caller sees says a
+	// deployment just left the rotation. Optional; nil disables it.
+	Ejected func(model, deployment string)
 }
 
 // New builds a Router from validated configuration.
@@ -65,6 +76,7 @@ func New(cfg *config.Config, state StateStore, exec Executor, log *slog.Logger, 
 		exec:     exec,
 		log:      log,
 		rnd:      rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)),
+		ejected:  opts.Ejected,
 		now:      time.Now,
 	}, nil
 }
@@ -478,6 +490,8 @@ func (r *Router) attempt(ctx context.Context, dep *config.Deployment, req *provi
 		if coolable(err, dep.Params.AuthMode) {
 			if cerr := r.state.RecordFailure(ctx, dep.ID(), r.now(), r.cfg.Cooldown.Fails(), r.cfg.Cooldown.Period); cerr != nil {
 				r.log.Warn("record failure", "deployment", dep.ID(), "error", cerr)
+			} else {
+				r.noteEjection(ctx, dep)
 			}
 		}
 		return nil, err
@@ -772,4 +786,25 @@ func (r *Router) DeploymentStatus(ctx context.Context, id string) (cooling bool,
 		r.log.Warn("read in-flight for health", "deployment", id, "error", err)
 	}
 	return cooling, inFlight
+}
+
+// noteEjection reports a deployment that this failure just put into cooldown.
+//
+// It asks the state store rather than being told, because whether a failure
+// ejects is the store's decision: it depends on how many failures preceded it
+// inside the window, and with Redis that tally is shared across every replica.
+// The extra round trip is on the failure path only, and a deployment that was
+// still a candidate a moment ago was by definition not cooling down before —
+// so a "yes" here means this attempt is what ejected it.
+func (r *Router) noteEjection(ctx context.Context, dep *config.Deployment) {
+	if r.ejected == nil {
+		return
+	}
+	cooling, err := r.state.InCooldown(ctx, dep.ID(), r.now())
+	if err != nil || !cooling {
+		return
+	}
+	r.log.Warn("deployment ejected",
+		"deployment", dep.ID(), "model", dep.ModelName, "period", r.cfg.Cooldown.Period)
+	r.ejected(dep.ModelName, dep.ID())
 }

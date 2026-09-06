@@ -64,6 +64,17 @@ model_list:
       # falls back to cache_write_per_1m and the gateway warns the first time an
       # upstream reports a long write it cannot price.
       # cache_write_1h_per_1m: 6.00
+      #
+      # cache_writes_free replaces cache_write_per_1m on an Anthropic-compatible
+      # upstream that is not Anthropic and charges nothing to write its cache —
+      # Moonshot's /anthropic endpoint, for one. Without it such a deployment
+      # cannot be priced at all: a write price is required on an anthropic
+      # deployment and required above input, so every figure available would
+      # invent a premium the invoice never shows, and the deployment would be
+      # left unpriced reporting real billable traffic at zero. It also sharpens
+      # an openai deployment, where an unset write price falls back to the input
+      # rate rather than to zero.
+      # cache_writes_free: true
 
   # A cheaper group to fall back to.
   - model_name: anthropic-claude-haiku
@@ -276,6 +287,38 @@ observability:
   # Serve GET /metrics in the Prometheus text format. Unauthenticated, like the
   # liveness probe, but exposes only counters — no hostnames or auth modes.
   metrics: true
+
+  # Push the same metrics to an OpenTelemetry collector.
+  #
+  # Independent of `metrics` above: either, both or neither may be on, and both
+  # render one snapshot so they cannot disagree about a number. The reason to
+  # add it is that OTLP is a push where Prometheus is a pull — a gateway that
+  # cannot be scraped, because it is behind NAT or because it is one
+  # short-lived member of an autoscaled group, has no way to publish a
+  # pull-based metric at all.
+  #
+  # The standard OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS,
+  # OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES variables are read wherever
+  # this block is silent, so a collector sidecar that configures the rest of a
+  # fleet configures this without a line here.
+  # otlp:
+  #   endpoint: http://localhost:4318
+  #   # http/protobuf is what every collector accepts. http/json is the same
+  #   # payload in a form you can read, which is worth having the first time a
+  #   # collector rejects an export — but only some endpoints take it.
+  #   protocol: http/protobuf
+  #   interval: 60s
+  #   # Must be below the interval, or a slow collector leaves exports
+  #   # overlapping.
+  #   timeout: 10s
+  #   compress: true
+  #   service_name: ai-gateway
+  #   headers:
+  #     x-api-key: ${OTLP_API_KEY}
+  #   # Describe the process rather than the measurement, so they are sent once
+  #   # per export rather than repeated on every data point.
+  #   resource_attributes:
+  #     deployment.environment: production
 
   # Persist the spend ledger so budgets survive a restart. Without it every
   # restart hands each key a fresh allowance.

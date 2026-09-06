@@ -72,7 +72,7 @@ claude    # /login → "Claude account with subscription"
 | `GET /health/liveliness`, `/health/readiness` | Probes, unauthenticated. |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | Key management, master-key only. |
 | `GET /spend/keys`, `GET /spend/deployments` | Usage and cost reports, master-key only. |
-| `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. |
+| `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. The same metrics push to an OpenTelemetry collector when `observability.otlp.endpoint` is set. |
 | `POST /cache/purge` | Empty the response cache, master-key only. |
 
 ## Scope
@@ -97,6 +97,8 @@ interface waiting for it.
 | Response caching | ✅ |
 | Prompt caching — prefix affinity, breakpoints, savings reporting | ✅ |
 | Prompt-cache accounting for OpenAI-compatible providers | ✅ |
+| Prometheus metrics — traffic, tokens, cost, cache, streaming, routing | ✅ |
+| OpenTelemetry — OTLP/HTTP metrics export | ✅ |
 | Guardrails | ⏳ |
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
 | Multi-instance shared state (Redis) | ✅ |

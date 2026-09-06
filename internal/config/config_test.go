@@ -440,3 +440,152 @@ router:
 		t.Errorf("a cross-format fallback should be rejected, got %v", err)
 	}
 }
+
+// The exporter is the one component whose own failures nothing else reports: a
+// wrong endpoint produces no bad responses and no wrong numbers, just an absence
+// that looks exactly like having configured nothing. So the checkable parts are
+// checked at load, where the operator is still looking.
+func TestOTLPValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		otlp    string
+		wantErr string
+	}{
+		{
+			name: "a complete exporter",
+			otlp: "endpoint: http://localhost:4318\n    protocol: http/json\n    interval: 30s\n    timeout: 5s",
+		},
+		{
+			name: "no exporter at all",
+			otlp: "",
+		},
+		{
+			name:    "configured but never turned on",
+			otlp:    "protocol: http/protobuf\n    interval: 30s",
+			wantErr: "configured without an endpoint",
+		},
+		{
+			name:    "a scheme that names no transport",
+			otlp:    "endpoint: otlp://collector:4317",
+			wantErr: "scheme must be http or https",
+		},
+		{
+			name:    "grpc, which this exporter does not speak",
+			otlp:    "endpoint: http://localhost:4317\n    protocol: grpc",
+			wantErr: "grpc is not implemented",
+		},
+		{
+			name:    "an unknown protocol",
+			otlp:    "endpoint: http://localhost:4318\n    protocol: thrift",
+			wantErr: "must be \"http/protobuf\" or \"http/json\"",
+		},
+		{
+			name:    "a timeout that outlasts the interval",
+			otlp:    "endpoint: http://localhost:4318\n    interval: 5s\n    timeout: 10s",
+			wantErr: "must be below observability.otlp.interval",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, k := range []string{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"} {
+				t.Setenv(k, "")
+			}
+			body := `
+model_list:
+  - model_name: m
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      auth_mode: api_key
+      auth_header: x-api-key
+      api_key: k
+`
+			if tt.otlp != "" {
+				body += "observability:\n  otlp:\n    " + tt.otlp + "\n"
+			}
+			_, err := Parse([]byte(body))
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("Parse: %v", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("Parse succeeded, want an error containing %q", tt.wantErr)
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Fatalf("Parse error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// The standard OpenTelemetry variables are how a collector sidecar configures
+// every other component in a fleet. A gateway that read only its own YAML would
+// be the one process needing to be told separately.
+func TestOTLPReadsStandardEnvironment(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+	t.Setenv("OTEL_SERVICE_NAME", "gateway-eu")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "api-key=abc123,x-tenant=acme")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=staging,cloud.region=eu-west-1")
+
+	cfg, err := Parse([]byte(`
+model_list:
+  - model_name: m
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      auth_mode: api_key
+      auth_header: x-api-key
+      api_key: k
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	o := cfg.Observability.OTLP
+	if !o.Enabled() || o.Endpoint != "http://collector:4318" {
+		t.Fatalf("endpoint = %q, want it read from OTEL_EXPORTER_OTLP_ENDPOINT", o.Endpoint)
+	}
+	if o.ServiceName != "gateway-eu" {
+		t.Errorf("service_name = %q, want gateway-eu", o.ServiceName)
+	}
+	if o.Headers["api-key"] != "abc123" || o.Headers["x-tenant"] != "acme" {
+		t.Errorf("headers = %v, want both pairs parsed", o.Headers)
+	}
+	if o.ResourceAttributes["cloud.region"] != "eu-west-1" {
+		t.Errorf("resource attributes = %v, want cloud.region parsed", o.ResourceAttributes)
+	}
+}
+
+// The config file is the more specific statement, so it wins — but only where
+// it speaks. A file naming one header must not discard the rest.
+func TestOTLPConfigOverridesEnvironmentPerKey(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://from-env:4318")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "api-key=from-env,x-tenant=acme")
+
+	cfg, err := Parse([]byte(`
+model_list:
+  - model_name: m
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      auth_mode: api_key
+      auth_header: x-api-key
+      api_key: k
+observability:
+  otlp:
+    endpoint: http://from-file:4318
+    headers:
+      api-key: from-file
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	o := cfg.Observability.OTLP
+	if o.Endpoint != "http://from-file:4318" {
+		t.Errorf("endpoint = %q, want the config file to win", o.Endpoint)
+	}
+	if o.Headers["api-key"] != "from-file" {
+		t.Errorf("api-key = %q, want the config file to win", o.Headers["api-key"])
+	}
+	if o.Headers["x-tenant"] != "acme" {
+		t.Errorf("x-tenant = %q, want the environment's header kept alongside", o.Headers["x-tenant"])
+	}
+}

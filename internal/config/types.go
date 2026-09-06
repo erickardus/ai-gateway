@@ -373,7 +373,74 @@ type ObservabilityConfig struct {
 	// message_start whether or not it was asked to. A pointer, so an explicit
 	// false is not mistaken for an omitted field.
 	StreamUsage *bool `yaml:"stream_usage"`
+
+	// OTLP pushes the same metrics /metrics serves to an OpenTelemetry
+	// collector.
+	OTLP OTLPConfig `yaml:"otlp"`
 }
+
+// OTLPConfig configures the OpenTelemetry metrics exporter.
+//
+// It is a push where Prometheus is a pull, and that difference is the reason to
+// use it: a gateway that cannot be scraped — behind NAT, in a serverless
+// runtime, one instance of an autoscaled group whose short-lived members are
+// gone before the next scrape — has no way to publish a pull-based metric at
+// all. The two are not alternatives, and both can be on: they render the same
+// snapshot, so they cannot disagree.
+type OTLPConfig struct {
+	// Endpoint is the collector's base URL, e.g. http://localhost:4318. The
+	// exporter appends /v1/metrics unless the endpoint already names a path.
+	//
+	// Empty disables the exporter, unless OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+	// or OTEL_EXPORTER_OTLP_ENDPOINT is set: those are where the whole
+	// OpenTelemetry ecosystem expects to find this, and a gateway that ignored
+	// them would be the one component in a fleet needing its own configuration.
+	Endpoint string `yaml:"endpoint"`
+
+	// Protocol is "http/protobuf" (the default) or "http/json".
+	//
+	// Protobuf is what every collector accepts. JSON is the same payload in a
+	// form you can read, which is worth having the first time a collector
+	// rejects an export — but only some endpoints accept it.
+	Protocol string `yaml:"protocol"`
+
+	// Headers are sent on every export, typically an API key for a hosted
+	// collector. Merged over anything parsed from OTEL_EXPORTER_OTLP_HEADERS,
+	// with these winning.
+	Headers map[string]string `yaml:"headers"`
+
+	// Interval is how often metrics are pushed.
+	//
+	// Cumulative counters make this a resolution choice rather than a
+	// correctness one: a missed export is made good by the next, since each
+	// carries a running total rather than a delta since the last.
+	Interval time.Duration `yaml:"interval"`
+
+	// Timeout bounds one export attempt, and the flush on shutdown.
+	Timeout time.Duration `yaml:"timeout"`
+
+	// Compress gzips the payload. On by default: metric bodies are highly
+	// repetitive text and compress by roughly an order of magnitude, which
+	// matters on a per-GB ingest bill.
+	Compress *bool `yaml:"compress"`
+
+	// ServiceName becomes the service.name resource attribute, which is the
+	// primary key almost every OTLP backend groups by. Defaults to
+	// OTEL_SERVICE_NAME, then "ai-gateway".
+	ServiceName string `yaml:"service_name"`
+
+	// ResourceAttributes are added to every export — deployment.environment,
+	// service.instance.id, a region. They describe the process rather than the
+	// measurement, so they are sent once per export rather than repeated on
+	// every data point.
+	ResourceAttributes map[string]string `yaml:"resource_attributes"`
+}
+
+// Enabled reports whether the exporter should run.
+func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
+
+// CompressEnabled reports whether to gzip, defaulting to true.
+func (o OTLPConfig) CompressEnabled() bool { return o.Compress == nil || *o.Compress }
 
 // StreamUsageEnabled reports whether streamed OpenAI-compatible requests should
 // ask for usage.

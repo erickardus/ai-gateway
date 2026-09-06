@@ -56,11 +56,14 @@ func (c *Config) Validate() error {
 		{"redis.timeout", c.Redis.Timeout},
 		{"cache.ttl", c.Cache.TTL},
 		{"prompt_cache.affinity_ttl", c.PromptCache.AffinityTTL},
+		{"observability.otlp.interval", c.Observability.OTLP.Interval},
+		{"observability.otlp.timeout", c.Observability.OTLP.Timeout},
 	} {
 		if d.value < 0 {
 			errs = append(errs, fmt.Errorf("%s: must not be negative, got %s", d.path, d.value))
 		}
 	}
+	errs = append(errs, validateOTLP(c.Observability.OTLP)...)
 
 	// A group must speak one wire format: the gateway does not translate, so a
 	// mixed group would route some requests to an upstream expecting a
@@ -359,8 +362,18 @@ func validatePricing(path string, d *Deployment) []error {
 		cacheRead:    cost.CacheReadPer1M,
 		cacheWrite:   cost.CacheWritePer1M,
 		cacheWrite1h: cost.CacheWrite1hPer1M,
+		writesFree:   cost.CacheWritesFree,
 	}
-	errs := validateRates(path+".cost", base, d.Params.Format, false)
+	var errs []error
+	// The flag says what an absent write price means, so there has to be a
+	// price list for it to say it about. On its own it prices nothing and would
+	// be silently ignored.
+	if cost.CacheWritesFree && cost.InputPer1M <= 0 {
+		errs = append(errs, fmt.Errorf(
+			"%s.cost.cache_writes_free: requires %s.cost.input_per_1m; on its own it prices nothing, since it only says what an absent write price means",
+			path, path))
+	}
+	errs = append(errs, validateRates(path+".cost", base, d.Params.Format, false)...)
 	return append(errs, validateLongContext(path, d, base)...)
 }
 
@@ -370,6 +383,11 @@ func validatePricing(path string, d *Deployment) []error {
 // within a tier rather than across tiers, so they are checked per tier.
 type rateSet struct {
 	input, output, cacheRead, cacheWrite, cacheWrite1h float64
+	// writesFree carries cost.cache_writes_free into the per-tier checks. It is
+	// declared once on the base block and applies to every tier: a tier is an
+	// override of the base rates, and one that reintroduced a write charge
+	// would have to name a price, which is refused as a contradiction.
+	writesFree bool
 }
 
 // validateRates checks one tier's internal consistency. block is the key path
@@ -420,12 +438,25 @@ func validateRates(block string, r rateSet, format core.Format, required bool) [
 	// input and reported as its own counter. OpenAI-compatible providers cache
 	// automatically and charge nothing to write, so requiring a price there
 	// would be inventing one.
+	// A declared-free write and a priced one are contradictory statements about
+	// the same tier, and there is no defensible way to pick between them.
+	if r.writesFree && r.cacheWrite > 0 {
+		errs = append(errs, fmt.Errorf(
+			"%s.cache_write_per_1m: must not be set alongside cache_writes_free (got %v); the two say different things about what a write costs",
+			block, r.cacheWrite))
+	}
+
 	if format == core.FormatAnthropic {
-		if r.cacheWrite <= 0 {
+		switch {
+		case r.writesFree:
+			// An Anthropic-compatible upstream that is not Anthropic. The rule
+			// below asserts a fact about Anthropic's price list, not about the
+			// wire format, so it does not apply here.
+		case r.cacheWrite <= 0:
 			errs = append(errs, fmt.Errorf(
-				"%s.cache_write_per_1m: required on an anthropic deployment once input_per_1m is set; a cache write costs a premium over input, and pricing it at zero hides the one cost that makes bad cache routing expensive",
+				"%s.cache_write_per_1m: required on an anthropic deployment once input_per_1m is set; a cache write costs a premium over input, and pricing it at zero hides the one cost that makes bad cache routing expensive. Set cache_writes_free instead if this upstream is Anthropic-compatible but charges nothing to write",
 				block))
-		} else if r.cacheWrite <= r.input {
+		case r.cacheWrite <= r.input:
 			errs = append(errs, fmt.Errorf(
 				"%s.cache_write_per_1m: must exceed input_per_1m (got %v against %v); writing the cache is charged at a premium, and a price at or below input makes a cache miss look free",
 				block, r.cacheWrite, r.input))
@@ -473,6 +504,11 @@ func validateLongContext(path string, d *Deployment, base rateSet) []error {
 		cacheRead:    long.CacheReadPer1M,
 		cacheWrite:   long.CacheWritePer1M,
 		cacheWrite1h: long.CacheWrite1hPer1M,
+		// Declared once on the base block and inherited: a provider that
+		// charges nothing to write does not start charging above a prompt-size
+		// threshold, and a tier naming a write price alongside it is refused as
+		// the contradiction it is.
+		writesFree: base.writesFree,
 	}
 	errs = append(errs, validateRates(block, tier, d.Params.Format, true)...)
 
@@ -505,6 +541,57 @@ func validateLongContext(path string, d *Deployment, base rateSet) []error {
 				"%s.%s: must be at least %s.cost.%s (got %v against %v); the long-context tier is the more expensive one, so a lower rate here is the two blocks written the wrong way round",
 				block, f.name, path, f.name, f.tier, f.base))
 		}
+	}
+	return errs
+}
+
+// validateOTLP refuses an exporter configuration that would fail silently.
+//
+// A metrics exporter is the one component whose own failures nothing else
+// reports: a wrong endpoint or an unsupported protocol produces no bad
+// responses and no wrong numbers, just an absence that looks exactly like
+// having configured nothing at all. So the checkable parts are checked at load,
+// where the operator is still looking.
+func validateOTLP(o OTLPConfig) []error {
+	if !o.Enabled() {
+		// Everything else in the block is inert without an endpoint, and a
+		// block written in full but missing the one field that turns it on is
+		// far likelier to be an oversight than a deliberate staging area.
+		if o.Protocol != "" || len(o.Headers) > 0 || o.Interval > 0 || len(o.ResourceAttributes) > 0 {
+			return []error{errors.New(
+				"observability.otlp: configured without an endpoint, so nothing is exported; set observability.otlp.endpoint or OTEL_EXPORTER_OTLP_ENDPOINT")}
+		}
+		return nil
+	}
+
+	var errs []error
+	u, err := url.Parse(o.Endpoint)
+	switch {
+	case err != nil:
+		errs = append(errs, fmt.Errorf("observability.otlp.endpoint: not a valid URL: %v", err))
+	case u.Scheme != "http" && u.Scheme != "https":
+		errs = append(errs, fmt.Errorf(
+			"observability.otlp.endpoint: scheme must be http or https, got %q; this is OTLP over HTTP, and a bare host or an otlp:// URL names no transport", u.Scheme))
+	case u.Host == "":
+		errs = append(errs, fmt.Errorf("observability.otlp.endpoint: no host in %q", o.Endpoint))
+	}
+
+	switch o.Protocol {
+	case "", "http/protobuf", "http/json":
+	case "grpc":
+		errs = append(errs, errors.New(
+			"observability.otlp.protocol: grpc is not implemented; this exporter speaks OTLP over HTTP, and every collector accepts http/protobuf on port 4318"))
+	default:
+		errs = append(errs, fmt.Errorf(
+			"observability.otlp.protocol: must be \"http/protobuf\" or \"http/json\", got %q", o.Protocol))
+	}
+
+	// A timeout at or above the interval leaves a slow collector with exports
+	// overlapping, each holding the snapshot it started with.
+	if o.Timeout > 0 && o.Interval > 0 && o.Timeout >= o.Interval {
+		errs = append(errs, fmt.Errorf(
+			"observability.otlp.timeout: must be below observability.otlp.interval (got %s against %s), or a slow collector leaves exports overlapping",
+			o.Timeout, o.Interval))
 	}
 	return errs
 }

@@ -93,7 +93,8 @@ func TestRelayExtractsUsage(t *testing.T) {
 	}, "\n")
 
 	rec := httptest.NewRecorder()
-	usage, err := Relay(rec, strings.NewReader(in), core.FormatAnthropic)
+	relayed, err := Relay(rec, strings.NewReader(in), core.FormatAnthropic)
+	usage := relayed.Usage
 	if err != nil {
 		t.Fatalf("Relay: %v", err)
 	}

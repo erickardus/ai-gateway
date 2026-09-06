@@ -230,12 +230,28 @@ See [prompt-caching.md](prompt-caching.md#when-an-upstream-refuses-an-annotation
 | `spend_store_path` | — | Persists budgets across restarts. |
 | `spend_flush_interval` | `30s` | |
 | `stream_usage` | `true` | Ask OpenAI-compatible upstreams to report usage on streamed replies. See [prompt-caching.md](prompt-caching.md#streamed-replies-report-nothing-unless-asked). |
+| `otlp.endpoint` | — | Collector base URL. Empty disables the exporter unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. |
+| `otlp.protocol` | `http/protobuf` | Or `http/json`. |
+| `otlp.interval` | `60s` | |
+| `otlp.timeout` | `10s` | Must be below `interval`. |
+| `otlp.compress` | `true` | gzip the payload. |
+| `otlp.service_name` | `ai-gateway` | Becomes the `service.name` resource attribute. |
+| `otlp.headers` | — | Sent on every export. |
+| `otlp.resource_attributes` | — | Added to every export. |
 
 `stream_usage` adds `stream_options.include_usage` to a streamed request that did
 not set `stream_options` itself. Without it such a reply carries no usage at all
 and the request is billed as zero — no cost, no budget, no cached tokens. The
 cost of asking is one extra chunk at the end of the stream; turn it off for a
 client or an upstream that cannot take one.
+
+`otlp` pushes the same metrics `/metrics` serves to an OpenTelemetry collector.
+The two are independent — either, both or neither may be on — and both render
+one snapshot, so they cannot disagree about a number. See
+[observability.md](observability.md#opentelemetry). The standard
+`OTEL_EXPORTER_OTLP_*` environment variables are read where this block is
+silent, so a collector sidecar that configures everything else in a fleet
+configures this too.
 
 ## Endpoints
 

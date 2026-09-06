@@ -278,7 +278,9 @@ func TestStreamedUsageIsAssembledAcrossEvents(t *testing.T) {
 		"",
 	}, "\n")
 
-	usage, err := Relay(httptest.NewRecorder(), strings.NewReader(stream), core.FormatAnthropic)
+	relayed, err := Relay(httptest.NewRecorder(), strings.NewReader(stream), core.FormatAnthropic)
+
+	usage := relayed.Usage
 	if err != nil {
 		t.Fatalf("Relay: %v", err)
 	}
@@ -303,7 +305,9 @@ func TestStreamedOpenAIUsageArrivesInTheFinalChunk(t *testing.T) {
 		"",
 	}, "\n")
 
-	usage, err := Relay(httptest.NewRecorder(), strings.NewReader(stream), core.FormatOpenAI)
+	relayed, err := Relay(httptest.NewRecorder(), strings.NewReader(stream), core.FormatOpenAI)
+
+	usage := relayed.Usage
 	if err != nil {
 		t.Fatalf("Relay: %v", err)
 	}
@@ -324,7 +328,9 @@ func TestStreamedTallyNeverRegresses(t *testing.T) {
 		"",
 	}, "\n")
 
-	usage, err := Relay(httptest.NewRecorder(), strings.NewReader(stream), core.FormatAnthropic)
+	relayed, err := Relay(httptest.NewRecorder(), strings.NewReader(stream), core.FormatAnthropic)
+
+	usage := relayed.Usage
 	if err != nil {
 		t.Fatalf("Relay: %v", err)
 	}
@@ -342,7 +348,9 @@ func TestStreamedTallyNeverRegresses(t *testing.T) {
 func TestUsageSurvivesAChunkBoundaryMidField(t *testing.T) {
 	const line = `data: {"usage":{"prompt_tokens":12345,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":12000}}}` + "\n"
 
-	usage, err := Relay(httptest.NewRecorder(), oneByteAtATime(line), core.FormatOpenAI)
+	relayed, err := Relay(httptest.NewRecorder(), oneByteAtATime(line), core.FormatOpenAI)
+
+	usage := relayed.Usage
 	if err != nil {
 		t.Fatalf("Relay: %v", err)
 	}

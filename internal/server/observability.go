@@ -104,9 +104,16 @@ func (s *Server) record(r *http.Request, obs observation) {
 
 	pricing := s.pricing[obs.deployment]
 	cost, savings := 0.0, 0.0
+	discount, premium := 0.0, 0.0
 	if pricing.billable {
 		cost = pricing.price.Cost(obs.usage)
 		savings = pricing.price.CacheSavings(obs.usage)
+		// The ledger reports savings as one signed figure, which is the right
+		// shape for a report a human reads. Metrics need the two halves apart:
+		// their difference is signed, and a counter that can fall is not a
+		// counter — every rate() over it would break the moment caching started
+		// costing more than it saved, which is exactly when it matters.
+		discount, premium = pricing.price.CacheBreakdown(obs.usage)
 		s.warnUnpricedCacheTier(obs, pricing.price)
 		s.warnUnpricedCacheWrite(obs, pricing.price)
 	}
@@ -128,7 +135,7 @@ func (s *Server) record(r *http.Request, obs observation) {
 		}
 	}
 
-	s.metrics.Observe(obs.toResult(cost))
+	s.metrics.Observe(obs.toResult(cost, discount, premium))
 }
 
 // recordTimeout bounds accounting so a wedged store cannot pin a handler open
@@ -152,10 +159,27 @@ type observation struct {
 	// deployment quietly billing nothing.
 	format    core.Format
 	streaming bool
+
+	// statusClass is the class of the upstream response the caller received,
+	// as "2xx", "4xx", "5xx". Empty where no upstream answered.
+	statusClass string
+	// requestBytes and responseBytes are body sizes, headers excluded.
+	requestBytes, responseBytes int64
+	// timeToFirstToken is measured from the caller's request arriving, so it
+	// includes the routing and retrying they waited through. streamCompleted
+	// says whether the stream then ran to the end; throughput is output tokens
+	// per second measured after the first chunk.
+	timeToFirstToken time.Duration
+	streamCompleted  bool
+	throughput       float64
 }
 
 // toResult renders an observation for the metrics registry.
-func (o observation) toResult(cost float64) metrics.Result {
+//
+// discount and premium are the two halves of what prompt caching did to this
+// request's bill. They are passed in rather than derived here because pricing
+// belongs to the deployment, which record has already looked up.
+func (o observation) toResult(cost, discount, premium float64) metrics.Result {
 	return metrics.Result{
 		Model:        o.model,
 		Deployment:   o.deployment,
@@ -171,6 +195,22 @@ func (o observation) toResult(cost float64) metrics.Result {
 		CacheWriteTokens:   o.usage.CacheWriteTokens,
 		CacheWrite1hTokens: o.usage.CacheWrite1hTokens,
 		PromptAffinity:     o.promptAffinity,
+
+		InputTokens:  o.usage.InputTokens,
+		OutputTokens: o.usage.OutputTokens,
+		PromptTokens: o.usage.PromptTokens(),
+
+		CacheDiscount:     discount,
+		CacheWritePremium: premium,
+
+		Streaming:        o.streaming,
+		StreamCompleted:  o.streamCompleted,
+		TimeToFirstToken: o.timeToFirstToken,
+		Throughput:       o.throughput,
+
+		UpstreamStatusClass: o.statusClass,
+		RequestBytes:        o.requestBytes,
+		ResponseBytes:       o.responseBytes,
 	}
 }
 
@@ -194,6 +234,12 @@ func (s *Server) warnUnpricedCacheTier(obs observation, price core.Pricing) {
 	// The rate that fell back is the one belonging to the tier this request was
 	// billed at, so a long-context deployment is told to price the long-context
 	// block rather than the base one it may already have priced correctly.
+	// A deployment whose writes are free has no premium to under-report: both
+	// tiers are zero, and the fallback is the correct figure rather than an
+	// approximation of one.
+	if price.CacheWritesFree {
+		return
+	}
 	key, priced, fallback := "cost.cache_write_1h_per_1m", price.CacheWrite1hPer1M > 0, price.CacheWritePer1M
 	if tier := price.TierFor(obs.usage); tier != nil {
 		key, priced, fallback = "cost.long_context.cache_write_1h_per_1m", tier.CacheWrite1hPer1M > 0, tier.CacheWritePer1M
@@ -228,6 +274,11 @@ func (s *Server) warnUnpricedCacheTier(obs observation, price core.Pricing) {
 // the total is wrong.
 func (s *Server) warnUnpricedCacheWrite(obs observation, price core.Pricing) {
 	if obs.usage.CacheWriteTokens == 0 {
+		return
+	}
+	// Nothing fell back: the operator declared the write price to be zero, so
+	// zero is what was charged.
+	if price.CacheWritesFree {
 		return
 	}
 	key, priced := "cost.cache_write_per_1m", price.CacheWritePer1M > 0

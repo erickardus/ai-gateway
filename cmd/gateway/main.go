@@ -20,6 +20,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/metrics"
+	"github.com/erickardus/ai-gateway/internal/otlp"
 	"github.com/erickardus/ai-gateway/internal/provider"
 	"github.com/erickardus/ai-gateway/internal/router"
 	"github.com/erickardus/ai-gateway/internal/rstate"
@@ -124,14 +125,48 @@ func run() error {
 		}
 	}
 
+	// The registry is built before the router so the router can report an
+	// ejection into it. Metrics are enabled by either publisher: an operator who
+	// exports over OTLP but does not serve /metrics still needs them collected.
+	var reg *metrics.Registry
+	if cfg.Observability.Metrics || cfg.Observability.OTLP.Enabled() {
+		reg = metrics.New()
+	}
+
 	client := newUpstreamClient(cfg)
-	rtr, err := router.New(cfg, state, client, log, router.Options{})
+	rtr, err := router.New(cfg, state, client, log, router.Options{
+		Ejected: func(model, deployment string) {
+			reg.Add(metrics.MCooldowns, 1, "model", model, "deployment", deployment)
+		},
+	})
 	if err != nil {
 		return fmt.Errorf("initialize router: %w", err)
 	}
-	var reg *metrics.Registry
-	if cfg.Observability.Metrics {
-		reg = metrics.New()
+	registerLiveGauges(reg, cfg, rtr, store, shared, version)
+
+	// Push the same snapshot /metrics serves to an OTLP collector. The two are
+	// independent: either, both or neither may be on, and both render the same
+	// snapshot so they cannot disagree about a number.
+	var otlpDone chan struct{}
+	if cfg.Observability.OTLP.Enabled() {
+		o := cfg.Observability.OTLP
+		exporter, err := otlp.New(reg, otlp.Options{
+			Endpoint: o.Endpoint,
+			Protocol: otlp.Protocol(o.Protocol),
+			Headers:  o.Headers,
+			Interval: o.Interval,
+			Timeout:  o.Timeout,
+			Compress: o.CompressEnabled(),
+			Resource: otlpResource(o, version),
+		}, log)
+		if err != nil {
+			return fmt.Errorf("initialize otlp exporter: %w", err)
+		}
+		otlpDone = make(chan struct{})
+		go func() {
+			defer close(otlpDone)
+			exporter.Run(ctx)
+		}()
 	}
 
 	srv := server.New(cfg, authn, store, rtr, log, ledger, reg, shared, responses).HTTPServer()
@@ -171,6 +206,7 @@ func run() error {
 		"deployments", len(cfg.ModelList),
 		"key_management", authn.HasMasterKey(),
 		"metrics", cfg.Observability.Metrics,
+		"otlp", cfg.Observability.OTLP.Endpoint,
 		"spend_store", cfg.Observability.SpendStorePath != "",
 		"shared_state", cfg.Redis.Enabled(),
 		"cache", cfg.Cache.Enabled,
@@ -203,6 +239,14 @@ func run() error {
 			return fmt.Errorf("close server: %w", closeErr)
 		}
 	}
+	// The exporter's context is already cancelled; wait for its final flush so
+	// the interval since the last push is not lost. It is bounded by the
+	// exporter's own timeout, and the shutdown grace has already elapsed by the
+	// time anything is waiting here.
+	if otlpDone != nil {
+		<-otlpDone
+	}
+
 	log.Info("gateway stopped")
 	return nil
 }

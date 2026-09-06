@@ -123,3 +123,79 @@ func TestDocsReferenceRealEndpoints(t *testing.T) {
 		}
 	}
 }
+
+// TestDocumentedOTLPDefaultsMatchCode pins the exporter defaults published in
+// docs/configuration.md and docs/observability.md.
+//
+// They are checked separately from the rest because they apply only once an
+// endpoint turns the exporter on: with none set, the whole block stays zero so
+// that a gateway exporting nothing does not carry a half-configured exporter.
+func TestDocumentedOTLPDefaultsMatchCode(t *testing.T) {
+	// The defaults read the standard OpenTelemetry variables, so the ambient
+	// environment has to be cleared or the assertions depend on the machine.
+	for _, k := range []string{
+		"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "OTEL_EXPORTER_OTLP_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_METRICS_HEADERS", "OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_SERVICE_NAME", "OTEL_RESOURCE_ATTRIBUTES",
+	} {
+		t.Setenv(k, "")
+	}
+
+	cfg, err := Parse([]byte(`
+model_list:
+  - model_name: m
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      auth_mode: api_key
+      auth_header: x-api-key
+      api_key: k
+observability:
+  otlp:
+    endpoint: http://localhost:4318
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	o := cfg.Observability.OTLP
+	documented := []struct {
+		field string
+		got   any
+		want  any
+	}{
+		{"observability.otlp.protocol", o.Protocol, "http/protobuf"},
+		{"observability.otlp.interval", o.Interval.String(), "1m0s"},
+		{"observability.otlp.timeout", o.Timeout.String(), "10s"},
+		{"observability.otlp.compress", o.CompressEnabled(), true},
+		{"observability.otlp.service_name", o.ServiceName, "ai-gateway"},
+	}
+	for _, d := range documented {
+		if d.got != d.want {
+			t.Errorf("%s = %v, but the docs say %v — update both together", d.field, d.got, d.want)
+		}
+	}
+
+	// With no endpoint the block stays empty, so nothing half-configured is
+	// carried by a gateway that exports nothing.
+	off, err := Parse([]byte(`
+model_list:
+  - model_name: m
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      auth_mode: api_key
+      auth_header: x-api-key
+      api_key: k
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if off.Observability.OTLP.Enabled() {
+		t.Error("the exporter reported itself enabled with no endpoint configured")
+	}
+	if off.Observability.OTLP.Protocol != "" || off.Observability.OTLP.Interval != 0 {
+		t.Errorf("defaults were applied to a disabled exporter: %+v", off.Observability.OTLP)
+	}
+}
