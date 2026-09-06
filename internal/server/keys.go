@@ -182,7 +182,7 @@ func (s *Server) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	// Release the key's rate-limit counter and spend record; it can never be
 	// used again, so retaining either would only leak memory and skew reports.
-	s.auth.Limiter().Forget(req.Hash)
+	s.auth.ForgetKey(r.Context(), req.Hash)
 	// Both ledger implementations expose Forget; the interface deliberately does
 	// not, since dropping a subject is an administrative action rather than
 	// something the accounting path needs.

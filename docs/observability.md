@@ -357,9 +357,9 @@ outcome, how long. Measuring twice would let the two drift apart.
 ## Running more than one instance
 
 By default every replica keeps its own counters, so a `rpm: 100` limit across
-three replicas admits up to 300 requests a minute, and a key with a $50 budget
-can spend $50 on each instance. Point them at one Redis and the limits become
-what they say:
+three replicas admits up to 300 requests a minute, a key with `rpm_limit: 60`
+gets 180, and a key with a $50 budget can spend $50 on each instance. Point them
+at one Redis and the limits become what they say:
 
 ```yaml
 redis:
@@ -368,11 +368,19 @@ redis:
   timeout: 250ms
 ```
 
+`deploy/docker-compose.yml` runs two instances against one Redis, which is the
+smallest arrangement in which any of the rows below can be observed to differ:
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build   # gateways on :4000 and :4001
+```
+
 ### What is shared, and what is not
 
 | State | Where | Why |
 |---|---|---|
-| Rate limits (`rpm`/`tpm`) | Redis | A per-process limit is silently multiplied by the replica count. |
+| Deployment rate limits (`model_list[].rpm`/`tpm`) | Redis | A per-process limit is silently multiplied by the replica count. |
+| Key rate limits (`keys[].rpm_limit`/`tpm_limit`) | Redis | The same arithmetic, applied to the caller's allowance rather than the upstream's capacity. Counted in a separate keyspace from the deployment limits, so a key hash and a deployment id can never draw on one window. |
 | Cooldowns | Redis | An upstream ejected by one instance should be ejected everywhere. |
 | Spend and budgets | Redis | Otherwise a key spends its whole allowance once per instance. |
 | Prompt-prefix pins | Redis | Behind a load balancer the next turn of a conversation arrives at a different replica; a per-instance pin would send it to a different upstream, which is the thing the pin exists to prevent. |

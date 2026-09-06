@@ -1,0 +1,64 @@
+# A runnable two-instance gateway: what the README describes as "point them at
+# one Redis", actually wired up.
+#
+# It exists to make the multi-instance path testable without a cluster. Every
+# limit the gateway enforces — a deployment's rpm, a key's rpm_limit, a key's
+# budget — reads differently with one replica than with two, and a single
+# container cannot show the difference.
+#
+#   cp ../config/gateway.example.yaml ../config/gateway.yaml   # then edit it
+#   export ANTHROPIC_API_KEY=... GATEWAY_MASTER_KEY=... DEV_KEY=...
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# The gateways listen on 4000 and 4001. Send traffic to either: they share
+# limits, cooldowns, budgets and prompt-prefix pins through Redis.
+
+name: ai-gateway
+
+services:
+  redis:
+    image: redis:7-alpine
+    # No persistence: everything here is a counter with a TTL, and a restart
+    # that forgets them costs one window rather than any data.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway-a: &gateway
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports: ["4000:4000"]
+    environment:
+      # The gateway reads ${VAR} and ${VAR:-default} out of its YAML, so the
+      # config file carries no secrets and the compose file passes none of its
+      # own. Anything unset here is unset in the container.
+      REDIS_ADDR: redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GATEWAY_MASTER_KEY: ${GATEWAY_MASTER_KEY:-}
+      DEV_KEY: ${DEV_KEY:-}
+    volumes:
+      # Read-only: the gateway never writes its configuration, and mounting it
+      # writable would let a compromised container rewrite which upstream its
+      # traffic — and on a passthrough deployment, its callers' credentials —
+      # is relayed to.
+      - ../config/gateway.yaml:/etc/ai-gateway/gateway.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    # No healthcheck here on purpose. The runtime image is distroless — no
+    # shell, no curl, no wget — so the only thing a check could run is the
+    # gateway binary itself, and `gateway -version` proves the binary executes
+    # rather than that it is serving. A check that always passes is worse than
+    # none, because compose reports it as health. Probe
+    # GET /health/liveliness (unauthenticated, by design) from outside, or
+    # /health/readiness for whether the key store and Redis are reachable.
+    restart: unless-stopped
+
+  gateway-b:
+    <<: *gateway
+    ports: ["4001:4000"]

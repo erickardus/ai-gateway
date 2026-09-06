@@ -132,7 +132,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	// Charge the key's rate limit only now that the request is known to be one
 	// the gateway will actually dispatch.
-	if err := s.auth.Admit(authCtx); err != nil {
+	if err := s.auth.Admit(ctx, authCtx); err != nil {
 		s.reject(r, &obs, "rate_limited", started)
 		s.fail(w, r, err)
 		return
@@ -250,7 +250,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// is something only the response says.
 	s.router.RecordPrefix(context.WithoutCancel(ctx), result, usage)
 	if authCtx.Key != nil {
-		s.auth.Limiter().AddTokens(authCtx.Key.Hash, usage.Total())
+		s.auth.RecordKeyTokens(context.WithoutCancel(ctx), authCtx.Key.Hash, usage.Total())
 	}
 
 	// Store only a stream that completed. A truncated response replayed for the
