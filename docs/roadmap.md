@@ -83,6 +83,35 @@ response-cache key, so it was not worth doing before the feature had users.
 Claude Code places its own breakpoints, so nothing is lost on the traffic this
 gateway primarily carries.
 
+### 🟡 A deployment that refuses an annotation is retried, not remembered
+
+Injection marks three positions, one of which — the top-level `cache_control`
+field — is not accepted everywhere; the legacy Bedrock integration rejects it.
+An upstream answering `400` to an annotated body is retried once with the
+request as it arrived, so the caller never loses a request, and the deployment
+is named in the log.
+
+The round trip is paid on **every** request until an operator acts on that line.
+Remembering the rejection per deployment would avoid it, but injection is decided
+before the router picks one, so the body would have to be annotated per attempt
+rather than per request — the same per-deployment body transform the entry above
+wants. Until then the log line is the mechanism, which is why it names the
+setting to unset rather than just reporting the status.
+
+### 🟡 A declared one-hour cache is read from the prefix only
+
+A pin lives as long as the cache entry it points at, so a request declaring the
+one-hour breakpoint is pinned for an hour rather than for `affinity_ttl`. The
+declaration is read from the tools and the system prompt, which are small and
+already walked. The API requires longer-lived entries to precede shorter-lived
+ones, so a one-hour breakpoint sharing a request with any five-minute one is in
+those; a request whose *only* breakpoint is a one-hour marker further into the
+message history is pinned for the default instead.
+
+Catching that case means walking the whole message array on every request, which
+is the cost the fingerprint is deliberately shaped to avoid. The consequence is a
+pin that lapses early on an unusual request shape, not a wrong one.
+
 ### 🟡 Prefix affinity concentrates load, bounded by in-flight rather than share
 
 A fingerprint covers a request's prefix, not a conversation, so all traffic
@@ -159,16 +188,19 @@ An OpenAI-compatible provider caches automatically, keyed on the prefix itself.
 routing, and it earns its keep for a caller sending one prefix at high rates —
 which is what a company standardizing on one system prompt looks like.
 
-The gateway does not send it. Doing so means editing the request body, and body
-rewrites carry the constraints that already keep breakpoint injection off the
-passthrough path: the response-cache key, retry and fallback all assume one set
-of bytes per request, and an OpenAI-*compatible* server that is strict about
-unknown fields would 400 rather than ignore it.
+The gateway does not send it. It does now edit an OpenAI-format body — a
+streamed request gets `stream_options.include_usage` so the deployment can be
+billed at all — so the objection is no longer that such an edit is impossible.
+It is that this one is optional where that one is the difference between a bill
+and a zero: an OpenAI-*compatible* server strict about unknown fields would 400
+rather than ignore it, and the same risk buys much less.
 
-The seam is the same one injection wants: a per-deployment body transform
-carried on `provider.Request` and applied by `Client.Do`. Prefix affinity
-already gives the gateway the fingerprint such a key would be derived from, so
-the work is the plumbing rather than the value.
+Both edits happen before routing, so the response-cache key is taken from the
+body as it arrived and every retry and fallback attempt sends the same bytes.
+A per-deployment transform carried on `provider.Request` and applied by
+`Client.Do` is still what a field worth varying per upstream would want. Prefix
+affinity already gives the gateway the fingerprint such a key would be derived
+from, so the work is the plumbing rather than the value.
 
 ### 🔴 No cache-hit-rate signal per prefix
 
@@ -248,7 +280,12 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Cache scope | per-key by default | shared-by-default leaks completions across tenants |
 | Provider prompt cache | routed for | LiteLLM balances without regard to it, so every hop pays a cache write instead of a read |
 | OpenAI cached tokens | carved out of `prompt_tokens` | they are reported *inside* the input count, so adding them beside it bills every cached token twice |
+| Streamed OpenAI usage | asked for | a streamed reply reports none unless the request opted in, so the traffic is billed at zero |
+| A moving cache breakpoint | ignored when pinning | every Anthropic client walks one forward each turn, which would re-pin the conversation every time |
 | Anthropic cache-write tiers | priced apart | the one-hour cache costs 2x base input against the five-minute tier's 1.25x |
+| Pin lifetime | follows the declared cache TTL | a five-minute pin on a one-hour entry pays the long tier's premium a second time |
+| `cache_savings` | net of the write premium | a gross figure cannot report that caching is costing money, which is what scattering looks like |
+| Injected breakpoints | tools, system **and** the conversation | marking only the static prefix re-reads a growing history at full price every turn |
 | Passthrough cost | not billed to the operator | it is billed to the caller's subscription |
 
 ---

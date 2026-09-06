@@ -20,7 +20,9 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"strconv"
+	"time"
 
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/jsonx"
@@ -43,15 +45,75 @@ const controlKey = "cache_control"
 // too.
 var controlMarker = []byte(`"` + controlKey + `"`)
 
-// prefixLead is how many leading messages join the fingerprint.
+// prefixLead is how many leading messages join the fingerprint, which differs by
+// wire format because the two put their distinguishing turn in different places.
 //
-// Two is the smallest number that discriminates usefully in both wire formats.
 // Under the Anthropic format the first message is the opening user turn, which
-// differs per conversation; under OpenAI it is often a system message shared by
-// every caller, and the second is what tells two conversations apart. Both are
-// stable for the life of a conversation, which is the property the fingerprint
-// needs.
-const prefixLead = 2
+// differs per conversation and is therefore enough on its own. Under OpenAI the
+// first is often a system message shared by every caller, and the second is what
+// tells two conversations apart.
+//
+// The count has to be one a conversation satisfies from its very first request,
+// not merely later on. A lead of two under the Anthropic format would read one
+// message on the opening turn and two on every turn after it, so the opening
+// turn would fingerprint differently from the conversation it begins — and the
+// upstream it warmed would be the one deployment the second turn had no reason
+// to return to. An OpenAI conversation carrying a system message already holds
+// two messages on its first request, so two is stable there from the start.
+func prefixLead(format core.Format) int {
+	if format == core.FormatAnthropic {
+		return 1
+	}
+	return 2
+}
+
+// LongCacheLifetime is how long Anthropic's extended cache entry lives. A caller
+// opts into it per breakpoint, paying twice base input to write rather than
+// 1.25x, in exchange for an entry that survives a gap the default five-minute
+// one would not.
+const LongCacheLifetime = time.Hour
+
+// longTTL is the lifetime a one-hour breakpoint names.
+const longTTL = "1h"
+
+// DeclaresLongCacheTTL reports whether the request asks for the one-hour prompt
+// cache.
+//
+// It decides how long a prefix pin should live. A pin exists to send the next
+// turn back to the upstream holding the warm entry, so a pin that lapses before
+// that entry does hands the conversation back to the load balancer while the
+// cache it paid two times input to write is still sitting there — and the turn
+// that lands elsewhere pays that premium again.
+//
+// Only the tools and the system prompt are read. Both are small, both are
+// already walked to fingerprint the request, and the API requires longer-lived
+// entries to appear before shorter-lived ones — so a one-hour breakpoint that
+// coexists with any five-minute breakpoint is in one of them. Scanning the
+// message history for the remaining case would cost a walk over the largest part
+// of every request, which is the expense the fingerprint itself is shaped to
+// avoid.
+func DeclaresLongCacheTTL(fields jsonx.Fields) bool {
+	return declaresLongTTL(fields.Tools) || declaresLongTTL(fields.System)
+}
+
+func declaresLongTTL(value []byte) bool {
+	if !bytes.Contains(value, controlMarker) {
+		return false
+	}
+	values, err := jsonx.MemberValues(value, controlKey)
+	if err != nil {
+		return false
+	}
+	for _, v := range values {
+		var control struct {
+			TTL string `json:"ttl"`
+		}
+		if json.Unmarshal(v, &control) == nil && control.TTL == longTTL {
+			return true
+		}
+	}
+	return false
+}
 
 // Fingerprint identifies the cacheable prefix of a request, or returns false
 // when the body has none worth pinning on.
@@ -60,6 +122,13 @@ const prefixLead = 2
 // grows — the tool definitions, the system blocks and the opening turns — and
 // deliberately not the trailing messages, which change on every turn and would
 // make the fingerprint useless as an affinity key.
+//
+// Cache breakpoints are excluded from the hash. They are metadata saying where
+// a prefix ends rather than prompt text an upstream tokenizes, and every client
+// that places its own walks the last one forward as the conversation grows —
+// Claude Code does, and so does the SDKs' automatic caching. Hashing them would
+// make each turn of one conversation a different prefix, which is the precise
+// condition this whole package exists to prevent.
 //
 // The model group and wire format are included so that two groups sharing a
 // prompt do not share a pin, and the whole thing is hashed rather than kept, so
@@ -78,12 +147,12 @@ func Fingerprint(format core.Format, model string, fields jsonx.Fields) (string,
 	}
 	write([]byte(format))
 	write([]byte(model))
-	write(fields.System)
-	write(fields.Tools)
+	write(stripBreakpoints(fields.System))
+	write(stripBreakpoints(fields.Tools))
 
-	lead := fields.LeadingMessages(prefixLead)
+	lead := fields.LeadingMessages(prefixLead(format))
 	for _, message := range lead {
-		write(message)
+		write(stripBreakpoints(message))
 	}
 
 	// A request with no prefix at all — no system, no tools, no messages — has
@@ -95,48 +164,93 @@ func Fingerprint(format core.Format, model string, fields jsonx.Fields) (string,
 	return hex.EncodeToString(h.Sum(nil)), true
 }
 
-// Inject marks the stable prefix of an Anthropic request as cacheable, and
-// reports whether it changed anything.
+// stripBreakpoints removes cache_control members from a value so that a
+// breakpoint moving through a conversation does not change its fingerprint.
 //
-// Breakpoints go at the end of the tool definitions and at the end of the
-// system prompt, which together are the part of a request that does not change
-// from one turn to the next. Trailing messages are deliberately left alone: a
-// breakpoint there is rewritten on every turn, so it buys one cache write for
-// every cache read.
+// The byte scan is the same prefilter alreadyMarked uses, and for the same
+// reason: the bytes appear in any conversation that discusses prompt caching,
+// so their presence only means the structural walk is worth running. A value
+// that cannot be walked is hashed as it arrived — a fingerprint that is stable
+// for a request shape the gateway does not recognize is still better than none.
+func stripBreakpoints(value []byte) []byte {
+	if !bytes.Contains(value, controlMarker) {
+		return value
+	}
+	stripped, changed, err := jsonx.StripObjectKey(value, controlKey)
+	if err != nil || !changed {
+		return value
+	}
+	return stripped
+}
+
+// Inject marks the cacheable parts of an Anthropic request, and reports whether
+// it changed anything.
 //
-// It is skipped entirely when the body already carries a breakpoint of its own.
-// The API caps how many a request may hold, and a caller that placed its own
-// knows where its prompt actually repeats.
+// Explicit breakpoints go at the end of the tool definitions and at the end of
+// the system prompt, which together are the part of a request that does not
+// change from one turn to the next. Those two are read points that survive
+// whatever happens later in the conversation.
 //
-// minBytes suppresses breakpoints on prefixes too short for a provider to
-// cache. Anthropic ignores a breakpoint below its minimum rather than
-// rejecting it, so the threshold is an economy, not a correctness requirement.
+// They do not, on their own, cache the conversation. Render order is tools, then
+// system, then messages, so a breakpoint at the end of the system prompt caches
+// everything before it and nothing after — and the messages are what grow. A
+// caller with a modest system prompt and a long history would re-read the whole
+// history at full price on every turn while the gateway reported that caching
+// was working.
+//
+// So, where the request can carry it, injection also sets the top-level
+// cache_control field. That is Anthropic's automatic caching: the API places a
+// breakpoint on the last cacheable block and walks it forward as the
+// conversation grows, which is precisely the marker a gateway cannot maintain
+// itself — one written into the body would be rewritten every turn, buying a
+// cache write for each read. Together the three are the combination the API
+// documents for an agent loop: a guaranteed read point on the expensive static
+// prefix, plus automatic caching for the tail.
+//
+// Three of the four breakpoints a request may hold, which is deliberate. The two
+// documented ways of combining an explicit marker with the automatic one are
+// both refused with a 400: all four slots already taken, and an explicit marker
+// on the last block whose lifetime differs from the top-level field's. Neither
+// can arise here, because injection runs only on a body carrying no breakpoint
+// of its own and every marker it places has the same default lifetime.
+//
+// It is skipped entirely when the body already carries a breakpoint. A caller
+// that placed its own knows where its prompt actually repeats, and the API caps
+// how many a request may hold.
+//
+// minBytes suppresses breakpoints on prompts too short for a provider to cache.
+// It is measured over the whole prompt — tools, system and messages — because
+// that is what the automatic breakpoint would cache; measuring only the static
+// prefix would skip exactly the caller this is for, whose history is long and
+// whose system prompt is not. Anthropic ignores a breakpoint below its own
+// minimum rather than rejecting it, so the threshold is an economy, not a
+// correctness requirement.
 //
 // The body is edited by splicing, never by re-encoding: a re-marshalled request
 // would reorder keys and renormalize numbers, which changes the very prefix
 // bytes the upstream cache keys on.
-func Inject(body []byte, minBytes int) ([]byte, bool, error) {
+func Inject(body []byte, minBytes int, markConversation bool) ([]byte, bool, error) {
 	if marked, err := alreadyMarked(body); err != nil {
 		return body, false, err
 	} else if marked {
 		return body, false, nil
 	}
 
-	values, err := jsonx.RawTopLevel(body, "system", "tools")
+	values, err := jsonx.RawTopLevel(body, "system", "tools", "messages")
 	if err != nil {
 		return body, false, err
 	}
-	system, tools := values[0], values[1]
-	if len(system)+len(tools) < minBytes {
+	system, tools, messages := values[0], values[1], values[2]
+	if len(system)+len(tools)+len(messages) < minBytes {
 		return body, false, nil
 	}
 
-	// Both breakpoints are decided before either is spliced, so the document is
-	// walked once to read and once to write rather than once per edit. Each
-	// walk revalidates the whole body, and on the request bodies this runs
-	// against that is what editing actually costs.
+	// Both explicit breakpoints are decided before either is spliced, so the
+	// document is walked once to read and once to write rather than once per
+	// edit. Each walk revalidates the whole body, and on the request bodies this
+	// runs against that is what editing actually costs.
 	marks := make(map[string][]byte, 2)
-	if marked, ok, err := markLastElement(tools); err != nil {
+	if marked, ok, err := markLastElement(tools, markable); err != nil {
 		return body, false, err
 	} else if ok {
 		marks["tools"] = marked
@@ -146,15 +260,63 @@ func Inject(body []byte, minBytes int) ([]byte, bool, error) {
 	} else if ok {
 		marks["system"] = marked
 	}
-	if len(marks) == 0 {
+
+	out, changed := body, false
+	if len(marks) > 0 {
+		out, err = jsonx.SetTopLevelValues(out, marks)
+		if err != nil {
+			return body, false, err
+		}
+		changed = true
+	}
+	// The automatic breakpoint is only worth a slot where there is a
+	// conversation for it to follow. With no messages it would land on the
+	// system block this already marked explicitly, which the API treats as a
+	// no-op.
+	if markConversation && hasElements(messages) {
+		asked, added, err := jsonx.AddMember(out, controlKey, cacheControl)
+		if err != nil {
+			return body, false, err
+		}
+		if added {
+			out, changed = asked, true
+		}
+	}
+	if !changed {
 		return body, false, nil
 	}
-
-	out, err := jsonx.SetTopLevelValues(body, marks)
-	if err != nil {
-		return body, false, err
-	}
 	return out, true, nil
+}
+
+// hasElements reports whether a JSON array holds at least one element. An empty
+// messages array is not a conversation, and a breakpoint set to follow one that
+// is not there would land on the system prompt already marked explicitly.
+func hasElements(array []byte) bool {
+	if len(array) == 0 {
+		return false
+	}
+	spans, err := jsonx.Elements(array)
+	return err == nil && len(spans) > 0
+}
+
+// markable reports whether a tool definition is one a breakpoint is known to be
+// accepted on.
+//
+// A custom tool declares an input_schema. The rest of what may appear in the
+// tools array does not: server tools such as web search or code execution are
+// named by type alone, an MCP toolset names a server, and both are shapes the
+// gateway has no way to validate a breakpoint against. Marking one to find out
+// costs a 400 on a request that would otherwise have been served.
+//
+// Skipping it loses nothing, which is what makes this the cheap answer rather
+// than a compromise: tools render before the system prompt, so the breakpoint at
+// the end of the system prompt already caches every tool in the list. The tools
+// marker is a second read point for a caller whose system prompt changes while
+// its tools do not, and a caller mixing server tools into that position simply
+// does not get one.
+func markable(tool []byte) bool {
+	ok, err := jsonx.HasMember(tool, "input_schema")
+	return err == nil && ok
 }
 
 // markSystem places a breakpoint on the system prompt in either of the two
@@ -175,12 +337,16 @@ func markSystem(system []byte) ([]byte, bool, error) {
 		out = append(out, "}]"...)
 		return out, true, nil
 	}
-	return markLastElement(system)
+	// Every block a system prompt may hold is a text block, so there is nothing
+	// to discriminate on the way there is among tools.
+	return markLastElement(system, nil)
 }
 
-// markLastElement adds a breakpoint to the final element of a JSON array,
-// which is where a cacheable prefix ends.
-func markLastElement(array []byte) ([]byte, bool, error) {
+// markLastElement adds a breakpoint to the final element of a JSON array, which
+// is where a cacheable prefix ends. A nil eligible marks whatever is there; one
+// that returns false leaves the array alone rather than marking something the
+// upstream might reject.
+func markLastElement(array []byte, eligible func([]byte) bool) ([]byte, bool, error) {
 	if len(array) == 0 {
 		return nil, false, nil
 	}
@@ -198,6 +364,9 @@ func markLastElement(array []byte) ([]byte, bool, error) {
 	last := spans[len(spans)-1]
 	element := array[last[0]:last[1]]
 	if len(element) == 0 || element[0] != '{' {
+		return nil, false, nil
+	}
+	if eligible != nil && !eligible(element) {
 		return nil, false, nil
 	}
 

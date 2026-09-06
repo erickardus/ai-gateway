@@ -150,14 +150,18 @@ The **provider's** cache of a request's leading tokens, as distinct from
 | Key | Default | Notes |
 |---|---|---|
 | `affinity` | `true` | Pin requests sharing a cacheable prefix to the deployment that last served one. A preference, never a constraint. Inert in a group with one deployment. |
-| `affinity_ttl` | `5m` | How long a pin survives without use. Matches the lifetime of an ephemeral prompt-cache entry. |
+| `affinity_ttl` | `5m` | How long a pin survives without use. Matches the lifetime of an ephemeral prompt-cache entry. A request declaring the one-hour cache is pinned for an hour regardless, so the pin does not expire before the entry it points at. |
 | `affinity_max_in_flight_lead` | `4` | A pin is passed over once the pinned deployment carries this many more in-flight requests than the idlest deployment that could serve it instead. `0` yields to any idler peer. |
-| `inject` | `false` | Place cache breakpoints on the tools and system prompt of an Anthropic request that carries none of its own. |
-| `inject_min_bytes` | `4096` | Prefixes smaller than this are left unmarked; a provider would ignore the breakpoint anyway. |
+| `inject` | `false` | Place cache breakpoints on an Anthropic request that carries none of its own: the tools, the system prompt, and the top-level field that caches the conversation. |
+| `inject_min_bytes` | `4096` | Prompts smaller than this are left unmarked; a provider would ignore the breakpoint anyway. Measured over tools, system **and** messages, since the conversation is cached too. |
 
 `inject: true` is **refused at load** while any passthrough deployment exists,
 and while any deployment speaks a format other than `anthropic`. Injection edits
 the request body, and passthrough exists to forward one unchanged.
+
+An upstream that answers `400` to an annotated body is retried once with the
+request as it arrived, and named in the log. See
+[prompt-caching.md](prompt-caching.md#when-an-upstream-refuses-an-annotation).
 
 ## `observability`
 
@@ -168,6 +172,13 @@ the request body, and passthrough exists to forward one unchanged.
 | `metrics` | `false` | Serves `GET /metrics`. |
 | `spend_store_path` | — | Persists budgets across restarts. |
 | `spend_flush_interval` | `30s` | |
+| `stream_usage` | `true` | Ask OpenAI-compatible upstreams to report usage on streamed replies. See [prompt-caching.md](prompt-caching.md#streamed-replies-report-nothing-unless-asked). |
+
+`stream_usage` adds `stream_options.include_usage` to a streamed request that did
+not set `stream_options` itself. Without it such a reply carries no usage at all
+and the request is billed as zero — no cost, no budget, no cached tokens. The
+cost of asking is one extra chunk at the end of the stream; turn it off for a
+client or an upstream that cannot take one.
 
 ## Endpoints
 

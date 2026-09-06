@@ -84,7 +84,7 @@ func (s *Server) writeSpend(w http.ResponseWriter, r *http.Request, fetch func()
 		"total_cost":          totalCost,
 		"total_cache_savings": totalSavings,
 		"note":                "Cost covers only deployments the operator pays for. Passthrough traffic bills the caller's own subscription and is reported as usage with no cost.",
-		"cache_savings_note":  "What the provider's prompt cache took off the bill, against the same tokens charged as ordinary input. It is not included in cost, which is what was actually charged.",
+		"cache_savings_note":  "What the provider's prompt cache took off the bill, against the same tokens charged as ordinary input. Net of the write premium, so it goes negative where caches were written and never read back — which is what a conversation scattered across deployments costs. It is not included in cost, which is what was actually charged.",
 	})
 }
 
@@ -109,6 +109,7 @@ func (s *Server) record(r *http.Request, obs observation) {
 		savings = pricing.price.CacheSavings(obs.usage)
 		s.warnUnpricedCacheTier(obs, pricing.price)
 	}
+	s.warnMissingStreamUsage(obs)
 
 	if s.ledger != nil && obs.deployment != "" {
 		entry := spend.Entry{
@@ -145,6 +146,11 @@ type observation struct {
 	// promptAffinity records whether the request went to the deployment already
 	// holding its prompt prefix. Empty when no pin was consulted.
 	promptAffinity string
+	// format and streaming describe the shape of the request, which is what
+	// says whether an upstream reporting no usage at all is expected or a
+	// deployment quietly billing nothing.
+	format    core.Format
+	streaming bool
 }
 
 // toResult renders an observation for the metrics registry.
@@ -192,4 +198,29 @@ func (s *Server) warnUnpricedCacheTier(obs observation, price core.Pricing) {
 		"model", obs.model,
 		"cache_write_1h_tokens", obs.usage.CacheWrite1hTokens,
 		"cache_write_per_1m", price.CacheWritePer1M)
+}
+
+// warnMissingStreamUsage reports, once per deployment, that a streamed reply
+// from an OpenAI-compatible upstream carried no usage at all.
+//
+// Such a request is recorded as zero of everything: no cost, nothing charged
+// against a budget or a token limit, and a prompt cache whose reads cannot be
+// seen. observability.stream_usage exists to prevent it, so reaching here means
+// either that it is switched off, that the caller set stream_options itself and
+// asked for no usage, or that this upstream ignores the field — and none of the
+// three announces itself anywhere else.
+func (s *Server) warnMissingStreamUsage(obs observation) {
+	if obs.format != core.FormatOpenAI || !obs.streaming || obs.deployment == "" {
+		return
+	}
+	if obs.outcome != metrics.OutcomeSuccess || !obs.usage.Empty() {
+		return
+	}
+	if _, seen := s.unmeasured.LoadOrStore(obs.deployment, true); seen {
+		return
+	}
+	s.log.Warn("streamed reply reported no usage, so it is billed as nothing",
+		"deployment", obs.deployment,
+		"model", obs.model,
+		"remedy", "set observability.stream_usage, or have the caller send stream_options.include_usage")
 }

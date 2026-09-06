@@ -20,9 +20,18 @@ import (
 	"github.com/erickardus/ai-gateway/internal/router"
 )
 
+// streamUsageOptions is what a streamed OpenAI-compatible request needs in order
+// to be billed at all. The field is inert on a non-streamed request, which is
+// why it is only ever added to one that asked to stream.
+var streamUsageOptions = []byte(`{"include_usage":true}`)
+
+// pathMessages is the inference endpoint, as distinct from token counting, which
+// takes the same body and is served by the same path below.
+const pathMessages = "/v1/messages"
+
 // handleMessages serves the Anthropic Messages API.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	s.serveInference(w, r, "/v1/messages", core.FormatAnthropic)
+	s.serveInference(w, r, pathMessages, core.FormatAnthropic)
 }
 
 // handleCountTokens serves Anthropic's token counting endpoint. It is optional
@@ -126,7 +135,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	overrides := router.OverridesFromHeaders(r.Header)
 	overrides.AllowPassthrough = authCtx.Key != nil && authCtx.Key.AllowPassthrough
-	overrides.PromptPrefix = s.promptPrefix(format, fields)
+	overrides.PromptPrefix, overrides.PromptPinTTL = s.promptPrefix(format, fields)
 	if fields.HasDisableFallbacks {
 		overrides.DisableFallbacks = fields.DisableFallbacks
 		// It is a gateway directive, not part of the provider's schema, so it
@@ -139,6 +148,33 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		body = stripped
 	}
 
+	// Everything below annotates the request for the gateway's own benefit
+	// rather than the caller's. The body as it stood before is kept so a request
+	// an upstream rejects because of an annotation can be served without it: the
+	// shapes a breakpoint or a stream option may legally be attached to differ
+	// between providers and change over time, and a gateway that guessed wrong
+	// would otherwise turn an optimization into a failed request.
+	unannotated := body
+	annotated := false
+
+	// Ask an OpenAI-compatible upstream to report usage on a streamed reply.
+	// Without stream_options.include_usage the final chunk carries no usage at
+	// all, so the request is billed as nothing: no cost, no budget charge, no
+	// rate-limit tokens, and a prompt cache whose reads are invisible. A caller
+	// that set stream_options itself is left alone — AddMember reports the
+	// member already present and changes no byte — since it has said what it
+	// wants and the gateway's accounting is not worth overriding it for.
+	if format == core.FormatOpenAI && fields.Stream && s.cfg.Observability.StreamUsageEnabled() {
+		asked, added, err := jsonx.AddMember(body, "stream_options", streamUsageOptions)
+		if err != nil {
+			// As with injection below: a request the gateway could not annotate
+			// is forwarded as it arrived rather than refused.
+			s.log.Warn("stream usage request skipped", "error", err, "request_id", RequestIDFrom(ctx))
+		} else if added {
+			body, annotated = asked, true
+		}
+	}
+
 	// Mark the cacheable prefix last, once every gateway directive has been
 	// stripped: injection edits the body, and editing one that is about to
 	// change again would place a breakpoint against bytes the upstream never
@@ -146,13 +182,17 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// deployment, so no rewritten body can reach the path that must forward one
 	// unchanged.
 	if s.cfg.PromptCache.Inject && format == core.FormatAnthropic {
-		injected, changed, err := promptcache.Inject(body, s.cfg.PromptCache.InjectMinBytes)
+		// The top-level breakpoint is Anthropic's automatic caching, a field of
+		// the Messages request. Token counting takes the same body but answers a
+		// different question, and asking it to cache anything is at best inert,
+		// so only the inference path carries it.
+		injected, changed, err := promptcache.Inject(body, s.cfg.PromptCache.InjectMinBytes, upstreamPath == pathMessages)
 		if err != nil {
 			// The request is forwarded exactly as it arrived. An optimization
 			// that could not be applied is not a reason to refuse a request.
 			s.log.Warn("prompt cache injection skipped", "error", err, "request_id", RequestIDFrom(ctx))
 		} else if changed {
-			body = injected
+			body, annotated = injected, true
 		}
 	}
 
@@ -167,6 +207,15 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	}
 
 	result, err := s.router.Route(ctx, fields.Model, req, overrides)
+	if err != nil && annotated && rejectedAsBadRequest(err) {
+		// An upstream that refuses the annotated body is refusing something the
+		// caller never asked for, so it gets one more chance with the request as
+		// it arrived. Anything still failing is the caller's own 400 and is
+		// relayed as such.
+		s.warnAnnotationRejected(err)
+		req.Body = unannotated
+		result, err = s.router.Route(ctx, fields.Model, req, overrides)
+	}
 	if err != nil {
 		obs.outcome = metrics.OutcomeGateway
 		var upstream *core.UpstreamError
@@ -181,6 +230,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	defer result.Response.Body.Close()
 
 	obs.deployment = result.Deployment.ID()
+	obs.format, obs.streaming = format, fields.Stream
 	obs.retries, obs.fallbacks = result.AttemptedRetries, result.AttemptedFallback
 	obs.promptAffinity = result.PromptAffinity
 	s.metrics.InFlightAdd(obs.model, obs.deployment, 1)
@@ -254,22 +304,31 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	s.record(r, obs)
 }
 
-// promptPrefix fingerprints the cacheable prefix of a request, or returns empty
-// when nothing would come of pinning it.
+// promptPrefix fingerprints the cacheable prefix of a request and says how long
+// a pin on it should live, or returns empty when nothing would come of pinning
+// it at all.
 //
-// Fingerprinting is skipped where it cannot pay: with affinity off, or with
-// every model group holding one deployment, hashing the system blocks and tool
-// definitions of every request would cost real time for a preference that has
-// nothing to choose between.
-func (s *Server) promptPrefix(format core.Format, fields jsonx.Fields) string {
-	if !s.cfg.PromptCache.AffinityEnabled() || !s.balanced {
-		return ""
+// Fingerprinting is skipped where it cannot pay: with affinity off, or in a
+// group that has nothing to choose between, hashing the system blocks and tool
+// definitions of every request would cost real time for a preference with no
+// decision to make.
+//
+// The lifetime is the caller's rather than the operator's wherever the caller
+// declared one. A conversation using the one-hour cache holds an entry that
+// outlives a five-minute pin, and the turn that arrives after the pin lapses
+// would write that entry again somewhere else, at twice base input.
+func (s *Server) promptPrefix(format core.Format, fields jsonx.Fields) (string, time.Duration) {
+	if !s.cfg.PromptCache.AffinityEnabled() || !s.pinnable[fields.Model] {
+		return "", 0
 	}
 	fingerprint, ok := promptcache.Fingerprint(format, fields.Model, fields)
 	if !ok {
-		return ""
+		return "", 0
 	}
-	return fingerprint
+	if promptcache.DeclaresLongCacheTTL(fields) {
+		return fingerprint, promptcache.LongCacheLifetime
+	}
+	return fingerprint, 0
 }
 
 // reject records a request refused before dispatch. Such a request consumed no
@@ -394,3 +453,32 @@ func writeError(w http.ResponseWriter, status int, kind, message string) {
 
 // authHeaderNames is used by the key endpoints to find a presented credential.
 func (s *Server) authHeaderNames() []string { return s.auth.HeaderNames() }
+
+// rejectedAsBadRequest reports whether an upstream refused the request outright,
+// which is the answer an annotation it does not accept produces.
+func rejectedAsBadRequest(err error) bool {
+	var upstream *core.UpstreamError
+	return errors.As(err, &upstream) && upstream.StatusCode == http.StatusBadRequest
+}
+
+// warnAnnotationRejected reports, once per deployment, that an upstream refused
+// a body the gateway had annotated.
+//
+// The request itself is retried without the annotation, so nothing is lost but
+// one round trip — and that round trip is paid on every request until the
+// configuration changes, which is why it is worth a line naming the deployment.
+// The likely causes are an upstream that predates automatic caching, such as the
+// legacy Bedrock integration, or an OpenAI-compatible server strict about fields
+// it does not recognize.
+func (s *Server) warnAnnotationRejected(err error) {
+	var upstream *core.UpstreamError
+	if !errors.As(err, &upstream) {
+		return
+	}
+	if _, seen := s.rejectedAnnotation.LoadOrStore(upstream.Deployment, true); seen {
+		return
+	}
+	s.log.Warn("upstream rejected an annotated request; retrying without the annotation costs a round trip on every request until it is turned off",
+		"deployment", upstream.Deployment,
+		"remedy", "unset prompt_cache.inject or observability.stream_usage for this deployment's group")
+}

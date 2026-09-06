@@ -261,3 +261,123 @@ func (l *ctxSensitiveLedger) Keys(ctx context.Context) ([]spend.Summary, error) 
 func (l *ctxSensitiveLedger) Deployments(ctx context.Context) ([]spend.Summary, error) {
 	return l.inner.Deployments(ctx)
 }
+
+// A streamed Chat Completions reply carries usage only where the request asked
+// for it. Without that, a deployment serving nothing but streamed traffic — the
+// normal case for a chat UI — is recorded as costing nothing at all, and no
+// error, header or metric says otherwise.
+func TestStreamedOpenAIRequestsAskForUsage(t *testing.T) {
+	no := false
+	cases := []struct {
+		name        string
+		path        string
+		format      core.Format
+		body        string
+		streamUsage *bool
+		want        bool
+	}{
+		{
+			name:   "streamed openai request",
+			path:   "/v1/chat/completions",
+			format: core.FormatOpenAI,
+			body:   `{"model":"openai-gpt","stream":true,"messages":[]}`,
+			want:   true,
+		},
+		{
+			name:   "non-streamed openai request",
+			path:   "/v1/chat/completions",
+			format: core.FormatOpenAI,
+			body:   `{"model":"openai-gpt","messages":[]}`,
+			// A whole-body reply reports usage unasked, so there is nothing to
+			// add and no extra chunk to justify.
+			want: false,
+		},
+		{
+			name:   "streamed anthropic request",
+			path:   "/v1/messages",
+			format: core.FormatAnthropic,
+			body:   `{"model":"anthropic-claude","stream":true,"messages":[]}`,
+			// Anthropic reports usage on message_start regardless, and
+			// stream_options is not part of its schema.
+			want: false,
+		},
+		{
+			name:        "turned off",
+			path:        "/v1/chat/completions",
+			format:      core.FormatOpenAI,
+			body:        `{"model":"openai-gpt","stream":true,"messages":[]}`,
+			streamUsage: &no,
+			want:        false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, harnessOpts{
+				authMode: "api_key", allowPassthrough: true,
+				format: tc.format, streamUsage: tc.streamUsage,
+			})
+			if rec := h.do(t, claudeCodeRequest(tc.path, tc.body)); rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			_, forwarded, _, _ := h.seen.get()
+			if got := askedForStreamUsage(forwarded); got != tc.want {
+				t.Errorf("request asked for stream usage = %v, want %v: %s", got, tc.want, forwarded)
+			}
+		})
+	}
+}
+
+// A caller that sent stream_options has said what it wants, and the gateway's
+// own accounting is not a reason to overrule it. The one-off warning is what
+// makes the resulting unbilled traffic visible instead.
+func TestCallerStreamOptionsAreLeftAlone(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, format: core.FormatOpenAI,
+	})
+	body := `{"model":"openai-gpt","stream":true,"stream_options":{"include_usage":false},"messages":[]}`
+
+	if rec := h.do(t, claudeCodeRequest("/v1/chat/completions", body)); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	_, forwarded, _, _ := h.seen.get()
+	if !strings.Contains(string(forwarded), `"stream_options":{"include_usage":false}`) {
+		t.Errorf("the caller's own stream_options did not survive: %s", forwarded)
+	}
+	if strings.Count(string(forwarded), "stream_options") != 1 {
+		t.Errorf("stream_options appears more than once: %s", forwarded)
+	}
+}
+
+// TestAnUnbilledStreamIsReported covers what is left once the request can no
+// longer be annotated: a streamed reply that reported nothing is recorded as
+// costing nothing, and the only way an operator learns of it is this line.
+func TestAnUnbilledStreamIsReported(t *testing.T) {
+	no := false
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		format: core.FormatOpenAI, streamUsage: &no,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")
+		},
+	})
+
+	for i := 0; i < 3; i++ {
+		if rec := h.do(t, claudeCodeRequest("/v1/chat/completions",
+			`{"model":"openai-gpt","stream":true,"messages":[]}`)); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+	}
+
+	logs := h.logBuf.String()
+	if !strings.Contains(logs, "streamed reply reported no usage") {
+		t.Errorf("nothing in the log says the deployment was billed nothing:\n%s", logs)
+	}
+	// It is a fact about the deployment, not the request, so it is said once
+	// however much traffic goes unbilled.
+	if got := strings.Count(logs, "streamed reply reported no usage"); got != 1 {
+		t.Errorf("warned %d times, want 1", got)
+	}
+}

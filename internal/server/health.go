@@ -167,14 +167,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // anything" are different claims: a fleet of single-deployment groups reports
 // the first without the second.
 func (s *Server) promptCacheStatus() map[string]any {
+	active := s.cfg.PromptCache.AffinityEnabled() && s.anyPinnable()
 	status := map[string]any{
-		"affinity":                    s.cfg.PromptCache.AffinityEnabled() && s.balanced,
+		"affinity":                    active,
 		"affinity_ttl":                s.cfg.PromptCache.AffinityTTL.String(),
 		"affinity_max_in_flight_lead": s.cfg.PromptCache.MaxInFlightLead(),
 		"inject":                      s.cfg.PromptCache.Inject,
 	}
-	if s.cfg.PromptCache.AffinityEnabled() && !s.balanced {
-		status["affinity_note"] = "configured, but inactive: every model group has a single deployment, so there is nothing to pin against"
+	if s.cfg.PromptCache.AffinityEnabled() && !active {
+		status["affinity_note"] = "configured, but inactive: no model group holds two deployments with separate prompt caches, so there is nothing to pin against"
 	}
 	return status
 }

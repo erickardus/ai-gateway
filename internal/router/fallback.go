@@ -39,6 +39,12 @@ type Overrides struct {
 	// It is a hash, never prompt text: it travels into routing state and, with
 	// Redis configured, out of the process.
 	PromptPrefix string
+	// PromptPinTTL is how long the pin this request establishes should live,
+	// where that is longer than the configured default. A caller that asked for
+	// the one-hour prompt cache has an entry that outlives a five-minute pin, and
+	// the turn arriving after the pin lapses would pay the long tier's premium a
+	// second time. Zero means the configured lifetime.
+	PromptPinTTL time.Duration
 }
 
 // OverridesFromHeaders reads the per-request routing headers. Names match

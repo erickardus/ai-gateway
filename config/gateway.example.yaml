@@ -236,10 +236,16 @@ prompt_cache:
   # contention — one busy conversation among idle peers is the feature working.
   # 0 yields to any idler peer.
   affinity_max_in_flight_lead: 4
+  # Mark an Anthropic request that carries no breakpoint of its own: the end of
+  # the tools, the end of the system prompt, and the top-level cache_control
+  # field that caches the conversation as it grows. A tool the gateway cannot
+  # recognize as a custom one — a server tool, an MCP toolset — is left unmarked,
+  # since the system breakpoint already caches every tool in the list.
   inject: false
-  # Prefixes smaller than this are left unmarked. Anthropic ignores a breakpoint
+  # Prompts smaller than this are left unmarked. Anthropic ignores a breakpoint
   # below its own minimum rather than rejecting it, so this is an economy rather
-  # than a correctness rule.
+  # than a correctness rule. Measured over the tools, the system prompt and the
+  # messages together, since the conversation is cached too.
   inject_min_bytes: 4096
 
 observability:
@@ -255,3 +261,16 @@ observability:
   # restart hands each key a fresh allowance.
   spend_store_path: ./data/spend.json
   spend_flush_interval: 30s
+
+  # Ask OpenAI-compatible upstreams to report usage on streamed replies, by
+  # adding stream_options.include_usage to a request that did not set
+  # stream_options itself. Without it a streamed reply carries no usage at all,
+  # so the request costs nothing, charges no budget and reports no cached
+  # tokens — a plausible-looking zero that nothing else contradicts.
+  #
+  # The cost of asking is one extra chunk at the end of the stream, carrying the
+  # usage and an empty choices array. It is part of the OpenAI protocol, but turn
+  # this off for a hand-written client that indexes choices[0] on every chunk, or
+  # for an upstream strict enough to reject the field. Anthropic is unaffected:
+  # it reports usage on message_start whether asked or not.
+  stream_usage: true

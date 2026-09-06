@@ -71,17 +71,45 @@ func TestTotalExcludesTheLongTierSubset(t *testing.T) {
 	}
 }
 
-// Savings are what caching took off the bill. An unpriced or inverted cost model
-// must report nothing rather than a negative saving, which would read as the
-// cache having cost money.
-func TestSavingsNeverGoNegative(t *testing.T) {
-	inverted := Pricing{InputPer1M: 0.3, CacheReadPer1M: 3}
-	if got := inverted.CacheSavings(Usage{CacheReadTokens: 1_000_000}); got != 0 {
-		t.Errorf("CacheSavings = %v, want 0 when a cache read is priced above input", got)
+// Savings are what caching did to the bill, in either direction. A negative
+// figure is not a bug to clamp away: it is the report that this traffic wrote
+// caches it never read, which is what a scattered conversation looks like in
+// money and is the one place the gateway says so.
+//
+// The inverted cost model the old clamp guarded against — a cache read priced at
+// or above input — cannot be loaded: validation refuses it, and refusing it
+// there is what leaves this arithmetic free to mean what it says.
+func TestSavingsAreNetOfTheWritePremium(t *testing.T) {
+	price := Pricing{InputPer1M: 3, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
+
+	// A turn that read back what an earlier one wrote: the read saves 2.70 and
+	// the write it extends cost 0.75 over ordinary input.
+	if got := price.CacheSavings(Usage{CacheReadTokens: 1_000_000, CacheWriteTokens: 1_000_000}); !within(got, 1.95) {
+		t.Errorf("CacheSavings = %v, want 1.95", got)
+	}
+	// The same write with nowhere to read it back is the premium alone.
+	if got := price.CacheSavings(Usage{CacheWriteTokens: 1_000_000}); !within(got, -0.75) {
+		t.Errorf("CacheSavings = %v, want -0.75: an unread write costs more than not caching", got)
 	}
 	unpriced := Pricing{}
 	if got := unpriced.CacheSavings(Usage{CacheReadTokens: 1_000_000}); got != 0 {
 		t.Errorf("CacheSavings = %v, want 0 with no pricing configured", got)
+	}
+}
+
+// The definition savings are pinned to: what caching took off the bill is the
+// difference between the bill and the one the same tokens would have run up as
+// ordinary input. Everything else about the figure follows from this.
+func TestCostAndSavingsReconstructTheUncachedBill(t *testing.T) {
+	price := Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75, CacheWrite1hPer1M: 6}
+	usage := Usage{InputTokens: 400, OutputTokens: 900, CacheReadTokens: 120_000, CacheWriteTokens: 30_000, CacheWrite1hTokens: 10_000}
+
+	uncached := Usage{
+		InputTokens:  usage.InputTokens + usage.CacheReadTokens + usage.CacheWriteTokens,
+		OutputTokens: usage.OutputTokens,
+	}
+	if got, want := price.Cost(usage)+price.CacheSavings(usage), price.Cost(uncached); !within(got, want) {
+		t.Errorf("cost plus savings = %v, want the uncached bill %v", got, want)
 	}
 }
 

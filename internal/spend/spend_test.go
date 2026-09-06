@@ -221,3 +221,141 @@ func TestConcurrentRecord(t *testing.T) {
 		t.Errorf("requests = %d, want 1000", keys[0].Requests)
 	}
 }
+
+// Savings are net of the prompt cache's write premium, so an entry can report a
+// negative one: a request that wrote a cache and read nothing back cost more
+// than it would have uncached. The ledger has to carry that sign rather than
+// treat it as an absent value, since a run of them summing towards zero is the
+// report that caching is not paying for itself.
+func TestSavingsAccumulateWithTheirSign(t *testing.T) {
+	ctx := context.Background()
+	l := New()
+
+	for _, savings := range []float64{2.50, -0.75, -0.25, 1.00} {
+		e := entry("k1", 0.10, true)
+		e.CacheSavings = savings
+		if err := l.Record(ctx, e); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+
+	rows, err := l.Keys(ctx)
+	if err != nil {
+		t.Fatalf("Keys: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if got := rows[0].CacheSavings; got < 2.4999 || got > 2.5001 {
+		t.Errorf("cache savings = %v, want 2.50", got)
+	}
+}
+
+// A workload that only ever writes caches reports a negative total, which is the
+// whole point of the figure being net: it says prompt caching is costing this
+// operator money, and no other number in the ledger does.
+func TestAWorkloadThatOnlyWritesReportsALoss(t *testing.T) {
+	ctx := context.Background()
+	l := New()
+
+	for range 4 {
+		e := entry("k1", 0.10, true)
+		e.CacheSavings = -0.30
+		if err := l.Record(ctx, e); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+
+	rows, _ := l.Keys(ctx)
+	if got := rows[0].CacheSavings; got > -1.19 || got < -1.21 {
+		t.Errorf("cache savings = %v, want about -1.20", got)
+	}
+	if rows[0].Cost <= 0 {
+		t.Error("cost must stay positive: the request was still charged for")
+	}
+}
+
+// Non-billable traffic invents no savings for the same reason it invents no
+// cost. A passthrough deployment's cache activity was paid for by the caller's
+// own subscription.
+func TestNonBillableRecordsNoSavings(t *testing.T) {
+	ctx := context.Background()
+	l := New()
+
+	e := entry("k1", 0, false)
+	e.CacheSavings = 9.99
+	if err := l.Record(ctx, e); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	rows, _ := l.Keys(ctx)
+	if rows[0].CacheSavings != 0 {
+		t.Errorf("cache savings = %v, want 0 for passthrough traffic", rows[0].CacheSavings)
+	}
+	if rows[0].CacheReadTokens == 0 {
+		t.Error("usage must still be recorded, only the money is not")
+	}
+}
+
+// TestFilePersistenceCarriesEveryFigure is the restart the budget depends on.
+//
+// The round-trip test above proves cost survives. Everything else in Totals has
+// to as well: a reopened ledger that lost its cache counters would report a
+// deployment as having done no caching, and one that lost the sign on savings
+// would turn a loss back into nothing.
+func TestFilePersistenceCarriesEveryFigure(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "spend.json")
+
+	l, err := NewFileLedger(path)
+	if err != nil {
+		t.Fatalf("NewFileLedger: %v", err)
+	}
+	e := entry("k1", 1.25, true)
+	e.CacheSavings = -0.5
+	if err := l.Record(ctx, e); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := l.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	before, err := l.Keys(ctx)
+	if err != nil {
+		t.Fatalf("Keys: %v", err)
+	}
+	reopened, err := NewFileLedger(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	after, err := reopened.Keys(ctx)
+	if err != nil {
+		t.Fatalf("Keys after restart: %v", err)
+	}
+	if len(after) != 1 {
+		t.Fatalf("got %d rows after restart, want 1", len(after))
+	}
+	// Compared with the window start set aside: it survives as a wall-clock
+	// instant, and a reloaded one carries no monotonic reading for == to match.
+	if !before[0].WindowStart.Equal(after[0].WindowStart) {
+		t.Errorf("window start = %v after restart, want %v", after[0].WindowStart, before[0].WindowStart)
+	}
+	beforeTotals, afterTotals := before[0].Totals, after[0].Totals
+	beforeTotals.WindowStart, afterTotals.WindowStart = time.Time{}, time.Time{}
+	if beforeTotals != afterTotals {
+		t.Errorf("totals changed across a restart:\nbefore %+v\nafter  %+v", beforeTotals, afterTotals)
+	}
+	if after[0].CacheSavings != -0.5 {
+		t.Errorf("cache savings = %v after restart, want -0.5", after[0].CacheSavings)
+	}
+
+	// Deployment rows are persisted too, or /spend would report an empty fleet
+	// after every deploy while keys still showed their spend.
+	deployments, err := reopened.Deployments(ctx)
+	if err != nil {
+		t.Fatalf("Deployments: %v", err)
+	}
+	if len(deployments) != 1 || deployments[0].Subject != "dep-1" {
+		t.Errorf("deployment rows after restart = %+v, want one for dep-1", deployments)
+	}
+}

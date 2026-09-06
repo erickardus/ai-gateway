@@ -20,22 +20,24 @@ import (
 // is the very thing injection is trying to make hittable — and would do it
 // invisibly, since the request would still succeed.
 func TestInjectionAddsBreakpointsAndNothingElse(t *testing.T) {
-	for _, body := range injectableBodies() {
-		out, changed, err := Inject([]byte(body), 0)
-		if err != nil {
-			t.Fatalf("Inject(%s): %v", body, err)
-		}
-		if !changed {
-			continue
-		}
-		if !json.Valid(out) {
-			t.Fatalf("Inject produced invalid JSON for %s: %s", body, out)
-		}
+	for _, conversation := range []bool{false, true} {
+		for _, body := range injectableBodies() {
+			out, changed, err := Inject([]byte(body), 0, conversation)
+			if err != nil {
+				t.Fatalf("Inject(%s): %v", body, err)
+			}
+			if !changed {
+				continue
+			}
+			if !json.Valid(out) {
+				t.Fatalf("Inject produced invalid JSON for %s: %s", body, out)
+			}
 
-		before := normalize(decode(t, []byte(body)))
-		after := normalize(decode(t, out))
-		if !reflect.DeepEqual(before, after) {
-			t.Errorf("injection changed the request beyond its breakpoints\n in: %s\nout: %s", body, out)
+			before := normalize(decode(t, []byte(body)))
+			after := normalize(decode(t, out))
+			if !reflect.DeepEqual(before, after) {
+				t.Errorf("injection changed the request beyond its breakpoints\n in: %s\nout: %s", body, out)
+			}
 		}
 	}
 }
@@ -45,37 +47,42 @@ func TestInjectionAddsBreakpointsAndNothingElse(t *testing.T) {
 // accumulate breakpoints: the API caps how many a request may carry, and
 // exceeding it turns an optimization into a 400.
 func TestInjectionIsIdempotent(t *testing.T) {
-	for _, body := range injectableBodies() {
-		once, changed, err := Inject([]byte(body), 0)
-		if err != nil || !changed {
-			continue
-		}
-		twice, changedAgain, err := Inject(once, 0)
-		if err != nil {
-			t.Fatalf("second Inject: %v", err)
-		}
-		if changedAgain {
-			t.Errorf("second injection changed an already-marked body: %s", twice)
-		}
-		if string(twice) != string(once) {
-			t.Errorf("second injection rewrote the body\nfirst:  %s\nsecond: %s", once, twice)
+	for _, conversation := range []bool{false, true} {
+		for _, body := range injectableBodies() {
+			once, changed, err := Inject([]byte(body), 0, conversation)
+			if err != nil || !changed {
+				continue
+			}
+			twice, changedAgain, err := Inject(once, 0, conversation)
+			if err != nil {
+				t.Fatalf("second Inject: %v", err)
+			}
+			if changedAgain {
+				t.Errorf("second injection changed an already-marked body: %s", twice)
+			}
+			if string(twice) != string(once) {
+				t.Errorf("second injection rewrote the body\nfirst:  %s\nsecond: %s", once, twice)
+			}
 		}
 	}
 }
 
 // TestInjectionStaysUnderTheBreakpointCap counts what it places. Anthropic
-// accepts at most four cache_control blocks per request, and the gateway's two
-// must leave room for none of the caller's, since it only ever runs where the
-// caller placed none.
+// accepts at most four cache_control blocks per request, and the gateway's three
+// — the tools, the system prompt, and the automatic one that follows the
+// conversation — have to stay inside that. They need leave room for none of the
+// caller's, since injection only ever runs where the caller placed none.
 func TestInjectionStaysUnderTheBreakpointCap(t *testing.T) {
 	const cap = 4
-	for _, body := range injectableBodies() {
-		out, changed, err := Inject([]byte(body), 0)
-		if err != nil || !changed {
-			continue
-		}
-		if n := strings.Count(string(out), `"cache_control"`); n > cap {
-			t.Errorf("placed %d breakpoints, the API accepts %d: %s", n, cap, out)
+	for _, conversation := range []bool{false, true} {
+		for _, body := range injectableBodies() {
+			out, changed, err := Inject([]byte(body), 0, conversation)
+			if err != nil || !changed {
+				continue
+			}
+			if n := strings.Count(string(out), `"cache_control"`); n > cap {
+				t.Errorf("placed %d breakpoints, the API accepts %d: %s", n, cap, out)
+			}
 		}
 	}
 }
@@ -88,7 +95,7 @@ func TestInjectionNeverMarksATrailingMessage(t *testing.T) {
 	const body = `{"model":"m","system":"a system prompt long enough to be worth caching",` +
 		`"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"second"},{"role":"user","content":"latest turn"}]}`
 
-	out, changed, err := Inject([]byte(body), 0)
+	out, changed, err := Inject([]byte(body), 0, true)
 	if err != nil || !changed {
 		t.Fatalf("Inject: changed=%v err=%v", changed, err)
 	}
@@ -114,7 +121,7 @@ func TestInjectionIsSkippedWhenTheCallerMentionsCachingInProse(t *testing.T) {
 	const body = `{"model":"m","system":"You are a helpful assistant with a system prompt long enough to be cacheable",` +
 		`"messages":[{"role":"user","content":"how does cache_control work in the Messages API?"}]}`
 
-	out, changed, err := Inject([]byte(body), 0)
+	out, changed, err := Inject([]byte(body), 0, true)
 	if err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
@@ -131,18 +138,18 @@ func TestInjectionIsSkippedWhenTheCallerMentionsCachingInProse(t *testing.T) {
 // behaved", and a malformed edit reaches the provider as a rewritten prompt.
 func FuzzInject(f *testing.F) {
 	for _, body := range injectableBodies() {
-		f.Add(body, 0)
+		f.Add(body, 0, true)
 	}
-	f.Add(`{"system":[],"tools":[]}`, 0)
-	f.Add(`{"system":123,"tools":"x"}`, 0)
-	f.Add(`{"messages":[{"cache_control":{}}]}`, 0)
-	f.Add(`not json`, 4096)
+	f.Add(`{"system":[],"tools":[]}`, 0, true)
+	f.Add(`{"system":123,"tools":"x"}`, 0, false)
+	f.Add(`{"messages":[{"cache_control":{}}]}`, 0, true)
+	f.Add(`not json`, 4096, true)
 
-	f.Fuzz(func(t *testing.T, body string, minBytes int) {
+	f.Fuzz(func(t *testing.T, body string, minBytes int, conversation bool) {
 		if minBytes < 0 {
 			return
 		}
-		out, changed, err := Inject([]byte(body), minBytes)
+		out, changed, err := Inject([]byte(body), minBytes, conversation)
 		if err != nil {
 			// A body that could not be edited must be forwarded exactly as it
 			// arrived: an optimization is never a reason to alter a request.
