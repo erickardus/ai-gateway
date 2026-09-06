@@ -25,9 +25,15 @@ import (
 // why it is only ever added to one that asked to stream.
 var streamUsageOptions = []byte(`{"include_usage":true}`)
 
-// pathMessages is the inference endpoint, as distinct from token counting, which
-// takes the same body and is served by the same path below.
-const pathMessages = "/v1/messages"
+// pathMessages is Anthropic's inference endpoint, and pathCountTokens the
+// endpoint that takes the same body to answer a different question. Both are
+// served by serveInference below, and two of the things it does — asking the
+// API to cache the conversation, and pinning the prefix — belong only to the
+// one that actually runs the model.
+const (
+	pathMessages    = "/v1/messages"
+	pathCountTokens = "/v1/messages/count_tokens"
+)
 
 // handleMessages serves the Anthropic Messages API.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +44,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // for a gateway, but exposing it keeps Claude Code from spending an inference
 // request to measure context.
 func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
-	s.serveInference(w, r, "/v1/messages/count_tokens", core.FormatAnthropic)
+	s.serveInference(w, r, pathCountTokens, core.FormatAnthropic)
 }
 
 // handleChatCompletions serves the OpenAI Chat Completions API.
@@ -135,7 +141,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	overrides := router.OverridesFromHeaders(r.Header)
 	overrides.AllowPassthrough = authCtx.Key != nil && authCtx.Key.AllowPassthrough
-	overrides.PromptPrefix, overrides.PromptPinTTL = s.promptPrefix(format, fields)
+	overrides.PromptPrefix, overrides.PromptPinTTL = s.promptPrefix(format, fields, upstreamPath != pathCountTokens)
 	if fields.HasDisableFallbacks {
 		overrides.DisableFallbacks = fields.DisableFallbacks
 		// It is a gateway directive, not part of the provider's schema, so it
@@ -274,6 +280,9 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// Detached for the same reason as record: a client that disconnected must
 	// still have its usage counted against the deployment and its key.
 	s.router.RecordUsage(context.WithoutCancel(ctx), result.Deployment, usage)
+	// Pin the prefix only now: whether this deployment holds a warm copy of it
+	// is something only the response says.
+	s.router.RecordPrefix(context.WithoutCancel(ctx), result, usage)
 	if authCtx.Key != nil {
 		s.auth.Limiter().AddTokens(authCtx.Key.Hash, usage.Total())
 	}
@@ -313,12 +322,20 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 // definitions of every request would cost real time for a preference with no
 // decision to make.
 //
+// inference says whether this endpoint actually runs the model, and token
+// counting is the one that does not. It takes the same body as an inference
+// request and warms nothing, so a pin taken from it names a deployment holding
+// no warm prefix, and refreshing an existing pin from it keeps a conversation
+// pointed at an upstream on the strength of a request that never reached the
+// model. Claude Code counts tokens on most turns, so this is the ordinary case
+// rather than an edge.
+//
 // The lifetime is the caller's rather than the operator's wherever the caller
 // declared one. A conversation using the one-hour cache holds an entry that
 // outlives a five-minute pin, and the turn that arrives after the pin lapses
 // would write that entry again somewhere else, at twice base input.
-func (s *Server) promptPrefix(format core.Format, fields jsonx.Fields) (string, time.Duration) {
-	if !s.cfg.PromptCache.AffinityEnabled() || !s.pinnable[fields.Model] {
+func (s *Server) promptPrefix(format core.Format, fields jsonx.Fields, inference bool) (string, time.Duration) {
+	if !inference || !s.cfg.PromptCache.AffinityEnabled() || !s.pinnable[fields.Model] {
 		return "", 0
 	}
 	fingerprint, ok := promptcache.Fingerprint(format, fields.Model, fields)

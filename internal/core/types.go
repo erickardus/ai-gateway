@@ -177,7 +177,27 @@ type Usage struct {
 // CacheWriteTokens, and adding it would count those tokens twice against a
 // caller's TPM limit.
 func (u Usage) Total() int {
-	return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens
+	return u.PromptTokens() + u.OutputTokens
+}
+
+// PromptTokens is every token the provider read as prompt, whatever it charged
+// for them: ordinary input, plus the tokens it served from its cache, plus the
+// tokens it wrote into it.
+//
+// It is the figure a provider measures its own long-context threshold against,
+// and the one a caller means by "how big is this conversation now".
+func (u Usage) PromptTokens() int {
+	return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
+}
+
+// PromptCacheUsed reports whether the provider's prompt cache took any part in
+// this request — either it served tokens from an entry, or it wrote one.
+//
+// It is what decides whether pinning this request's prefix could pay: a prefix
+// no upstream cached has no warm copy anywhere, so sending the next request
+// carrying it back to the same deployment concentrates load and buys nothing.
+func (u Usage) PromptCacheUsed() bool {
+	return u.CacheReadTokens > 0 || u.CacheWriteTokens > 0
 }
 
 // Empty reports whether the upstream reported no usage at all.
@@ -199,21 +219,108 @@ type Pricing struct {
 	// a long write at a deployment without this price is logged, rather than
 	// left to be discovered on an invoice.
 	CacheWrite1hPer1M float64 `yaml:"cache_write_1h_per_1m"`
+	// LongContext prices a request whose prompt crosses a threshold the
+	// provider charges a higher rate above. Anthropic's long-context tier is
+	// the one in use today: a request whose prompt exceeds 200k tokens is
+	// charged more for every class of token it uses, cache reads and writes
+	// included.
+	//
+	// It is optional because most deployments never reach the threshold, and
+	// nil where a provider has no such tier. Where a provider does have one and
+	// this is left unset, the largest requests — the ones a prompt cache exists
+	// for — are billed at the small-request rate, which understates the bill by
+	// the whole of the premium.
+	LongContext *LongContextPricing `yaml:"long_context"`
+}
+
+// LongContextPricing is what a deployment charges for a request whose prompt is
+// large enough to cross into the provider's higher tier.
+//
+// The threshold is written out rather than assumed, because it is a fact about
+// one provider's price list rather than about prompt caching: hardcoding 200k
+// would silently misprice any deployment whose provider draws the line
+// somewhere else, or moves it.
+type LongContextPricing struct {
+	// AbovePromptTokens is the prompt size, in tokens, above which these rates
+	// apply. The comparison is against every prompt token the provider
+	// reported — ordinary input, cache reads and cache writes together — since
+	// that is the figure a provider measures its own threshold against.
+	AbovePromptTokens int     `yaml:"above_prompt_tokens"`
+	InputPer1M        float64 `yaml:"input_per_1m"`
+	OutputPer1M       float64 `yaml:"output_per_1m"`
+	CacheReadPer1M    float64 `yaml:"cache_read_per_1m"`
+	CacheWritePer1M   float64 `yaml:"cache_write_per_1m"`
+	CacheWrite1hPer1M float64 `yaml:"cache_write_1h_per_1m"`
 }
 
 // Zero reports whether no pricing was configured.
 func (p Pricing) Zero() bool {
 	return p.InputPer1M == 0 && p.OutputPer1M == 0 && p.CacheReadPer1M == 0 &&
-		p.CacheWritePer1M == 0 && p.CacheWrite1hPer1M == 0
+		p.CacheWritePer1M == 0 && p.CacheWrite1hPer1M == 0 && p.LongContext == nil
 }
 
-// write1hRate is what a one-hour cache write costs, falling back to the
-// five-minute price where none was configured.
-func (p Pricing) write1hRate() float64 {
-	if p.CacheWrite1hPer1M == 0 {
-		return p.CacheWritePer1M
+// rates is the price of each class of token for one request, once the tier the
+// request falls into has been decided.
+type rates struct {
+	input, output, cacheRead, cacheWrite, cacheWrite1h float64
+}
+
+// rates resolves what this request is charged at.
+//
+// A tier is a property of the request rather than of the deployment: the same
+// upstream charges one set of rates for a small prompt and another for a large
+// one, so the threshold is compared against what the provider actually reported
+// for this request rather than against anything configured.
+//
+// Every rate falls back to its base counterpart when the tier leaves it unset,
+// so a partially written tier overcharges nothing it does not name. Validation
+// refuses that at load; the fallback is what keeps a config loaded by an older
+// binary from mispricing rather than crashing.
+func (p Pricing) rates(u Usage) rates {
+	base := rates{
+		input:        p.InputPer1M,
+		output:       p.OutputPer1M,
+		cacheRead:    p.CacheReadPer1M,
+		cacheWrite:   p.CacheWritePer1M,
+		cacheWrite1h: orRate(p.CacheWrite1hPer1M, p.CacheWritePer1M),
 	}
-	return p.CacheWrite1hPer1M
+	long := p.TierFor(u)
+	if long == nil {
+		return base
+	}
+	return rates{
+		input:      orRate(long.InputPer1M, base.input),
+		output:     orRate(long.OutputPer1M, base.output),
+		cacheRead:  orRate(long.CacheReadPer1M, base.cacheRead),
+		cacheWrite: orRate(long.CacheWritePer1M, base.cacheWrite),
+		cacheWrite1h: orRate(
+			orRate(long.CacheWrite1hPer1M, long.CacheWritePer1M),
+			base.cacheWrite1h),
+	}
+}
+
+// TierFor returns the higher tier this request is charged at, or nil where it
+// falls under the threshold or the deployment names no tier.
+//
+// It is exported because pricing a request is not the only thing that has to
+// know which rates applied to it: a warning about a rate that fell back has to
+// name the block the operator would edit.
+func (p Pricing) TierFor(u Usage) *LongContextPricing {
+	long := p.LongContext
+	if long == nil || long.AbovePromptTokens <= 0 || u.PromptTokens() <= long.AbovePromptTokens {
+		return nil
+	}
+	return long
+}
+
+// orRate returns a price, or the one it falls back to where none was
+// configured. It is what makes an unset one-hour write cost a five-minute
+// write, and an unset long-context rate cost its base rate.
+func orRate(rate, fallback float64) float64 {
+	if rate == 0 {
+		return fallback
+	}
+	return rate
 }
 
 // CacheSavings returns what the prompt cache did to this request's bill: what
@@ -239,11 +346,12 @@ func (p Pricing) write1hRate() float64 {
 // the deployment is unpriced, since there is then no arithmetic to do.
 func (p Pricing) CacheSavings(u Usage) float64 {
 	const perMillion = 1_000_000.0
+	r := p.rates(u)
 	write1h := min(max(u.CacheWrite1hTokens, 0), u.CacheWriteTokens)
 	write5m := u.CacheWriteTokens - write1h
-	return float64(u.CacheReadTokens)*(p.InputPer1M-p.CacheReadPer1M)/perMillion +
-		float64(write5m)*(p.InputPer1M-p.CacheWritePer1M)/perMillion +
-		float64(write1h)*(p.InputPer1M-p.write1hRate())/perMillion
+	return float64(u.CacheReadTokens)*(r.input-r.cacheRead)/perMillion +
+		float64(write5m)*(r.input-r.cacheWrite)/perMillion +
+		float64(write1h)*(r.input-r.cacheWrite1h)/perMillion
 }
 
 // Cost returns what a request cost, in the currency the pricing was written in.
@@ -254,13 +362,14 @@ func (p Pricing) CacheSavings(u Usage) float64 {
 // than allowed to charge for tokens the provider never reported.
 func (p Pricing) Cost(u Usage) float64 {
 	const perMillion = 1_000_000.0
+	r := p.rates(u)
 	write1h := min(max(u.CacheWrite1hTokens, 0), u.CacheWriteTokens)
 	write5m := u.CacheWriteTokens - write1h
-	return float64(u.InputTokens)*p.InputPer1M/perMillion +
-		float64(u.OutputTokens)*p.OutputPer1M/perMillion +
-		float64(u.CacheReadTokens)*p.CacheReadPer1M/perMillion +
-		float64(write5m)*p.CacheWritePer1M/perMillion +
-		float64(write1h)*p.write1hRate()/perMillion
+	return float64(u.InputTokens)*r.input/perMillion +
+		float64(u.OutputTokens)*r.output/perMillion +
+		float64(u.CacheReadTokens)*r.cacheRead/perMillion +
+		float64(write5m)*r.cacheWrite/perMillion +
+		float64(write1h)*r.cacheWrite1h/perMillion
 }
 
 // ControlHeaders are the headers the gateway interprets for its own routing and

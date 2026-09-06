@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/erickardus/ai-gateway/internal/config"
+	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/provider"
 )
 
@@ -29,12 +30,28 @@ func buildAffinityRouter(t *testing.T, weights []int, pc config.PromptCacheConfi
 	return r, deps
 }
 
+// route serves one request and then records its prefix, which is the order the
+// server works in: a pin says the deployment holds a warm copy of this prefix,
+// and only the response knows whether it does.
+//
+// The usage is what a conversation whose prefix is being cached reports — a
+// write on the turn that establishes the entry, a read on every turn after it.
+// Tests about the pin itself use the write, since that is the turn a pin is
+// created on.
 func route(t *testing.T, r *Router, prefix string) *Result {
+	t.Helper()
+	return routeReporting(t, r, prefix, core.Usage{InputTokens: 40, CacheWriteTokens: 1000})
+}
+
+// routeReporting is route with the upstream's own account of what its prompt
+// cache did.
+func routeReporting(t *testing.T, r *Router, prefix string, usage core.Usage) *Result {
 	t.Helper()
 	res, err := r.Route(context.Background(), "g", &provider.Request{}, Overrides{PromptPrefix: prefix})
 	if err != nil {
 		t.Fatalf("Route: %v", err)
 	}
+	r.RecordPrefix(context.Background(), res, usage)
 	res.Response.Body.Close()
 	return res
 }
@@ -559,6 +576,7 @@ func TestAPinOutlivesTheCacheItPointsAt(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Route: %v", err)
 			}
+			r.RecordPrefix(context.Background(), res, core.Usage{CacheWriteTokens: 1000})
 			res.Response.Body.Close()
 
 			if state.ttl != tt.want {
@@ -580,9 +598,83 @@ func TestAShorterRequestedPinDoesNotShortenTheConfiguredOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Route: %v", err)
 	}
+	r.RecordPrefix(context.Background(), res, core.Usage{CacheWriteTokens: 1000})
 	res.Response.Body.Close()
 
 	if state.ttl != 10*time.Minute {
 		t.Errorf("pin written with a %s lifetime, want the configured 10m", state.ttl)
+	}
+}
+
+// A pin says one deployment holds a warm copy of this prefix. Where the
+// upstream reports that it cached nothing — a prompt below the provider's
+// minimum, or an Anthropic caller sending no breakpoints with injection off —
+// there is no warm copy anywhere, and pinning would concentrate that prefix's
+// traffic on one deployment in exchange for nothing at all.
+func TestAPrefixTheProviderDidNotCacheIsNotPinned(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, _ := buildAffinityRouter(t, []int{1, 1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	res := routeReporting(t, r, "prefix-a", core.Usage{InputTokens: 400, OutputTokens: 90})
+	if res.PromptAffinity != AffinityNew {
+		t.Errorf("affinity = %q, want %q", res.PromptAffinity, AffinityNew)
+	}
+	if id, ok, err := state.Affinity(context.Background(), "g\x00prefix-a"); err != nil || ok {
+		t.Errorf("Affinity: got=%q ok=%v err=%v, want no pin for a prefix nothing cached", id, ok, err)
+	}
+}
+
+// The turn that establishes a cache is the turn that establishes a pin: the
+// write is the upstream saying it now holds this prefix.
+func TestACacheWriteEstablishesThePin(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, _ := buildAffinityRouter(t, []int{1, 1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	served := routeReporting(t, r, "prefix-a", core.Usage{InputTokens: 40, CacheWriteTokens: 2000}).Deployment.ID()
+	id, ok, err := state.Affinity(context.Background(), "g\x00prefix-a")
+	if err != nil || !ok || id != served {
+		t.Fatalf("Affinity: got=%q ok=%v err=%v, want the serving deployment %s", id, ok, err, served)
+	}
+
+	// And a read keeps it alive, which is what every later turn reports.
+	next := routeReporting(t, r, "prefix-a", core.Usage{InputTokens: 40, CacheReadTokens: 2000})
+	if next.Deployment.ID() != served || next.PromptAffinity != AffinityHit {
+		t.Errorf("second turn went to %s reporting %q, want %s reporting %q",
+			next.Deployment.ID(), next.PromptAffinity, served, AffinityHit)
+	}
+}
+
+// An OpenAI-compatible provider caches automatically and charges nothing to
+// write, so it reports no cached tokens at all until a read happens. Requiring
+// the same evidence there would mean never establishing a first pin, which is
+// the feature switched off on half the deployments it serves.
+func TestAnOpenAIPrefixIsPinnedWithoutACacheSignal(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, deps := buildAffinityRouter(t, []int{1, 1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+	for _, d := range deps {
+		d.Params.Format = core.FormatOpenAI
+	}
+
+	served := routeReporting(t, r, "prefix-a", core.Usage{InputTokens: 8000, OutputTokens: 200}).Deployment.ID()
+	if id, ok, _ := state.Affinity(context.Background(), "g\x00prefix-a"); !ok || id != served {
+		t.Errorf("Affinity: got=%q ok=%v, want the serving deployment %s", id, ok, served)
+	}
+}
+
+// A streamed reply that nobody asked for usage on reports none. That is a gap in
+// the accounting, not evidence that the provider cached nothing, and answering
+// it by dropping the pin would turn one unbilled request into a scattered
+// conversation.
+func TestAResponseThatReportedNoUsageKeepsThePin(t *testing.T) {
+	exec := &fakeExec{replies: map[string]error{}}
+	state := NewMemState()
+	r, _ := buildAffinityRouter(t, []int{1, 1, 1}, config.PromptCacheConfig{}, 0, exec, state)
+
+	served := routeReporting(t, r, "prefix-a", core.Usage{}).Deployment.ID()
+	if id, ok, _ := state.Affinity(context.Background(), "g\x00prefix-a"); !ok || id != served {
+		t.Errorf("Affinity: got=%q ok=%v, want the serving deployment %s", id, ok, served)
 	}
 }

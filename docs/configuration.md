@@ -46,6 +46,7 @@ the router load-balances across. A group must be format-homogeneous.
 | `cost.cache_read_per_1m` | — | Required once `input_per_1m` is set. Not optional detail: Claude Code leans on prompt caching. |
 | `cost.cache_write_per_1m` | — | Required on an `anthropic` deployment once `input_per_1m` is set. |
 | `cost.cache_write_1h_per_1m` | `cache_write_per_1m` | Anthropic's one-hour cache write, priced at 2x base input against the five-minute tier's 1.25x. |
+| `cost.long_context` | — | The higher rates a provider charges above a prompt size. Optional; see below. |
 
 A `passthrough` deployment must have its host listed in
 `virtual_keys.allowed_upstream_hosts`, must not carry an `api_key`, and must not
@@ -70,6 +71,46 @@ So the combination fails validation rather than serving traffic:
 
 An `openai` deployment needs no write price: OpenAI-compatible providers cache
 automatically and charge nothing to write.
+
+### The long-context tier
+
+A provider may charge more for every token of a request once its prompt crosses
+a size — Anthropic's threshold is 200k tokens, above which input, output, cache
+reads and cache writes all cost more. That is the largest traffic a gateway
+carries, and it is exactly the traffic a prompt cache exists for, so pricing it
+at the small-request rates understates the bill on the requests that dominate
+it.
+
+```yaml
+cost:
+  input_per_1m: 3.00
+  output_per_1m: 15.00
+  cache_read_per_1m: 0.30
+  cache_write_per_1m: 3.75
+  long_context:
+    above_prompt_tokens: 200000
+    input_per_1m: 6.00
+    output_per_1m: 22.50
+    cache_read_per_1m: 0.60
+    cache_write_per_1m: 7.50
+```
+
+The threshold is written out rather than assumed, because where a provider draws
+the line is a fact about its price list rather than about caching. It is
+compared against every prompt token the response reported — ordinary input plus
+cache reads plus cache writes — since that is the figure a provider measures its
+own threshold against. A conversation reading 190k tokens out of the cache is a
+large request and is charged as one.
+
+The block is optional and refused when incomplete, for the same reason a partial
+cost model is:
+
+| Rule | Why |
+|---|---|
+| `above_prompt_tokens` above zero | without a threshold nothing decides which tier a request falls into |
+| the same completeness rules as the base block | a rate the tier omits falls back to the base rate, so a tier naming only its input price charges the premium on input and the small-request price on everything else |
+| `output_per_1m` required where the base block prices output | otherwise long-context output is billed at the small-request rate |
+| every rate at least its base counterpart | the tier is what a provider charges *extra*, so a cheaper rate here is the two blocks written the wrong way round |
 
 ## `router`
 

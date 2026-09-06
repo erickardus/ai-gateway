@@ -112,6 +112,72 @@ Catching that case means walking the whole message array on every request, which
 is the cost the fingerprint is deliberately shaped to avoid. The consequence is a
 pin that lapses early on an unusual request shape, not a wrong one.
 
+### 🟡 Service tiers are not priced
+
+`cost.long_context` prices the one tier dimension that Claude Code traffic
+actually crosses. It is not the only one a provider has: a request served at a
+priority or a flex service tier is charged at its own rates for every class of
+token, cache reads and writes included, and the gateway prices it at the
+standard ones.
+
+A caller asks for a tier in the request body, which the gateway forwards
+untouched, so the misprice is silent in the same way the long-context one was.
+LiteLLM carries suffixed rate keys for each tier and picks between them on the
+request. The same shape would work here — `cost.service_tiers.<name>` resolved
+the way `long_context` is — and it wants the tier read out of the body during
+the walk the router already performs, rather than a second parse.
+
+### 🟡 The injection minimum is measured in bytes, not tokens
+
+A provider's minimum cacheable prefix is counted in tokens and differs by model:
+1024 for the larger Claude models, 2048 for the smaller ones.
+`prompt_cache.inject_min_bytes` is a byte count, defaulting to 4096 — roughly
+1000 tokens, which is right for the larger models and half of what the smaller
+ones need.
+
+Counting tokens instead means running a tokenizer over every request, which is
+what LiteLLM does: it carries a per-model `prompt_cache_min_tokens` and tokenizes
+to compare against it, twice per request on the routing path. That is a real
+per-request cost for a threshold that only decides whether an optimization is
+attempted, and being under it costs nothing — the provider ignores a breakpoint
+below its minimum rather than rejecting it.
+
+The gap is an operator on a small model who leaves the default and gets
+breakpoints the provider ignores. [prompt-caching.md](prompt-caching.md#cache-breakpoints)
+says to raise it; a per-deployment minimum would say it for them, and wants the
+same per-deployment body rewrite that injection alongside passthrough does.
+
+### 🟡 Injected breakpoints are always ephemeral, and always in the same three places
+
+Injection marks the end of the tools, the end of the system prompt and the
+conversation, each at the default five-minute lifetime. There is no way to ask
+for the one-hour tier, and no way to move or add a breakpoint.
+
+LiteLLM takes configurable injection points — by role or by message index,
+negative indexes included, each with its own TTL. The reason not to follow it on
+the TTL is that a one-hour write costs twice base input against 1.25x: injecting
+one is spending a caller's money on a lifetime it did not ask for, and the
+caller that wants it can say so, at which point injection stands down anyway
+because the request now carries breakpoints of its own. The reason not to follow
+it on the positions is that the three the gateway marks are the ones it can
+identify structurally; an index into a message array is a shape only the caller
+knows.
+
+Both would become reasonable alongside a per-deployment or per-key injection
+policy, which is the same seam as above.
+
+### 🟡 Savings do not say which breakpoints earned them
+
+`cache_savings` is one figure per request. Where `prompt_cache.inject` is on it
+mixes savings the caller's own breakpoints earned with savings the gateway's
+injected ones did, so it cannot answer whether injection is paying for itself —
+which is the question an operator turning it on actually has.
+
+LiteLLM stamps the injecting deployment into request metadata and splits the two
+in its spend reporting. Doing the same here means carrying a flag from injection
+through to the ledger entry and the persisted totals, which changes the on-disk
+ledger format; it was not worth that before the feature had users.
+
 ### 🟡 Prefix affinity concentrates load, bounded by in-flight rather than share
 
 A fingerprint covers a request's prefix, not a conversation, so all traffic
@@ -194,6 +260,11 @@ billed at all — so the objection is no longer that such an edit is impossible.
 It is that this one is optional where that one is the difference between a bill
 and a zero: an OpenAI-*compatible* server strict about unknown fields would 400
 rather than ignore it, and the same risk buys much less.
+
+The same objection covers OpenAI's explicit `prompt_cache_breakpoint` marker,
+which is the newer of the two and narrower still: it applies to a handful of
+models, and on the rest of an OpenAI-compatible fleet caching is automatic and
+needs no marker at all.
 
 Both edits happen before routing, so the response-cache key is taken from the
 body as it arrived and every retry and fallback attempt sends the same bytes.
@@ -278,10 +349,13 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Rate-limit windows | monotonic | LiteLLM's wall-clock buckets wrap daily |
 | `anthropic-beta` | forwarded verbatim | LiteLLM validates against a pinned list, which breaks on new Claude Code releases |
 | Cache scope | per-key by default | shared-by-default leaks completions across tenants |
-| Provider prompt cache | routed for | LiteLLM balances without regard to it, so every hop pays a cache write instead of a read |
-| OpenAI cached tokens | carved out of `prompt_tokens` | they are reported *inside* the input count, so adding them beside it bills every cached token twice |
+| Provider prompt cache | routed for, by default | LiteLLM has the same idea behind an opt-in `optional_pre_call_checks` entry, so the default arrangement pays a cache write on every hop |
+| OpenAI cached tokens | carved out of `prompt_tokens` | they are reported *inside* the input count, so adding them beside it bills every cached token twice. LiteLLM reaches the same answer by recomputing the input figure when the parts exceed the total |
 | Streamed OpenAI usage | asked for | a streamed reply reports none unless the request opted in, so the traffic is billed at zero |
-| A moving cache breakpoint | ignored when pinning | every Anthropic client walks one forward each turn, which would re-pin the conversation every time |
+| A moving cache breakpoint | ignored when pinning | every Anthropic client walks one forward each turn, which would re-pin the conversation every time. LiteLLM's affinity key is the messages up to and including the last breakpoint, marker bytes and all, so its own injected breakpoint moves the key every turn |
+| Affinity key | prefix, tools and model group | LiteLLM hashes neither the tools nor the model, so two conversations sharing a history but not a toolset share a pin |
+| A pin | written on evidence the provider cached | LiteLLM pins any successful call above a token count, so a prompt nothing cached still concentrates its traffic |
+| Long-context pricing | a configurable tier | the largest requests are the ones a cache serves, and the small-request rates understate them by about half |
 | Anthropic cache-write tiers | priced apart | the one-hour cache costs 2x base input against the five-minute tier's 1.25x |
 | Pin lifetime | follows the declared cache TTL | a five-minute pin on a one-hour entry pays the long tier's premium a second time |
 | `cache_savings` | net of the write premium | a gross figure cannot report that caching is costing money, which is what scattering looks like |

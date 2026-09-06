@@ -54,10 +54,16 @@ type usageFields struct {
 	// CacheCreation breaks the write total down by TTL. It appears on responses
 	// from callers using extended cache lifetimes, and the two tiers are priced
 	// differently enough that flattening them misprices the request.
-	CacheCreation *struct {
-		Ephemeral5m int `json:"ephemeral_5m_input_tokens"`
-		Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
-	} `json:"cache_creation"`
+	CacheCreation *cacheCreation `json:"cache_creation"`
+	// Iterations appears on a response produced by a server-side tool loop,
+	// where one reply is several turns against the model. The totals above are
+	// already the sum of them, but the per-tier breakdown is reported only per
+	// iteration — so a request whose long writes happened inside the loop looks
+	// like a request with no long writes at all, and is billed at the
+	// five-minute rate.
+	Iterations []struct {
+		CacheCreation *cacheCreation `json:"cache_creation"`
+	} `json:"iterations"`
 
 	// OpenAI Chat Completions.
 	PromptTokens        *int `json:"prompt_tokens"`
@@ -119,8 +125,8 @@ func (f *usageFields) normalize(format core.Format) core.Usage {
 	u.InputTokens = nonNegative(firstPresent(f.InputTokens))
 	u.CacheReadTokens = nonNegative(f.CacheReadInputTokens)
 	u.CacheWriteTokens = nonNegative(f.CacheCreationInputTokens)
-	if f.CacheCreation != nil {
-		short, long := nonNegative(f.CacheCreation.Ephemeral5m), nonNegative(f.CacheCreation.Ephemeral1h)
+	if breakdown := f.writeBreakdown(); breakdown != nil {
+		short, long := nonNegative(breakdown.Ephemeral5m), nonNegative(breakdown.Ephemeral1h)
 		// The breakdown is authoritative where it is present and larger: some
 		// responses carry the breakdown while cache_creation_input_tokens
 		// reports only the five-minute tier, and undercounting a write is a
@@ -129,6 +135,47 @@ func (f *usageFields) normalize(format core.Format) core.Usage {
 		u.CacheWrite1hTokens = min(long, u.CacheWriteTokens)
 	}
 	return u
+}
+
+// cacheCreation is the split of a write total across the two cache lifetimes.
+type cacheCreation struct {
+	Ephemeral5m int `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
+}
+
+// writeBreakdown returns how this response's cache writes divide between the two
+// lifetimes, summing the per-iteration breakdowns of a server-tool loop where
+// the response reports no breakdown of its own.
+//
+// Only the split is taken from the iterations, never the totals: the totals are
+// already aggregated, and adding them again would bill a multi-turn reply
+// several times over. The two tiers differ by more than a third in price, so a
+// split that goes missing on exactly the requests large enough to run a tool
+// loop is worth reassembling.
+func (f *usageFields) writeBreakdown() *cacheCreation {
+	if f.CacheCreation != nil {
+		return f.CacheCreation
+	}
+	var sum cacheCreation
+	found := false
+	for _, it := range f.Iterations {
+		if it.CacheCreation == nil {
+			continue
+		}
+		found = true
+		sum.Ephemeral5m += nonNegative(it.CacheCreation.Ephemeral5m)
+		sum.Ephemeral1h += nonNegative(it.CacheCreation.Ephemeral1h)
+	}
+	if !found {
+		return nil
+	}
+	// Whatever the iterations did not account for is a write at the default
+	// lifetime: the total is authoritative, and attributing an unexplained
+	// remainder to the long tier would charge the premium for it.
+	if rest := nonNegative(f.CacheCreationInputTokens) - sum.Ephemeral5m - sum.Ephemeral1h; rest > 0 {
+		sum.Ephemeral5m += rest
+	}
+	return &sum
 }
 
 // openAICached reads a cached-token count out of either details object.

@@ -75,6 +75,37 @@ func (f Fields) LeadingMessages(n int) [][]byte {
 	return out
 }
 
+// FirstMessageRole returns the role of the opening message, or "" where the
+// request has none or does not name one.
+//
+// It reads the role alone rather than decoding the message, which may carry the
+// largest system prompt in the request. Like LeadingMessages it relies on Peek
+// having validated the document already, which is why it is a method here
+// rather than a free function.
+func (f Fields) FirstMessageRole() string {
+	if len(f.Messages) == 0 {
+		return ""
+	}
+	spans, err := elements(f.Messages)
+	if err != nil || len(spans) == 0 {
+		return ""
+	}
+	role := ""
+	if err := walkObject(f.Messages[spans[0][0]:spans[0][1]], func(m member) error {
+		if m.key != "role" {
+			return nil
+		}
+		var s string
+		if json.Unmarshal(m.raw, &s) == nil {
+			role = s
+		}
+		return nil
+	}); err != nil {
+		return ""
+	}
+	return role
+}
+
 // member is one key/value pair of the root object.
 type member struct {
 	key string

@@ -99,6 +99,12 @@ type Result struct {
 	// It is what makes a cache-affinity regression visible before it shows up
 	// as a bill.
 	PromptAffinity string
+
+	// promptKey and promptTTL carry what RecordPrefix needs to pin this
+	// request's prefix once the response has been read. They are unexported
+	// because the caller's only business with them is handing the Result back.
+	promptKey string
+	promptTTL time.Duration
 }
 
 // Prompt-affinity outcomes reported on a Result.
@@ -112,7 +118,10 @@ const (
 	// AffinityOff means no pin was in play: affinity is disabled, the request
 	// has no cacheable prefix, or the group holds a single deployment.
 	AffinityOff = ""
-	// AffinityNew means this prefix had no pin. It has one now.
+	// AffinityNew means this prefix had no pin to honour. Whether it has one
+	// afterwards is decided by what the upstream reported: a prefix the
+	// provider did not cache is not pinned, since there is no warm copy for a
+	// later request to be sent back to.
 	AffinityNew = "new"
 	// AffinityHit means the pinned deployment served the request, so the
 	// upstream's prompt cache was there to be read.
@@ -234,13 +243,6 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 				default:
 					affinity = AffinityMiss
 				}
-				// Written on every success, not only on a new pin: refreshing
-				// the TTL keeps an active conversation pinned for as long as it
-				// runs, and lets it lapse once it stops — the same lifetime the
-				// upstream gives the cache entry itself.
-				if err := r.state.SetAffinity(ctx, affinityKey, dep.ID(), pinTTL); err != nil {
-					r.log.Warn("record prompt affinity", "deployment", dep.ID(), "error", err)
-				}
 			}
 			return &Result{
 				Response:          resp,
@@ -248,6 +250,8 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 				AttemptedRetries:  attempt,
 				AttemptedFallback: hop,
 				PromptAffinity:    affinity,
+				promptKey:         affinityKey,
+				promptTTL:         pinTTL,
 			}, nil
 		}
 		if firstErr == nil {
@@ -589,6 +593,64 @@ func (r *Router) candidates(ctx context.Context, deployments []*config.Deploymen
 		out = append(out, d)
 	}
 	return out, why, nil
+}
+
+// RecordPrefix pins this request's cacheable prefix to the deployment that
+// served it, once the response has been read and it is known whether there is
+// anything to pin to.
+//
+// It is called after the relay rather than at the moment the upstream answers,
+// because the answer is where the evidence is. A pin exists to send the next
+// request carrying this prefix back to the upstream holding a warm copy of it,
+// and a request the provider did not cache leaves no warm copy anywhere:
+// pinning it would concentrate that prefix's traffic on one deployment in
+// exchange for nothing. Prompts below the provider's minimum cacheable size do
+// that on every request, as does an Anthropic caller sending no breakpoints
+// with injection off.
+//
+// It is written on every success rather than only on a new pin: refreshing the
+// TTL keeps an active conversation pinned for as long as it runs and lets it
+// lapse once it stops, which is the lifetime the upstream gives the cache entry
+// itself.
+//
+// The cost of deferring is a window, between dispatch and the end of the
+// response, in which a concurrent request carrying the same prefix sees no pin.
+// A conversation cannot race itself — its next turn waits on this reply — so
+// that window belongs to distinct callers sharing a prefix, which is the
+// concentration case affinity deliberately bounds anyway.
+func (r *Router) RecordPrefix(ctx context.Context, res *Result, usage core.Usage) {
+	if res == nil || res.promptKey == "" || res.Deployment == nil || res.promptTTL <= 0 {
+		return
+	}
+	if !prefixWorthPinning(res.Deployment.Params.Format, usage) {
+		return
+	}
+	if err := r.state.SetAffinity(ctx, res.promptKey, res.Deployment.ID(), res.promptTTL); err != nil {
+		r.log.Warn("record prompt affinity", "deployment", res.Deployment.ID(), "error", err)
+	}
+}
+
+// prefixWorthPinning reports whether this response is evidence that the prefix
+// it carried is worth sending back to the same upstream.
+//
+// Anthropic says outright whether its cache took part, reporting the tokens it
+// read from an entry and the tokens it wrote into one, so silence there means
+// there is nothing on that deployment to return to.
+//
+// An OpenAI-compatible provider says no such thing. Its caching is automatic
+// and its writes are free, so the first request of a conversation reports no
+// cached tokens whether or not the prefix was stored — and requiring evidence
+// would mean never establishing a pin, which is the feature switched off. The
+// pin is free there for the same reason the write is.
+//
+// A response reporting no usage at all is pinned too. It is the answer a
+// streamed reply gives when nothing asked for usage, and losing cache hits is
+// the more expensive way to be wrong.
+func prefixWorthPinning(format core.Format, usage core.Usage) bool {
+	if format != core.FormatAnthropic || usage.Empty() {
+		return true
+	}
+	return usage.PromptCacheUsed()
 }
 
 // RecordUsage attributes token usage to the deployment that served a request.

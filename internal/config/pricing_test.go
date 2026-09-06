@@ -86,6 +86,72 @@ func TestPricingValidation(t *testing.T) {
 			format: core.FormatAnthropic,
 			cost:   core.Pricing{},
 		},
+		{
+			name:   "a complete long-context tier",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75,
+				LongContext: &core.LongContextPricing{
+					AbovePromptTokens: 200_000,
+					InputPer1M:        6, OutputPer1M: 22.5, CacheReadPer1M: 0.6, CacheWritePer1M: 7.5,
+				},
+			},
+		},
+		{
+			name:   "a long-context tier with no threshold to trigger it",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75,
+				LongContext: &core.LongContextPricing{
+					InputPer1M: 6, OutputPer1M: 22.5, CacheReadPer1M: 0.6, CacheWritePer1M: 7.5,
+				},
+			},
+			wantErr: "above_prompt_tokens: must be > 0",
+		},
+		{
+			name:   "a long-context tier naming only its input price",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75,
+				LongContext: &core.LongContextPricing{AbovePromptTokens: 200_000, InputPer1M: 6},
+			},
+			wantErr: "long_context.cache_read_per_1m: required",
+		},
+		{
+			name:   "a long-context tier with no output price against a base that has one",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75,
+				LongContext: &core.LongContextPricing{
+					AbovePromptTokens: 200_000,
+					InputPer1M:        6, CacheReadPer1M: 0.6, CacheWritePer1M: 7.5,
+				},
+			},
+			wantErr: "long_context.output_per_1m: required",
+		},
+		{
+			name:   "the two blocks written the wrong way round",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 6, OutputPer1M: 22.5, CacheReadPer1M: 0.6, CacheWritePer1M: 7.5,
+				LongContext: &core.LongContextPricing{
+					AbovePromptTokens: 200_000,
+					InputPer1M:        3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75,
+				},
+			},
+			wantErr: "must be at least",
+		},
+		{
+			name:   "a long-context tier with no base rates to override",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				LongContext: &core.LongContextPricing{
+					AbovePromptTokens: 200_000,
+					InputPer1M:        6, OutputPer1M: 22.5, CacheReadPer1M: 0.6, CacheWritePer1M: 7.5,
+				},
+			},
+			wantErr: "requires",
+		},
 	}
 
 	for _, tt := range tests {

@@ -138,3 +138,115 @@ func within(a, b float64) bool {
 	d := a - b
 	return d < epsilon && d > -epsilon
 }
+
+// longContextPrice is Anthropic's shape for the tier: every class of token
+// costs more above the threshold, and the threshold is measured against the
+// whole prompt rather than against the part that was not cached.
+func longContextPrice() Pricing {
+	return Pricing{
+		InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3,
+		CacheWritePer1M: 3.75, CacheWrite1hPer1M: 6,
+		LongContext: &LongContextPricing{
+			AbovePromptTokens: 200_000,
+			InputPer1M:        6, OutputPer1M: 22.5, CacheReadPer1M: 0.6,
+			CacheWritePer1M: 7.5, CacheWrite1hPer1M: 12,
+		},
+	}
+}
+
+// A long conversation is the one a prompt cache exists for, and it is also the
+// one a provider charges most for. Reading it at the small-request rate
+// understates every figure the gateway reports about the traffic it was built
+// to carry, and does so silently.
+func TestALargePromptIsBilledAtItsOwnTier(t *testing.T) {
+	price := longContextPrice()
+
+	tests := []struct {
+		name  string
+		usage Usage
+		want  float64
+	}{
+		{
+			name:  "below the threshold, at the base rates",
+			usage: Usage{InputTokens: 100_000, OutputTokens: 1_000},
+			want:  100_000*3/1e6 + 1_000*15/1e6,
+		},
+		{
+			// The threshold is crossed by the whole prompt, not by the part of
+			// it the provider charged as fresh input: a conversation reading
+			// 190k tokens out of the cache is a large request, and the provider
+			// prices it as one.
+			name:  "cached tokens count towards the threshold",
+			usage: Usage{InputTokens: 20_000, CacheReadTokens: 190_000, OutputTokens: 1_000},
+			want:  20_000*6/1e6 + 190_000*0.6/1e6 + 1_000*22.5/1e6,
+		},
+		{
+			name: "every class of token moves tier together",
+			usage: Usage{
+				InputTokens: 50_000, CacheReadTokens: 100_000, CacheWriteTokens: 100_000,
+				CacheWrite1hTokens: 40_000, OutputTokens: 2_000,
+			},
+			want: 50_000*6/1e6 + 100_000*0.6/1e6 + 60_000*7.5/1e6 + 40_000*12/1e6 + 2_000*22.5/1e6,
+		},
+		{
+			// Exactly at the threshold is not above it.
+			name:  "the threshold is exclusive",
+			usage: Usage{InputTokens: 200_000},
+			want:  200_000 * 3 / 1e6,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := price.Cost(tt.usage); !within(got, tt.want) {
+				t.Errorf("Cost = %.6f, want %.6f", got, tt.want)
+			}
+		})
+	}
+}
+
+// Savings are what the cache took off the bill, so they have to be measured
+// against the input rate the request would actually have paid. Measured against
+// the base rate, a long-context conversation reports about half the saving it
+// made — and the identity that cost plus savings is the uncached bill stops
+// holding exactly where the money is.
+func TestSavingsOnALargePromptUseTheTierItWasBilledAt(t *testing.T) {
+	price := longContextPrice()
+	usage := Usage{InputTokens: 20_000, CacheReadTokens: 190_000, CacheWriteTokens: 10_000, OutputTokens: 500}
+
+	want := 190_000*(6-0.6)/1e6 + 10_000*(6-7.5)/1e6
+	if got := price.CacheSavings(usage); !within(got, want) {
+		t.Errorf("CacheSavings = %.6f, want %.6f", got, want)
+	}
+
+	// The identity the whole report rests on: what was charged plus what was
+	// not is what the same tokens would have cost as ordinary input.
+	uncached := float64(usage.PromptTokens())*6/1e6 + float64(usage.OutputTokens)*22.5/1e6
+	if got := price.Cost(usage) + price.CacheSavings(usage); !within(got, uncached) {
+		t.Errorf("cost + savings = %.6f, want the uncached bill %.6f", got, uncached)
+	}
+}
+
+// A tier that names only some of its rates falls back to the base rate for the
+// rest rather than to zero. Configuration refuses that shape at load; this is
+// what keeps an older binary reading a newer config from billing a class of
+// token at nothing.
+func TestAPartialTierFallsBackToTheBaseRate(t *testing.T) {
+	price := Pricing{
+		InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75,
+		LongContext: &LongContextPricing{AbovePromptTokens: 200_000, InputPer1M: 6},
+	}
+	usage := Usage{InputTokens: 300_000, OutputTokens: 1_000, CacheReadTokens: 1_000}
+	want := 300_000*6/1e6 + 1_000*15/1e6 + 1_000*0.3/1e6
+	if got := price.Cost(usage); !within(got, want) {
+		t.Errorf("Cost = %.6f, want %.6f", got, want)
+	}
+}
+
+// A cost block holding nothing but a tier is still a cost model: reporting it as
+// unpriced would skip the validation that refuses it.
+func TestZeroSeesATierAsPricing(t *testing.T) {
+	if (Pricing{LongContext: &LongContextPricing{AbovePromptTokens: 200_000}}).Zero() {
+		t.Error("a cost block carrying a long-context tier reported itself as unpriced")
+	}
+}
