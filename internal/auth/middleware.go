@@ -146,7 +146,7 @@ func (a *Authenticator) CheckBudget(ctx context.Context, ac *Context, ledger spe
 	if ac == nil || ac.Key == nil || ac.Key.MaxBudget <= 0 || ledger == nil {
 		return nil
 	}
-	spent, err := ledger.KeySpend(ctx, ac.Key.Hash, ac.Key.BudgetDuration)
+	spent, err := ledger.KeySpend(ctx, ac.Key.SpendSubject(), ac.Key.BudgetDuration)
 	if err != nil {
 		return fmt.Errorf("read key spend: %w", err)
 	}

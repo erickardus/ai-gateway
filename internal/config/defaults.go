@@ -46,6 +46,18 @@ const (
 	DefaultOTLPTimeout = 10 * time.Second
 	// DefaultOTLPProtocol is what every collector accepts.
 	DefaultOTLPProtocol = "http/protobuf"
+	// DefaultSSOKeyDuration is how long a key issued by an SSO login lives.
+	// Long enough that renewal is rare, short enough that a key left behind on
+	// a machine nobody logs into again stops working.
+	DefaultSSOKeyDuration = 720 * time.Hour
+	// DefaultSSORenewWithin is how far ahead of expiry a client renews. A
+	// quarter of the key's life, so a developer who runs Claude Code even once
+	// a week never sees an expired key.
+	DefaultSSORenewWithin = 168 * time.Hour
+	// DefaultSSORoleClaim is the claim matched against the configured roles.
+	// Every major provider can emit group membership under this name.
+	DefaultSSORoleClaim = "groups"
+
 	// DefaultServiceName is the service.name resource attribute, the key almost
 	// every OTLP backend groups by.
 	DefaultServiceName = "ai-gateway"
@@ -100,6 +112,11 @@ var KnownStrategies = []string{
 	StrategyUsageBased,
 	StrategyLatencyBased,
 }
+
+// DefaultSSOScopes are requested when sso.scopes is unset. offline_access buys
+// the refresh token that lets renewal re-check the identity against the
+// provider, which is what makes disabling an account stop its renewals.
+var DefaultSSOScopes = []string{"openid", "email", "profile", "groups", "offline_access"}
 
 func (c *Config) applyDefaults() {
 	s := &c.Server
@@ -181,6 +198,7 @@ func (c *Config) applyDefaults() {
 		c.Observability.SpendFlushInterval = DefaultSpendFlushInterval
 	}
 	applyOTLPDefaults(&c.Observability.OTLP)
+	applySSODefaults(c)
 
 	if c.Redis.KeyPrefix == "" {
 		c.Redis.KeyPrefix = DefaultRedisKeyPrefix
@@ -322,4 +340,41 @@ func parseOTLPPairs(raw string, unescape bool) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// applySSODefaults fills the SSO block. It is a no-op when SSO is not
+// configured, so an unconfigured gateway does not acquire a half-populated
+// block that validation would then have to reason about.
+func applySSODefaults(c *Config) {
+	s := &c.SSO
+	if !s.Enabled() {
+		return
+	}
+	if len(s.Scopes) == 0 {
+		s.Scopes = slices.Clone(DefaultSSOScopes)
+	}
+	if s.KeyDuration == 0 {
+		s.KeyDuration = DefaultSSOKeyDuration
+	}
+	if s.RenewWithin == 0 {
+		s.RenewWithin = DefaultSSORenewWithin
+	}
+	if s.RoleClaim == "" {
+		s.RoleClaim = DefaultSSORoleClaim
+	}
+	if s.BaseURL == "" {
+		if u, err := url.Parse(s.RedirectURL); err == nil && u.Scheme != "" && u.Host != "" {
+			s.BaseURL = u.Scheme + "://" + u.Host
+		}
+	}
+	// One model group is unambiguous, so asking the operator to name it again
+	// would only be a second place to keep in step. Several are ambiguous, and
+	// validation says so rather than picking one.
+	if s.Model == "" {
+		if groups := c.Groups(); len(groups) == 1 {
+			for name := range groups {
+				s.Model = name
+			}
+		}
+	}
 }

@@ -14,6 +14,14 @@ import (
 // reads it, configures against it, and gets different behaviour. Changing a
 // default should therefore break this test, as a prompt to update the table
 // alongside it.
+// documentedDefault is one row of the reference table, paired with the value
+// the code actually produces.
+type documentedDefault struct {
+	field string
+	got   any
+	want  any
+}
+
 func TestDocumentedDefaultsMatchCode(t *testing.T) {
 	cfg, err := Parse([]byte(`
 model_list:
@@ -29,11 +37,7 @@ model_list:
 		t.Fatalf("Parse: %v", err)
 	}
 
-	documented := []struct {
-		field string
-		got   any
-		want  any
-	}{
+	documented := []documentedDefault{
 		{"server.addr", cfg.Server.Addr, "0.0.0.0:4000"},
 		{"server.read_header_timeout", cfg.Server.ReadHeaderTimeout.String(), "30s"},
 		{"server.idle_timeout", cfg.Server.IdleTimeout.String(), "2m0s"},
@@ -78,6 +82,18 @@ model_list:
 		{"observability.stream_usage", cfg.Observability.StreamUsageEnabled(), true},
 	}
 
+	// The SSO defaults only exist once SSO is on, so they are read from a config
+	// that enables it.
+	ssoCfg, err := Parse([]byte(ssoConfig))
+	if err != nil {
+		t.Fatalf("Parse sso config: %v", err)
+	}
+	documented = append(documented,
+		documentedDefault{"sso.key_duration", ssoCfg.SSO.KeyDuration.String(), "720h0m0s"},
+		documentedDefault{"sso.renew_within", ssoCfg.SSO.RenewWithin.String(), "168h0m0s"},
+		documentedDefault{"sso.role_claim", ssoCfg.SSO.RoleClaim, "groups"},
+	)
+
 	for _, d := range documented {
 		if d.got != d.want {
 			t.Errorf("%s = %v, but docs/configuration.md says %v — update both together", d.field, d.got, d.want)
@@ -114,6 +130,7 @@ func TestDocsReferenceRealEndpoints(t *testing.T) {
 		"/health", "/health/liveliness", "/health/readiness",
 		"/key/generate", "/key/info", "/key/list", "/key/delete",
 		"/spend/keys", "/spend/deployments", "/cache/purge",
+		"/sso/login", "/sso/callback", "/sso/exchange", "/sso/renew",
 	} {
 		if !strings.Contains(string(docs), route) {
 			t.Errorf("docs/configuration.md does not mention route %s", route)
