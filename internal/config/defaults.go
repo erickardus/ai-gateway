@@ -1,7 +1,11 @@
 package config
 
 import (
+	"maps"
+	"net/url"
+	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/erickardus/ai-gateway/internal/cache"
@@ -32,6 +36,19 @@ const (
 
 	// DefaultSpendFlushInterval paces persistence of the spend ledger.
 	DefaultSpendFlushInterval = 30 * time.Second
+
+	// DefaultOTLPInterval matches the OpenTelemetry SDK's own default export
+	// interval, so a collector sees this gateway arrive at the same cadence as
+	// everything else pointed at it.
+	DefaultOTLPInterval = 60 * time.Second
+	// DefaultOTLPTimeout bounds one export. Well under the interval, so a slow
+	// collector cannot leave exports overlapping.
+	DefaultOTLPTimeout = 10 * time.Second
+	// DefaultOTLPProtocol is what every collector accepts.
+	DefaultOTLPProtocol = "http/protobuf"
+	// DefaultServiceName is the service.name resource attribute, the key almost
+	// every OTLP backend groups by.
+	DefaultServiceName = "ai-gateway"
 
 	// DefaultRedisKeyPrefix namespaces shared state.
 	DefaultRedisKeyPrefix = "ai-gateway"
@@ -163,6 +180,7 @@ func (c *Config) applyDefaults() {
 	if c.Observability.SpendFlushInterval == 0 {
 		c.Observability.SpendFlushInterval = DefaultSpendFlushInterval
 	}
+	applyOTLPDefaults(&c.Observability.OTLP)
 
 	if c.Redis.KeyPrefix == "" {
 		c.Redis.KeyPrefix = DefaultRedisKeyPrefix
@@ -192,4 +210,116 @@ func (c *Config) applyDefaults() {
 	if c.PromptCache.InjectMinBytes == 0 {
 		c.PromptCache.InjectMinBytes = DefaultInjectMinBytes
 	}
+}
+
+// applyOTLPDefaults fills the exporter's blanks, reading the standard
+// OpenTelemetry environment variables where the config file is silent.
+//
+// Honouring OTEL_* matters more than it looks. Those variables are how a
+// collector sidecar, an operator's injected environment, or a hosted vendor's
+// setup instructions configure every other component in a fleet; a gateway that
+// read only its own YAML would be the one process needing to be told separately,
+// and would silently export nothing in an environment where everything else
+// worked. The config file still wins wherever it speaks, because it is the more
+// specific statement.
+func applyOTLPDefaults(o *OTLPConfig) {
+	if o.Endpoint == "" {
+		// The metrics-specific variable is the more specific of the two and
+		// wins, which is the precedence the OTLP specification defines. Note it
+		// is a full signal URL rather than a base, but endpointURL leaves a
+		// path it is given alone, so both spellings land in the right place.
+		o.Endpoint = firstNonEmpty(
+			os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"),
+			os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		)
+	}
+	if !o.Enabled() {
+		return
+	}
+	if o.Protocol == "" {
+		o.Protocol = firstNonEmpty(
+			os.Getenv("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"),
+			os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL"),
+			DefaultOTLPProtocol,
+		)
+	}
+	if o.Interval == 0 {
+		o.Interval = DefaultOTLPInterval
+	}
+	if o.Timeout == 0 {
+		o.Timeout = DefaultOTLPTimeout
+	}
+	if o.ServiceName == "" {
+		o.ServiceName = firstNonEmpty(os.Getenv("OTEL_SERVICE_NAME"), DefaultServiceName)
+	}
+
+	// Headers from the environment are the base; anything the config file names
+	// is layered over them, so a file can override one header without having to
+	// restate the rest.
+	env := parseOTLPHeaders(firstNonEmpty(
+		os.Getenv("OTEL_EXPORTER_OTLP_METRICS_HEADERS"),
+		os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"),
+	))
+	if len(env) > 0 {
+		merged := make(map[string]string, len(env)+len(o.Headers))
+		maps.Copy(merged, env)
+		maps.Copy(merged, o.Headers)
+		o.Headers = merged
+	}
+
+	if attrs := parseOTLPAttributes(os.Getenv("OTEL_RESOURCE_ATTRIBUTES")); len(attrs) > 0 {
+		merged := make(map[string]string, len(attrs)+len(o.ResourceAttributes))
+		maps.Copy(merged, attrs)
+		maps.Copy(merged, o.ResourceAttributes)
+		o.ResourceAttributes = merged
+	}
+}
+
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// parseOTLPHeaders reads the W3C Baggage form the OTLP specification uses for
+// OTEL_EXPORTER_OTLP_HEADERS: comma-separated key=value pairs, percent-encoded.
+//
+// A malformed pair is skipped rather than failing the load. The variable is
+// usually injected by something else — a sidecar, a platform — and refusing to
+// start over one unreadable header would take the gateway down for a
+// telemetry-only problem.
+func parseOTLPHeaders(raw string) map[string]string {
+	return parseOTLPPairs(raw, true)
+}
+
+// parseOTLPAttributes reads OTEL_RESOURCE_ATTRIBUTES, which uses the same form.
+func parseOTLPAttributes(raw string) map[string]string {
+	return parseOTLPPairs(raw, true)
+}
+
+func parseOTLPPairs(raw string, unescape bool) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	out := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		k, v, ok := strings.Cut(pair, "=")
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if !ok || k == "" {
+			continue
+		}
+		if unescape {
+			if dk, err := url.QueryUnescape(k); err == nil {
+				k = dk
+			}
+			if dv, err := url.QueryUnescape(v); err == nil {
+				v = dv
+			}
+		}
+		out[k] = v
+	}
+	return out
 }

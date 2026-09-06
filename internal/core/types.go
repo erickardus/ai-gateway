@@ -219,6 +219,28 @@ type Pricing struct {
 	// a long write at a deployment without this price is logged, rather than
 	// left to be discovered on an invoice.
 	CacheWrite1hPer1M float64 `yaml:"cache_write_1h_per_1m"`
+	// CacheWritesFree declares that this upstream charges nothing to write its
+	// prompt cache, so an absent write price means zero rather than "unset".
+	//
+	// It exists because "speaks the Anthropic wire format" is not the same fact
+	// as "is Anthropic, and prices like it". Anthropic charges a premium to
+	// write, so a write price is required on an `anthropic` deployment and
+	// required above input — but an Anthropic-compatible endpoint in front of
+	// another model need not charge for writes at all, and Moonshot's does not.
+	// Without this flag such a deployment cannot be priced: every price an
+	// operator could write there would invent a premium the invoice never
+	// shows, so the deployment is left unpriced and reports real billable
+	// traffic at zero.
+	//
+	// It also sharpens an `openai` deployment, where the write price is
+	// optional and an unset one falls back to the input rate — a deliberate
+	// approximation for Qwen and MiniMax, which do charge, but an overstatement
+	// for the larger part of that ecosystem which does not. Declaring writes
+	// free replaces the approximation with the actual figure.
+	//
+	// Requires InputPer1M, and contradicts a non-zero write price at the same
+	// tier; both are refused at load.
+	CacheWritesFree bool `yaml:"cache_writes_free"`
 	// LongContext prices a request whose prompt crosses a threshold the
 	// provider charges a higher rate above. Anthropic's long-context tier is
 	// the one in use today: a request whose prompt exceeds 200k tokens is
@@ -256,7 +278,8 @@ type LongContextPricing struct {
 // Zero reports whether no pricing was configured.
 func (p Pricing) Zero() bool {
 	return p.InputPer1M == 0 && p.OutputPer1M == 0 && p.CacheReadPer1M == 0 &&
-		p.CacheWritePer1M == 0 && p.CacheWrite1hPer1M == 0 && p.LongContext == nil
+		p.CacheWritePer1M == 0 && p.CacheWrite1hPer1M == 0 && p.LongContext == nil &&
+		!p.CacheWritesFree
 }
 
 // rates is the price of each class of token for one request, once the tier the
@@ -292,7 +315,13 @@ func (p Pricing) rates(u Usage) rates {
 	//
 	// It never fires on an `anthropic` deployment: validation requires a write
 	// price there, and requires it above input.
+	//
+	// Unless the deployment declares its writes free, which is the one case
+	// where an absent price is an actual zero rather than an unstated one.
 	writeRate := orRate(p.CacheWritePer1M, p.InputPer1M)
+	if p.CacheWritesFree {
+		writeRate = 0
+	}
 	base := rates{
 		input:        p.InputPer1M,
 		output:       p.OutputPer1M,
@@ -368,6 +397,30 @@ func (p Pricing) CacheSavings(u Usage) float64 {
 	return float64(u.CacheReadTokens)*(r.input-r.cacheRead)/perMillion +
 		float64(write5m)*(r.input-r.cacheWrite)/perMillion +
 		float64(write1h)*(r.input-r.cacheWrite1h)/perMillion
+}
+
+// CacheBreakdown splits CacheSavings into its two monotonic halves: what
+// reading the cache took off the bill, and what writing it added.
+//
+// The signed total is the right shape for a report a person reads — it answers
+// "is caching paying for itself" in one number. It is the wrong shape for a
+// metric, because a counter that can decrease is not a counter: every rate()
+// over it breaks the moment a deployment writes more cache than it reads back,
+// which is precisely the condition worth alerting on. Published apart, both
+// halves only ever rise and their difference is still one subtraction away.
+func (p Pricing) CacheBreakdown(u Usage) (discount, premium float64) {
+	const perMillion = 1_000_000.0
+	r := p.rates(u)
+	write1h := min(max(u.CacheWrite1hTokens, 0), u.CacheWriteTokens)
+	write5m := u.CacheWriteTokens - write1h
+
+	discount = float64(u.CacheReadTokens) * (r.input - r.cacheRead) / perMillion
+	premium = float64(write5m)*(r.cacheWrite-r.input)/perMillion +
+		float64(write1h)*(r.cacheWrite1h-r.input)/perMillion
+	// A write priced at or below input is a discount rather than a premium; it
+	// is not one this gateway has seen a provider charge, but the arithmetic
+	// must not report a negative premium either way.
+	return max(discount, 0), max(premium, 0)
 }
 
 // Cost returns what a request cost, in the currency the pricing was written in.

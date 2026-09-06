@@ -68,6 +68,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		s.fail(w, r, err)
 		return
 	}
+	obs.requestBytes = int64(len(body))
 
 	fields, err := jsonx.Peek(body)
 	if err != nil {
@@ -113,10 +114,13 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		} else if hit {
 			obs.deployment, obs.outcome = "cache", metrics.OutcomeCacheHit
 			obs.usage, obs.latency = entry.Usage, time.Since(started)
+			obs.responseBytes = int64(len(entry.Body))
+			s.metrics.RecordResponseCache(fields.Model, metrics.OutcomeHit)
 			s.serveFromCache(w, entry, fields.Model, format)
-			s.metrics.Observe(obs.toResult(0))
+			s.metrics.Observe(obs.toResult(0, 0, 0))
 			return
 		}
+		s.metrics.RecordResponseCache(fields.Model, metrics.OutcomeMiss)
 	}
 
 	// Refuse a key that has already spent its budget before incurring more cost.
@@ -192,6 +196,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	obs.format, obs.streaming = format, fields.Stream
 	obs.retries, obs.fallbacks = result.AttemptedRetries, result.AttemptedFallback
 	obs.promptAffinity = result.PromptAffinity
+	obs.statusClass = statusClass(result.Response.StatusCode)
 	s.metrics.InFlightAdd(obs.model, obs.deployment, 1)
 	defer s.metrics.InFlightAdd(obs.model, obs.deployment, -1)
 
@@ -221,7 +226,15 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		relayTarget = tee
 	}
 
-	usage, relayErr := provider.Relay(relayTarget, result.Response.Body, format)
+	relayed, relayErr := provider.Relay(relayTarget, result.Response.Body, format)
+	usage := relayed.Usage
+	obs.responseBytes = relayed.Bytes
+	// Time to first token is measured from when the caller's request arrived,
+	// not from when the relay began: the queueing, routing and retrying that
+	// happened in between is latency the caller waited through.
+	if !relayed.FirstChunkAt.IsZero() {
+		obs.timeToFirstToken = relayed.FirstChunkAt.Sub(started)
+	}
 	if relayErr != nil {
 		// The status line is already sent, so the only thing left is to record
 		// what happened.
@@ -259,11 +272,39 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	obs.usage = usage
 	obs.outcome = metrics.OutcomeSuccess
+	obs.streamCompleted = relayErr == nil
 	if relayErr != nil {
 		obs.outcome = metrics.OutcomeUpstream
 	}
 	obs.latency = time.Since(started)
+	// Throughput is measured after the first chunk so it describes generation
+	// rather than the queueing that preceded it — the two move independently,
+	// and averaging them together hides both.
+	if !relayed.FirstChunkAt.IsZero() && usage.OutputTokens > 0 {
+		if generating := time.Since(relayed.FirstChunkAt).Seconds(); generating > 0 {
+			obs.throughput = float64(usage.OutputTokens) / generating
+		}
+	}
 	s.record(r, obs)
+}
+
+// statusClass reduces an upstream status to its class. The full code would put
+// an unbounded dimension on a metric — a provider is free to invent one — where
+// the class is what an alert actually keys on: a 5xx is the upstream's fault, a
+// 4xx is the request's.
+func statusClass(code int) string {
+	switch {
+	case code >= 500:
+		return "5xx"
+	case code >= 400:
+		return "4xx"
+	case code >= 300:
+		return "3xx"
+	case code >= 200:
+		return "2xx"
+	default:
+		return ""
+	}
 }
 
 // promptPrefix fingerprints the cacheable prefix of a request and says how long
@@ -307,7 +348,7 @@ func (s *Server) reject(r *http.Request, obs *observation, reason string, starte
 	obs.outcome = metrics.OutcomeRejected
 	obs.rejectReason = reason
 	obs.latency = time.Since(started)
-	s.metrics.Observe(obs.toResult(0))
+	s.metrics.Observe(obs.toResult(0, 0, 0))
 }
 
 // readBody reads the request body under the configured size limit.

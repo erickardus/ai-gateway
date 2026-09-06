@@ -39,6 +39,17 @@ type generateRequest struct {
 	AllowPassthrough bool     `json:"allow_passthrough"`
 	// Duration is a Go duration string such as "720h". Empty means no expiry.
 	Duration string `json:"duration"`
+	// MaxBudget caps billable spend over BudgetDuration. Zero is unlimited.
+	//
+	// A key minted here can carry a budget for the same reason a
+	// config-declared one can: the ledger enforces the cap by key hash and
+	// knows nothing about where the key was declared. Omitting these fields
+	// would mean every key issued at runtime — which the quickstart's own
+	// example does — silently had no cap at all.
+	MaxBudget float64 `json:"max_budget"`
+	// BudgetDuration is the window MaxBudget applies over, as a Go duration
+	// string. Empty means the key's whole lifetime.
+	BudgetDuration string `json:"budget_duration"`
 }
 
 // handleKeyGenerate mints a new virtual key. The plaintext is returned exactly
@@ -68,6 +79,31 @@ func (s *Server) handleKeyGenerate(w http.ResponseWriter, r *http.Request) {
 		expiresAt = &t
 	}
 
+	if req.MaxBudget < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error",
+			"max_budget must not be negative")
+		return
+	}
+	var budgetDuration time.Duration
+	if req.BudgetDuration != "" {
+		d, err := time.ParseDuration(req.BudgetDuration)
+		if err != nil || d <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request_error",
+				"budget_duration must be a positive Go duration string, for example \"720h\"")
+			return
+		}
+		budgetDuration = d
+	}
+	// A window with nothing to cap is refused rather than ignored: it is far
+	// likelier to be a budget the caller believes they set than a deliberate
+	// no-op, and a key handed back with a window and no cap spends without
+	// limit while looking constrained.
+	if budgetDuration > 0 && req.MaxBudget == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error",
+			"budget_duration requires max_budget; a window with no cap limits nothing")
+		return
+	}
+
 	plaintext, hash, err := auth.Generate()
 	if err != nil {
 		s.fail(w, r, err)
@@ -78,6 +114,7 @@ func (s *Server) handleKeyGenerate(w http.ResponseWriter, r *http.Request) {
 		RPMLimit: req.RPMLimit, TPMLimit: req.TPMLimit,
 		AllowPassthrough: req.AllowPassthrough,
 		CreatedAt:        time.Now().UTC(), ExpiresAt: expiresAt,
+		MaxBudget: req.MaxBudget, BudgetDuration: budgetDuration,
 	}
 	if err := s.store.Put(r.Context(), key); err != nil {
 		s.fail(w, r, err)

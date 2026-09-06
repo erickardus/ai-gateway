@@ -202,3 +202,90 @@ func pricedConfig(format core.Format, cost core.Pricing) *Config {
 		}},
 	}
 }
+
+// An Anthropic-compatible endpoint in front of another model need not price
+// like Anthropic. Moonshot's charges nothing to write its prompt cache, and
+// before cache_writes_free existed such a deployment could not be priced at all:
+// every write price an operator could write there would invent a premium the
+// invoice never shows, so the deployment was left unpriced and reported real
+// billable traffic at zero.
+func TestFreeCacheWritesOnAnAnthropicCompatibleUpstream(t *testing.T) {
+	tests := []struct {
+		name    string
+		format  core.Format
+		cost    core.Pricing
+		wantErr string
+	}{
+		{
+			name:   "anthropic format, writes declared free",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3,
+				CacheWritesFree: true,
+			},
+		},
+		{
+			name:   "openai format, writes declared free",
+			format: core.FormatOpenAI,
+			cost: core.Pricing{
+				InputPer1M: 1.25, OutputPer1M: 10, CacheReadPer1M: 0.125,
+				CacheWritesFree: true,
+			},
+		},
+		{
+			name:   "free writes alongside a long-context tier, which inherits the flag",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3,
+				CacheWritesFree: true,
+				LongContext: &core.LongContextPricing{
+					AbovePromptTokens: 200000,
+					InputPer1M:        6, OutputPer1M: 22.5, CacheReadPer1M: 0.6,
+				},
+			},
+		},
+		{
+			name:   "free writes and a write price contradict each other",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3,
+				CacheWritePer1M: 3.75, CacheWritesFree: true,
+			},
+			wantErr: "must not be set alongside cache_writes_free",
+		},
+		{
+			name:    "the flag alone prices nothing",
+			format:  core.FormatAnthropic,
+			cost:    core.Pricing{CacheWritesFree: true},
+			wantErr: "cache_writes_free: requires",
+		},
+		{
+			name:   "a long-context tier may not reintroduce a write charge",
+			format: core.FormatAnthropic,
+			cost: core.Pricing{
+				InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3,
+				CacheWritesFree: true,
+				LongContext: &core.LongContextPricing{
+					AbovePromptTokens: 200000,
+					InputPer1M:        6, OutputPer1M: 22.5, CacheReadPer1M: 0.6,
+					CacheWritePer1M: 7.5,
+				},
+			},
+			wantErr: "must not be set alongside cache_writes_free",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := Finalize(pricedConfig(tt.format, tt.cost))
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("Finalize: %v", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("Finalize succeeded, want error containing %q", tt.wantErr)
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Fatalf("Finalize error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}

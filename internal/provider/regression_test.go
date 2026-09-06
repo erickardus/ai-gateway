@@ -74,7 +74,8 @@ func TestPassthroughRelaysRealCredential(t *testing.T) {
 func TestUsageFromNonStreamingBody(t *testing.T) {
 	body := `{"id":"msg_1","type":"message","usage":{"input_tokens":1234,"output_tokens":56}}`
 	rec := testutil.NewSyncWriter()
-	usage, err := Relay(rec, strings.NewReader(body), core.FormatAnthropic)
+	relayed, err := Relay(rec, strings.NewReader(body), core.FormatAnthropic)
+	usage := relayed.Usage
 	if err != nil {
 		t.Fatalf("Relay: %v", err)
 	}
