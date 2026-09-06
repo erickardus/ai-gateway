@@ -266,17 +266,31 @@ datastore behind `spend.Store`.
 ### ⚪ Cross-format translation
 
 An Anthropic ingress reaches only `anthropic` deployments; OpenAI only `openai`.
-Enforced in routing and validation.
+A model group may not mix formats, and a fallback may not cross them. Enforced in
+`router.candidates` and twice in `config.validate`.
 
-This is a **non-goal for now, not an oversight**. Anthropic's gateway rules
-require forwarding request bodies unchanged, and translation is precisely the
-opposite. Building it means mapping content blocks, `tool_use`/`tool_result`, and
-the streaming event grammar in both directions — large, and in tension with the
-guarantee that makes the passthrough path work.
+This is a **non-goal for now, not an oversight**.
+[architecture.md](architecture.md#there-is-no-cross-format-translation) records
+why. What follows is the size of the thing, so that a later decision to build it
+is taken against the real number rather than against "map the fields".
+
+| Surface | The work |
+|---|---|
+| Envelope | `system` is a top-level field one side and a message the other. `max_tokens` is required one side, optional the other. `temperature` is 0–1 against 0–2, so a faithful mapping rescales rather than copies. Each side has parameters the other cannot express — `n` and `logprobs` one way, a `thinking` budget and `cache_control` the other |
+| Content blocks | Anthropic's typed block list against OpenAI's string-or-parts plus a sibling `tool_calls` array. Tool results move from blocks inside a user message to separate `role: "tool"` messages — 1→N, so the arrays do not correspond by index and cannot be walked in step. Images move between `source.data` and a `data:` URL. `thinking` signatures have nowhere to go |
+| Tools | `input_schema` against `function.parameters`. `tool_choice` vocabularies that overlap without either containing the other: `any` and `required` are the same thing under different names |
+| Streaming | Anthropic's stateful event grammar against OpenAI's flat chunk sequence. Index-addressed tool-call fragments must be reassembled into `content_block_start`/`delta`/`stop` lifecycles with block indices the gateway invents, and `message_start` must carry an input token count that an OpenAI-compatible upstream does not report until its final chunk. Terminal reasons map unevenly too — OpenAI's `content_filter` has no `stop_reason` counterpart |
+
+It is also not a feature that finishes. Every content block type either provider
+adds afterwards is a new mapping in both directions, and a missing one degrades a
+call rather than failing it — so the cost is a permanent one, carried against
+providers that ship on their own schedule.
 
 If it is wanted, the shape is a `Transformer` between ingress and `provider`,
 applied only to deployments whose format differs from the ingress, never on the
-passthrough path.
+passthrough path. The gain that would justify it is a fallback that crosses
+vendors, which nothing else here can provide: today an Anthropic outage has no
+escape hatch, because `validate.go` refuses a fallback leaving the format.
 
 ### 🔴 OpenAI's `prompt_cache_key` is not sent
 

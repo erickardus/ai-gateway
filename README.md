@@ -116,7 +116,10 @@ interface waiting for it.
 There is **no cross-format translation** in v1: an Anthropic ingress routes only
 to `anthropic` deployments, an OpenAI ingress only to `openai` ones. That is a
 deliberate choice — Anthropic's gateway rules require forwarding request bodies
-unchanged, and translation is the opposite of that.
+unchanged, and translation is the opposite of that. The reasoning is recorded in
+[architecture.md](docs/architecture.md#there-is-no-cross-format-translation), and
+[roadmap.md](docs/roadmap.md#-cross-format-translation) sizes what building it
+would take.
 
 ## Documentation
 

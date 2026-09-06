@@ -121,6 +121,46 @@ every request. Refusal is recorded only on that succeeding branch, so a `400` th
 caller earned, which fails both bodies, cannot switch the optimization off for
 everyone else.
 
+### There is no cross-format translation
+
+An Anthropic ingress reaches only `anthropic` deployments, an OpenAI ingress only
+`openai` ones. A model group may not mix formats, and a fallback may not cross
+them. Enforced in `router.candidates` and twice in `config.validate`.
+
+Translation would mean accepting a request in one format, rewriting it into
+another upstream, and rewriting the reply back. That is the opposite operation to
+the two above. Editing a body splices one value and leaves every other byte
+identical; translating it parses the whole document, rebuilds it, and takes
+ownership of the fidelity of every field forever — including the fields that do
+not map.
+
+Several do not. Anthropic carries tool results as blocks inside a user message
+where OpenAI carries them as separate messages with `role: "tool"`, so one
+message becomes N and the arrays no longer correspond by index. `thinking` blocks
+carry signatures Anthropic verifies on the following turn, and the OpenAI format
+has nowhere to hold them. Anthropic reports input tokens in `message_start`, at
+the top of a stream; an OpenAI-compatible upstream reports usage in its final
+chunk and only when asked — so a translated stream would have to emit a token
+count before it could know one.
+
+None of those fail loudly. They produce a request that succeeds and behaves
+worse, which is the failure class the rest of this gateway is shaped to avoid.
+
+The harder constraint is that Anthropic's gateway rules require forwarding
+request bodies unchanged, and the subscription passthrough path depends on that
+guarantee. Translation cannot apply to a passthrough deployment at all.
+
+What an operator gives up is a fallback that crosses vendors: an
+`anthropic-claude` group cannot spill to an OpenAI-format upstream while
+Anthropic is down. That is the cost, and it is the thing that would justify
+revisiting this.
+
+If it is revisited, the seam is a `Transformer` between ingress and `provider`,
+applied only to deployments whose format differs from the ingress and never on
+the passthrough path — the same per-deployment decision the `Annotator` already
+makes, one order of commitment up. [roadmap.md](roadmap.md#-cross-format-translation)
+sizes the work.
+
 ### Headers are forwarded as an open list
 
 `anthropic-*` headers pass through unfiltered. Capability values arrive with new
