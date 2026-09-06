@@ -120,16 +120,19 @@ func TestValidationErrors(t *testing.T) {
 			want: "must be empty when auth_mode is passthrough",
 		},
 		{
-			// Injection rewrites the request body, and the passthrough path
-			// exists to forward one unchanged.
-			name: "prompt cache injection alongside passthrough",
+			// A passthrough deployment must forward the caller's body unchanged,
+			// so it never carries a breakpoint. A fleet holding nothing else is
+			// a setting that does nothing, which is refused rather than served.
+			name: "prompt cache injection where every deployment is passthrough",
 			yaml: "virtual_keys:\n  allowed_upstream_hosts: [api.anthropic.com]\nprompt_cache:\n  inject: true\nmodel_list:\n  - model_name: m\n    params:\n      format: anthropic\n      api_base: https://api.anthropic.com\n      auth_mode: passthrough\n",
-			want: "prompt_cache.inject",
+			want: "no deployment can carry a cache breakpoint",
 		},
 		{
-			name: "prompt cache injection on an openai deployment",
+			// Breakpoints are an Anthropic construct, so an all-openai fleet is
+			// the same empty set.
+			name: "prompt cache injection where every deployment is openai",
 			yaml: "prompt_cache:\n  inject: true\nmodel_list:\n  - model_name: m\n    params:\n      format: openai\n      api_base: https://api.openai.com\n      auth_mode: api_key\n      auth_header: authorization\n      api_key: k\n",
-			want: "cache breakpoints are an Anthropic construct",
+			want: "no deployment can carry a cache breakpoint",
 		},
 		{
 			name: "negative prompt cache affinity ttl",
@@ -193,6 +196,46 @@ func TestValidationErrors(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// Injection is decided per deployment, at dispatch, so a fleet that mixes
+// deployments which can carry a breakpoint with deployments which cannot is
+// served rather than refused.
+//
+// This is the arrangement the gateway exists for: one gateway fronting Claude
+// Code, whose subscription traffic must reach the upstream byte for byte, and
+// plain API callers, who place no breakpoints of their own and get no caching
+// without one. Refusing the combination at load — which is what a single body
+// fixed before routing forces — meant the operator had to choose which half of
+// their traffic to serve properly.
+func TestInjectionIsAllowedAlongsidePassthrough(t *testing.T) {
+	const mixed = `
+virtual_keys:
+  allowed_upstream_hosts: [api.anthropic.com]
+prompt_cache:
+  inject: true
+model_list:
+  - model_name: claude
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com
+      auth_mode: passthrough
+  - model_name: claude-api
+    params:
+      format: anthropic
+      api_base: https://api.anthropic.com/v1
+      auth_mode: api_key
+      auth_header: x-api-key
+      api_key: k
+      model: claude-sonnet-4
+`
+	cfg, err := Parse([]byte(mixed))
+	if err != nil {
+		t.Fatalf("a mixed fleet was refused, so an operator must still choose which half of their traffic to serve properly: %v", err)
+	}
+	if !cfg.PromptCache.Inject {
+		t.Error("inject was silently turned off rather than applied to the deployments that can take it")
 	}
 }
 
