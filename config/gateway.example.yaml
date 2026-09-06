@@ -221,11 +221,13 @@ virtual_keys:
 # deployment. On by default.
 #
 # inject places cache breakpoints on the stable prefix of an Anthropic request —
-# the tools and the system prompt — for callers that do not place their own.
-# Off by default, and refused at load while any passthrough deployment is
-# configured: injection edits the request body, and the passthrough path exists
-# to forward one unchanged. Claude Code places its own breakpoints, so a body
-# that already carries one is never touched.
+# the tools and the system prompt — for callers that do not place their own. Off
+# by default. Which deployments it reaches is decided at dispatch: a passthrough
+# deployment is never annotated, since it must forward the caller's body
+# unchanged, and neither is one speaking another format. So a fleet holding both
+# — the arrangement below — gets breakpoints on its API deployments while its
+# subscription traffic is forwarded verbatim. Claude Code places its own
+# breakpoints, so a body that already carries one is never touched.
 prompt_cache:
   affinity: true
   affinity_ttl: 5m
