@@ -224,16 +224,37 @@ does with it, and what it says afterwards.
 
 | | Anthropic | OpenAI-compatible |
 |---|---|---|
-| How a prefix is cached | explicitly, at a `cache_control` breakpoint | automatically, above a minimum prefix length |
-| What a write costs | a premium over input | nothing |
+| How a prefix is cached | explicitly, at a `cache_control` breakpoint | usually automatically, above a minimum prefix length |
+| What a write costs | a premium over input | usually nothing |
 | Where the discount shows up | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens` |
 | Whether input includes it | no | **yes** |
 
 That last row is the one that costs money. Anthropic reports an `input_tokens`
-that already excludes both cache counters, so the three figures are simply added
-up at their own prices. An OpenAI-compatible response reports a `prompt_tokens`
-that **includes** its cached tokens, and names how many of them were cached
-separately.
+that already excludes every cache counter, so the figures are simply added up at
+their own prices. An OpenAI-compatible response reports a `prompt_tokens` that
+**includes** them, and breaks them out beside it.
+
+The two "usually" qualifiers are the second thing that costs money, and they are
+why the counters are read from more than one place:
+
+| Provider | Cached how | A read is reported as | A write |
+|---|---|---|---|
+| OpenAI | automatically | `prompt_tokens_details.cached_tokens` | free, unreported |
+| Kimi (Moonshot) | automatically | the same | free, unreported |
+| GLM (Z.ai) | automatically | the same | free, unreported |
+| DeepSeek | automatically | `prompt_cache_hit_tokens`, top level | free, unreported |
+| **Qwen (Alibaba)** | **explicitly, at a `cache_control` breakpoint** | the same | **charged**, nested in `prompt_tokens_details` |
+| **MiniMax** | automatically | the same, and again as `cache_read_input_tokens` | **charged**, nested in `prompt_tokens_details` |
+
+The last two rows are the ones a gateway gets wrong. They put their write
+counters — and, for Qwen, an Anthropic-shaped `cache_creation` TTL breakdown —
+*inside* the details object rather than at the top level of `usage` where
+Anthropic puts them. Read only the top level and those writes are invisible;
+they do not vanish, they stay inside `prompt_tokens` and are billed at the input
+rate. On a request writing 2048 tokens of a 2059-token prompt that is a fifth
+off the bill, and on a larger explicit cache it is more. It fails in the
+expensive direction: a budget that should have stopped a key keeps letting it
+spend, and `/spend` quietly disagrees with the invoice.
 
 Read with Anthropic's rule, every cached token on an OpenAI deployment is
 charged twice — once at the full input rate inside `prompt_tokens`, once at the
@@ -248,16 +269,26 @@ So the gateway normalizes at the point of parsing, under the format of the
 deployment that served the request:
 
 ```
-InputTokens = prompt_tokens - cached_tokens      # openai
-InputTokens = input_tokens                       # anthropic
+InputTokens = prompt_tokens - cached_tokens - cache_creation_tokens   # openai
+InputTokens = input_tokens                                           # anthropic
 ```
 
 The invariant is that every prompt token is counted exactly once, in whichever
-bucket the provider priced it in. It holds against the field names in use across
-OpenAI-compatible servers — `prompt_tokens_details.cached_tokens`,
-`input_tokens_details.cached_tokens`, and DeepSeek's `prompt_cache_hit_tokens` —
-and a cached count larger than the input it belongs to is clamped rather than
-allowed to mint savings out of an upstream's arithmetic error.
+bucket the provider priced it in — the three buckets partition `prompt_tokens`
+rather than overlapping it. MiniMax states the same identity from its own side,
+reporting a `non_cached_input_tokens` that equals what this arithmetic produces.
+
+Every name a counter is known by is read, in both placements, and **no two are
+ever added together**: one figure under two names is still one figure, so the
+larger is taken rather than the sum. That covers
+`prompt_tokens_details.cached_tokens`, `input_tokens_details.cached_tokens`,
+`cache_read_input_tokens`, DeepSeek's top-level `prompt_cache_hit_tokens`, and
+`cache_creation_input_tokens` at either level.
+
+Reads settle against the reported total first and writes take what is left, so a
+provider claiming more cached and written tokens than it charged input for is
+clamped rather than allowed to drive input negative or mint savings out of an
+upstream's arithmetic error.
 
 ### Streamed replies report nothing unless asked
 
@@ -682,6 +713,7 @@ than on mechanism:
 | `TestAConversationPaysForItsPrefixOnce` | a ten-turn conversation through a balanced group, billed against a hand-computed figure. Each fake upstream holds its own cache, so a scattered conversation pays real cache writes |
 | `TestScatteringAConversationCostsRealMoney` | the same workload with affinity off, proving the guarantee above is doing something rather than describing a group that never balanced |
 | `TestOpenAICachedPrefixIsBilledOnce` | the double-billing bug, end to end, plus the invariant that input and cache-read tokens sum to what the provider reported |
+| `TestAnExplicitCacheWriteIsBilledAtItsOwnRate` | an explicit-cache provider's writes billed at the input rate because it nests them, which understates the bill and lets a budget overrun |
 | `TestUsageIsReadUnderTheFormatThatProducedIt` | every provider usage shape in use, read under both formats, against expected counters |
 | `FuzzUsageAccounting` | a hostile or broken upstream producing negative counts, negative cost, or savings nobody made |
 | `TestInjectionAddsBreakpointsAndNothingElse`, `FuzzInject` | a rewritten body that differs from the original by anything other than its breakpoints — which would change the very prefix bytes the cache keys on |

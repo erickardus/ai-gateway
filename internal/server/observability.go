@@ -108,6 +108,7 @@ func (s *Server) record(r *http.Request, obs observation) {
 		cost = pricing.price.Cost(obs.usage)
 		savings = pricing.price.CacheSavings(obs.usage)
 		s.warnUnpricedCacheTier(obs, pricing.price)
+		s.warnUnpricedCacheWrite(obs, pricing.price)
 	}
 	s.warnMissingStreamUsage(obs)
 
@@ -209,6 +210,42 @@ func (s *Server) warnUnpricedCacheTier(obs observation, price core.Pricing) {
 		"remedy", key,
 		"cache_write_1h_tokens", obs.usage.CacheWrite1hTokens,
 		"cache_write_per_1m", fallback)
+}
+
+// warnUnpricedCacheWrite reports, once per deployment, that an upstream charged
+// for a cache write the cost model names no price for.
+//
+// cost.cache_write_per_1m is optional on an `openai` deployment because most of
+// that ecosystem caches automatically and writes for free — OpenAI, Kimi, GLM
+// and DeepSeek all do. Alibaba's Qwen and MiniMax do not: both have an explicit
+// cache and both charge for the write, reporting it nested inside
+// prompt_tokens_details.
+//
+// Those writes are billed at the input rate where no write price is set, which
+// is a defensible approximation and much closer than the zero it would otherwise
+// be — but it is still an approximation, and on a provider charging a premium it
+// understates every write. Nothing else says so: the request succeeds and only
+// the total is wrong.
+func (s *Server) warnUnpricedCacheWrite(obs observation, price core.Pricing) {
+	if obs.usage.CacheWriteTokens == 0 {
+		return
+	}
+	key, priced := "cost.cache_write_per_1m", price.CacheWritePer1M > 0
+	if tier := price.TierFor(obs.usage); tier != nil {
+		key, priced = "cost.long_context.cache_write_per_1m", tier.CacheWritePer1M > 0
+	}
+	if priced {
+		return
+	}
+	if _, seen := s.mispriced.LoadOrStore(obs.deployment+"\x00"+key, true); seen {
+		return
+	}
+	s.log.Warn("upstream charged for a cache write at a deployment with no write price; those tokens are billed at the input rate, which understates a provider that charges a premium",
+		"deployment", obs.deployment,
+		"model", obs.model,
+		"remedy", key,
+		"cache_write_tokens", obs.usage.CacheWriteTokens,
+		"input_per_1m", price.InputPer1M)
 }
 
 // warnMissingStreamUsage reports, once per deployment, that a streamed reply

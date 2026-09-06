@@ -1163,3 +1163,61 @@ func TestAnExplicitCacheWriteIsBilledAtItsOwnRate(t *testing.T) {
 			got, promptTokens)
 	}
 }
+
+// TestAnUnpricedCacheWriteFallsBackToInput guards the edge the fix above
+// created.
+//
+// cost.cache_write_per_1m is optional on an `openai` deployment, because most of
+// that ecosystem writes for free. Now that a nested write counter is actually
+// read, an operator running Qwen or MiniMax without that optional price has
+// tokens in the write bucket and no rate for it — and billing them at zero would
+// be further from the invoice than the input rate they were charged at before
+// the counter was read at all. A missing price means the provider names no
+// separate one, not that the write was free.
+func TestAnUnpricedCacheWriteFallsBackToInput(t *testing.T) {
+	const (
+		promptTokens = 8_000
+		writtenToks  = 5_000
+		outputToks   = 50
+	)
+	// The harness default for an openai deployment, which names no write price.
+	price := harnessOpts{format: core.FormatOpenAI}.defaultPricing()
+	if price.CacheWritePer1M != 0 {
+		t.Fatalf("this test is about an unpriced write; the default now names one at %v", price.CacheWritePer1M)
+	}
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, format: core.FormatOpenAI,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"id":"c1","object":"chat.completion","choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"prompt_tokens_details":{"cached_tokens":0,"cache_creation_input_tokens":%d}}}`,
+				promptTokens, outputToks, writtenToks)
+		},
+	})
+
+	rec := h.do(t, claudeCodeRequest("/v1/chat/completions", conversationBody("openai-gpt", "hello")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	// Every prompt token at the input rate: the write bucket has no rate of its
+	// own, so it costs exactly what it would have as ordinary input.
+	want := float64(promptTokens)*price.InputPer1M/1e6 +
+		float64(outputToks)*price.OutputPer1M/1e6
+	assertLedgerCost(t, h, want)
+
+	// And an unpriced write is neither a saving nor a premium, so the identity
+	// between cost and savings still holds.
+	rows, err := h.ledger.Deployments(t.Context())
+	if err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	for _, row := range rows {
+		if !nearly(row.Totals.CacheSavings, 0) {
+			t.Errorf("cache savings = %v, want 0: a write billed at the input rate neither saved nor cost extra", row.Totals.CacheSavings)
+		}
+	}
+
+	if logs := h.logBuf.String(); !strings.Contains(logs, "cost.cache_write_per_1m") {
+		t.Errorf("nothing tells the operator their provider charges for a write they have not priced:\n%s", logs)
+	}
+}
