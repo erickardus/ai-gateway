@@ -598,12 +598,38 @@ grants and renewals and the refusals that follow an authenticated identity,
 cache purges, and this process starting and stopping. Each record carries the
 SHA-256 of the one before it and a sequence number, so a line altered or removed
 from the middle is detectable; `gateway -verify-audit <path>` reports where a
-chain breaks. Two sinks ship — JSONL to a file, which reads and continues its
-chain at startup and refuses to start on one that no longer verifies, and stdout
-— behind an interface a database sink slots into unchanged. Inference is
-deliberately not audited, which is what makes the writes affordable: they are
-synchronous, they fsync, and a write that fails fails the action it was
-recording. See [audit.md](audit.md).
+chain breaks. Three sinks ship — JSONL to a file, which reads and continues its
+chain at startup; stdout, whose chain restarts with each process; and Postgres,
+which is one chain shared by every instance. Inference is deliberately not
+audited, which is what makes the writes affordable: they are synchronous, they
+are durable before the action they authorize proceeds, and a write that fails
+fails the action it was recording. See [audit.md](audit.md).
+
+The fleet gap the file sink left was worse than "the chains are separate". Two
+replicas kept two unrelated chains, each starting at sequence 1, with no
+ordering between them and no way to tell a chain that was deleted from one that
+never existed — and on an orchestrator each lived on a container filesystem
+discarded with the pod, so the evidence a compliance process asks for was spread
+across hosts that no longer exist. `audit.PostgresSink` closes it: every append
+is one transaction that takes a fleet-wide advisory lock, reads the tip, checks
+that the record it is about to chain onto still verifies, seals and commits. Two
+replicas therefore cannot claim one sequence number, the newest link is
+re-verified on every append rather than only at startup, and each record carries
+`detail.instance` so a shared chain can still answer which replica acted. The
+table is append-only by trigger against `UPDATE`, `DELETE` and `TRUNCATE` —
+which the chain does not need and audit logs lose records without, since the
+usual cause is a retention script rather than an attacker.
+
+Sealing came with it, and it changed the file sink's posture too. A chain that
+does not verify used to stop the gateway starting; a shared chain made that a
+fleet-wide outage triggered by one edited row, in a process where inference is
+not audited and so has nothing to gain from the outage. Now a broken chain
+*seals* the sink: nothing is appended, every administrative action is refused
+with the reason, `gateway_audit_sealed` reports it, and inference is untouched.
+A sink that cannot be *reached* still refuses to start, because that failure is
+transient and a restart is how an orchestrator retries it. An operator who wants
+fail-closed on a broken chain runs `gateway -verify-audit` as an init container,
+which the same flag now does against a DSN as well as a path.
 
 What remains is the name. The actor is modelled as a kind plus an id — master
 key, SSO subject, unauthenticated, system — and `sso.grant` already carries a
@@ -611,7 +637,9 @@ real person. Every console action is still `master_key`, because every console
 session *is* the master key; that changes the day the console signs in through
 the identity provider, with no change to the record's shape. Two smaller gaps
 are recorded honestly rather than closed: a hash chain cannot detect truncation
-of its own tail without an anchor kept where the gateway cannot write, and the
+of its own tail without an anchor kept where the gateway cannot write — narrower
+now that the tail lives in a database behind two triggers, but not closed, and
+nothing here ships records to a SIEM — and the
 unauthenticated administrative endpoints are not audited on refusal because an
 fsync per attempt would be a disk-filling primitive for anyone who can open a
 socket — the same throttle

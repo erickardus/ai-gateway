@@ -686,18 +686,40 @@ func (u UIConfig) RequestLog() int {
 // asked to is a gateway that has no record on the one occasion anybody wants
 // one, because the question is always asked afterwards.
 //
-// The file sink is the deliberate choice, and the only one that continues a
-// chain across a restart. See docs/audit.md.
+// The file sink continues a chain across a restart on one host; the postgres
+// sink continues one chain across a fleet, which is the only arrangement in
+// which several replicas produce a single ordered record. See docs/audit.md.
 type AuditConfig struct {
 	// Enabled is a pointer so that "on unless told otherwise" is expressible.
 	// A plain bool cannot distinguish an operator writing `enabled: false` from
 	// one who never mentioned the block, and here those must differ.
 	Enabled *bool `yaml:"enabled"`
-	// Sink is "stdout" or "file".
+	// Sink is "stdout", "file" or "postgres".
 	Sink string `yaml:"sink"`
 	// Path is where the file sink writes. Required by that sink and meaningless
-	// to the other, which validation says rather than silently ignoring.
+	// to the others, which validation says rather than silently ignoring.
 	Path string `yaml:"path"`
+	// DSN is the Postgres connection string the postgres sink appends to. Like
+	// the key store's it carries a password and is expected to arrive as
+	// ${VAR}.
+	//
+	// It may name the same database as virtual_keys.store.dsn — the tables do
+	// not overlap — and usually should not: the two have opposite lifetimes.
+	// Keys are current state and a restore that loses a week of them is
+	// survivable; audit records are evidence, and the database holding them is
+	// the one an organisation puts under a longer retention and a stricter
+	// grant.
+	DSN string `yaml:"dsn"`
+	// Timeout bounds each append. Generous next to the key store's, because
+	// nothing here is on the inference path: a slow record is better than a
+	// refused administrative action.
+	Timeout time.Duration `yaml:"timeout"`
+	// MaxConns caps the pool. Appends serialize on an advisory lock, so this
+	// bounds connections held rather than throughput.
+	MaxConns int32 `yaml:"max_conns"`
+	// Instance names this gateway in the records it writes. Defaults to the
+	// hostname, which on an orchestrator is the pod name.
+	Instance string `yaml:"instance"`
 }
 
 // On reports whether administrative actions are recorded, with the default

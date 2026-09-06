@@ -211,7 +211,11 @@ func TestVerifyDetectsTampering(t *testing.T) {
 
 // A chain whose earlier records no longer verify must not be quietly extended:
 // the resulting file would be half evidence with nothing marking the boundary.
-func TestOpenFileRefusesABrokenChain(t *testing.T) {
+//
+// So the sink opens sealed rather than failing. The gateway starts and keeps
+// serving inference, which is not audited and has nothing to do with this, and
+// every administrative action is refused until a person deals with the chain.
+func TestOpenFileSealsABrokenChain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	sink, err := OpenFile(path)
 	if err != nil {
@@ -224,9 +228,50 @@ func TestOpenFileRefusesABrokenChain(t *testing.T) {
 
 	lines := readLines(t, path)
 	writeLines(t, path, append(lines[:1:1], lines[2:]...))
+	tampered := readLines(t, path)
 
+	reopened, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	if reopened.Sealed() == "" {
+		t.Fatal("the sink opened onto a broken chain without sealing")
+	}
+	if !strings.Contains(reopened.Sealed(), "audit chain broken") {
+		t.Errorf("seal reason = %q, want it to name the break", reopened.Sealed())
+	}
+
+	_, err = reopened.Record(context.Background(), Event{
+		Action:  ActionKeyGenerate,
+		Actor:   MasterKeyActor(),
+		Outcome: OutcomeSuccess,
+	})
+	var sealed *SealedError
+	if !errors.As(err, &sealed) {
+		t.Fatalf("Record on a sealed sink returned %v, want a *SealedError so the action is refused", err)
+	}
+
+	// And the refusal is the whole of it: a sealed sink writes nothing, so the
+	// file an auditor is about to examine is exactly the one they were handed.
+	if got := readLines(t, path); len(got) != len(tampered) {
+		t.Errorf("the sealed sink appended %d line(s) to a broken chain", len(got)-len(tampered))
+	}
+}
+
+// The other half of the posture: a file that cannot be read at all is a
+// transient problem a restart may fix, so it is an error rather than a seal.
+func TestOpenFileFailsOnAnUnreadableLog(t *testing.T) {
+	dir := t.TempDir()
+	// A directory where a log should be: openable by nothing, and not a
+	// verification failure.
+	path := filepath.Join(dir, "audit.jsonl")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
 	if _, err := OpenFile(path); err == nil {
-		t.Fatal("a gateway would have started on a broken audit chain")
+		t.Fatal("OpenFile succeeded on a path that is a directory")
 	}
 }
 

@@ -28,14 +28,15 @@ type FileSink struct {
 // tail would continue the chain correctly and miss the thing the chain is for:
 // a record altered or removed from the middle leaves a perfectly good last
 // line. The cost is a full read at startup, which is bounded by how many
-// administrative actions the gateway has ever taken — a number in the
-// thousands, not the millions, because inference is not audited here.
+// administrative actions this host has ever recorded — thousands, not millions,
+// because inference is not audited here.
 //
-// A broken chain refuses to open, so the gateway refuses to start. That is the
-// deliberate choice: continuing a chain whose earlier records no longer verify
-// would produce one file that is half evidence and half not, with nothing in it
-// saying where the boundary is. The operator's move is to archive the existing
-// file and let a new chain begin, which is a decision a person should make.
+// A file whose chain does not verify opens **sealed**: the sink is returned,
+// it appends nothing, and every record offered to it is refused with the
+// reason. The error return is for a file that could not be read or created at
+// all, which is a different thing — see the package comment on why one of those
+// stops the gateway starting and the other must not. A caller that cares
+// (cmd/gateway does) asks Sealed.
 func OpenFile(path string) (*FileSink, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		// 0700: the log names people and the keys they hold, so it is not
@@ -46,18 +47,34 @@ func OpenFile(path string) (*FileSink, error) {
 	}
 
 	summary, err := VerifyFile(path)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	var sealReason string
+	var broken *BreakError
+	switch {
+	case err == nil, errors.Is(err, fs.ErrNotExist):
+	case errors.As(err, &broken):
+		sealReason = err.Error()
+	default:
+		// Not a verification failure but an unreadable file — a permission
+		// problem, a directory where a log should be. Retrying is what fixes
+		// those, and a restart is how an orchestrator retries.
 		return nil, err
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open audit log %s: %w", path, err)
+	f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if ferr != nil {
+		return nil, fmt.Errorf("open audit log %s: %w", path, ferr)
 	}
 
 	s := &FileSink{f: f}
 	s.now = time.Now
 	s.emit = s.append
+	if sealReason != "" {
+		// The position is deliberately left at zero rather than at the tail: a
+		// sealed sink writes nothing, so resuming a chain that does not verify
+		// would only be arranging for bytes that will never be written.
+		s.seal(sealReason)
+		return s, nil
+	}
 	s.resume(summary.LastSeq, summary.LastHash)
 	return s, nil
 }
@@ -119,7 +136,7 @@ func (s *FileSink) rollback(to int64) error {
 }
 
 // Close flushes and closes the file.
-func (s *FileSink) Close() error { return s.close(s.f.Close) }
+func (s *FileSink) Close() error { return s.shut(s.f.Close) }
 
 // Path is the file being written, for the startup log line.
 func (s *FileSink) Path() string { return s.f.Name() }
@@ -163,4 +180,4 @@ func (s *WriterSink) write(line []byte) error {
 
 // Close stops the sink. The writer is not closed: this sink does not own it,
 // and closing stdout would take the process's logging with it.
-func (s *WriterSink) Close() error { return s.close(nil) }
+func (s *WriterSink) Close() error { return s.shut(nil) }

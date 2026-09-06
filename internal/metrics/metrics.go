@@ -85,6 +85,7 @@ const (
 	MVirtualKeys          = "gateway_virtual_keys"
 	MSSO                  = "gateway_sso_grants_total"
 	MAuditFailures        = "gateway_audit_write_failures_total"
+	MAuditSealed          = "gateway_audit_sealed"
 	MResponseCache        = "gateway_response_cache_requests_total"
 	MResponseCacheEntries = "gateway_response_cache_entries"
 

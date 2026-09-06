@@ -33,14 +33,18 @@ services:
       timeout: 3s
       retries: 5
 
-  # The shared key store. It is wired up but not yet used: the example config
-  # ships with `store.kind: file`, which in this arrangement means each gateway
-  # keeps its own keys inside its own container and neither can see the other's.
+  # The shared key store, and the shared audit chain beside it. Both are wired
+  # up but not yet used: the example config ships with `store.kind: file` and
+  # `audit.sink: stdout`, which in this arrangement means each gateway keeps its
+  # own keys inside its own container and each writes an audit chain that starts
+  # at sequence 1 and is unrelated to the other's.
+  #
   # Uncomment the postgres block under virtual_keys.store in your gateway.yaml,
   # set kind: postgres and REMOVE the path line beside it — the DSN below is
-  # already in the environment — and the two instances share one set of keys.
-  # The gateway creates its own table on startup, and refuses to start on a
-  # config that names both a path and a database.
+  # already in the environment — and the two instances share one set of keys. Do
+  # the same under `audit` for the chain. The gateway creates its own tables on
+  # startup, and refuses to start on a config that names both a path and a
+  # database.
   postgres:
     image: postgres:16-alpine
     environment:
@@ -51,6 +55,12 @@ services:
     # credentials the gateway authenticates with, so it outlives the container.
     volumes:
       - keys:/var/lib/postgresql/data
+      # Creates the second database, for the audit chain. Separate from the key
+      # store because the two want different retention and different grants,
+      # which is easier to arrange when they were never one database. The
+      # entrypoint runs this once, on an empty data directory — so if you have
+      # already brought this stack up, `docker compose down -v` first.
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-audit.sql:ro
     healthcheck:
       # The container accepts connections before the database is ready to serve
       # them, so a gateway that started on "port is open" would fail its own
@@ -74,6 +84,13 @@ services:
       # leaves the compose network. A real deployment wants require or better,
       # since the DSN carries a password and the table carries key hashes.
       KEY_STORE_DSN: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
+      # The shared audit chain. Same server here because this file runs on a
+      # laptop; in a real deployment these two belong in different databases,
+      # because keys are current state and audit records are evidence — see
+      # docs/audit.md. Switch it on with `audit.sink: postgres` and
+      # `dsn: ${GATEWAY_AUDIT_DSN}` in your gateway.yaml, and the two instances
+      # write one ordered chain instead of two unrelated ones.
+      GATEWAY_AUDIT_DSN: postgres://gateway:gateway@postgres:5432/audit?sslmode=disable
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GATEWAY_MASTER_KEY: ${GATEWAY_MASTER_KEY:-}

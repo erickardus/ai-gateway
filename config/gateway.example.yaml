@@ -408,19 +408,42 @@ ui:
 # precisely because inference is not audited here. See docs/audit.md.
 audit:
   enabled: true
-  # stdout | file
+  # stdout | file | postgres
   #
   # stdout needs no path and introduces no failure the process's own logging
   # does not already have, but a writer cannot read back what it wrote: the
   # chain restarts at sequence 1 on every start, and continuity across restarts
-  # is whatever collects your logs. The file sink is the one that reads the
-  # existing chain at startup and continues it — and refuses to start on a chain
-  # that no longer verifies, rather than quietly appending to it.
+  # is whatever collects your logs.
+  #
+  # file reads the existing chain at startup and continues it — on one host.
+  # Two replicas pointed at one path do not share a chain, they keep two
+  # unrelated ones, and on Kubernetes each lives on a filesystem that goes away
+  # with the pod.
+  #
+  # postgres is one chain shared by every instance, and the only sink to run a
+  # fleet with. See docs/audit.md.
   sink: stdout
   # Required by, and only meaningful to, the file sink. Written 0600 in a 0700
   # directory: the log names people and the keys they hold.
   # sink: file
   # path: ./data/audit.jsonl
+  #
+  # The shared chain. The table is created at startup and made append-only with
+  # triggers that refuse UPDATE, DELETE and TRUNCATE; grant the gateway's role
+  # INSERT and SELECT and nothing more. Prefer a different database from the key
+  # store above: keys are current state, and these are evidence.
+  # sink: postgres
+  # dsn: ${GATEWAY_AUDIT_DSN}
+  # timeout: 5s
+  # max_conns: 4
+  # Names this gateway in the records it writes. Defaults to the hostname, which
+  # on Kubernetes is the pod name.
+  # instance: gateway-a
+  #
+  # A chain that no longer verifies seals: the gateway starts and serves
+  # inference, and refuses every administrative action until somebody archives
+  # the chain. gateway_audit_sealed reports it. A sink that cannot be reached at
+  # all is the other case, and stops the gateway starting.
 
 observability:
   log_level: info

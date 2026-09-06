@@ -491,8 +491,12 @@ sessions, SSO grants, cache purges, startup and shutdown. **On** by default.
 | Key | Default | Notes |
 |---|---|---|
 | `enabled` | `true` | Records administrative actions. |
-| `sink` | `stdout` | `stdout` or `file`. |
+| `sink` | `stdout` | `stdout`, `file` or `postgres`. |
 | `path` | — | Required by the `file` sink, refused with any other. |
+| `dsn` | — | Required by the `postgres` sink, refused with any other. Carries a password: pass it as `${VAR}`. |
+| `timeout` | `5s` | Bounds each append to a Postgres chain. |
+| `max_conns` | `4` | Postgres pool size. Appends serialize on an advisory lock, so this bounds connections rather than throughput. |
+| `instance` | hostname | Names this gateway in the records it writes. Only the `postgres` sink uses it. |
 
 On by default is the opposite of `ui` above, and deliberate: the default sink is
 stdout, so the record costs nothing and creates nothing the operator did not ask
@@ -500,23 +504,32 @@ for. A gateway that records administration only when asked has no record on the
 one occasion anybody wants one, because that question is always asked
 afterwards.
 
-The `file` sink appends JSON Lines, verifies the existing chain at startup and
-continues it, and **refuses to start** on a chain that no longer verifies. The
-`stdout` sink cannot read back what it wrote, so its chain restarts at sequence
-1 with each process.
+**Choosing a sink.** `stdout` cannot read back what it wrote, so its chain
+restarts at sequence 1 with each process and continuity is whatever collects the
+logs. `file` appends JSON Lines and continues one chain across restarts — on one
+host: two replicas keep two unrelated chains, and on an orchestrator each lives
+on a filesystem that is discarded when the pod is rescheduled. `postgres` is the
+one sink under which a fleet produces a single ordered chain, and the only one
+to run more than one replica with.
 
 Writes are synchronous and a failed write fails the action it was recording: a
 key that could not be audited is not minted. Inference is not audited, which is
 what makes that affordable. `gateway_audit_write_failures_total` counts the
 refusals and is worth an alert.
 
+A chain that no longer verifies **seals**: the gateway starts, serves inference,
+and refuses every administrative action until a person archives the chain.
+`gateway_audit_sealed` reports it. A sink that cannot be *reached* is the other
+case and stops the gateway starting, because that one a restart may fix.
+
 ```
 gateway -verify-audit ./data/audit.jsonl
+gateway -verify-audit "$GATEWAY_AUDIT_DSN"
 ```
 
-verifies a chain and prints its last sequence number and hash, which is the
-anchor that makes truncation of the tail detectable. Full detail in
-**[audit.md](audit.md)**.
+verifies a chain — a file or a database — and prints its last sequence number
+and hash, which is the anchor that makes truncation of the tail detectable. Full
+detail in **[audit.md](audit.md)**.
 
 ## Endpoints
 

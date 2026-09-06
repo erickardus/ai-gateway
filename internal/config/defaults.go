@@ -124,8 +124,21 @@ const (
 	// Audit sinks. AuditSinkStdout is the default because it needs no path and
 	// introduces no failure the process's own logging does not already have;
 	// AuditSinkFile is the one that continues a hash chain across a restart.
-	AuditSinkStdout = "stdout"
-	AuditSinkFile   = "file"
+	AuditSinkStdout   = "stdout"
+	AuditSinkFile     = "file"
+	AuditSinkPostgres = "postgres"
+
+	// DefaultAuditTimeout bounds each append to a Postgres audit chain. It is
+	// longer than DefaultKeyStoreTimeout because the two sit in different
+	// places: a key lookup happens on every inference request and must fail
+	// well inside the router's own timeout, while an append happens when an
+	// operator mints a key and is worth waiting for.
+	DefaultAuditTimeout = 5 * time.Second
+	// DefaultAuditMaxConns sizes the Postgres audit pool. Appends serialize on
+	// a fleet-wide advisory lock, so more connections buy no throughput; this
+	// is sized to hold a spare or two for the verification query and no more,
+	// since every replica opens its own.
+	DefaultAuditMaxConns int32 = 4
 
 	// DefaultJWTAuthCacheTTL is how long a verified token is reused. It is short
 	// because the point of verifying per request is that revocation arrives
@@ -208,6 +221,13 @@ func (c *Config) applyDefaults() {
 	}
 	if v.Store.MaxConns == 0 {
 		v.Store.MaxConns = DefaultKeyStoreMaxConns
+	}
+
+	if c.Audit.Timeout == 0 {
+		c.Audit.Timeout = DefaultAuditTimeout
+	}
+	if c.Audit.MaxConns == 0 {
+		c.Audit.MaxConns = DefaultAuditMaxConns
 	}
 
 	for i := range c.ModelList {

@@ -68,7 +68,43 @@ func TestAuditConfig(t *testing.T) {
 		{
 			name:    "a sink nothing implements",
 			block:   "audit:\n  sink: syslog\n",
-			wantErr: "audit.sink: must be \"stdout\" or \"file\", got \"syslog\"",
+			wantErr: "audit.sink: must be \"stdout\", \"file\" or \"postgres\", got \"syslog\"",
+		},
+		{
+			name:    "a shared sink with nothing to connect to",
+			block:   "audit:\n  sink: postgres\n",
+			wantErr: "audit.dsn: required when audit.sink is \"postgres\"",
+		},
+		{
+			// The likely mistake when a file chain becomes a shared one: the
+			// sink line is edited and the path below it is left behind, naming
+			// a file the gateway no longer writes.
+			name:    "a path left behind by a move to postgres",
+			block:   "audit:\n  sink: postgres\n  dsn: postgres://localhost/gw\n  path: ./data/audit.jsonl\n",
+			wantErr: "audit.path: \"./data/audit.jsonl\" is set while audit.sink is \"postgres\"",
+		},
+		{
+			// And the reverse, which leaves a live database credential in a
+			// file that has no use for one.
+			name:    "a dsn left behind by a move off postgres",
+			block:   "audit:\n  sink: file\n  path: ./data/audit.jsonl\n  dsn: postgres://localhost/gw\n",
+			wantErr: "audit.dsn: set while audit.sink is \"file\"",
+		},
+		{
+			name:  "a shared sink",
+			block: "audit:\n  sink: postgres\n  dsn: postgres://localhost/gw\n",
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if got := cfg.Audit.SinkKind(); got != AuditSinkPostgres {
+					t.Errorf("sink = %q, want %q", got, AuditSinkPostgres)
+				}
+				if cfg.Audit.Timeout != DefaultAuditTimeout {
+					t.Errorf("timeout = %s, want the default %s", cfg.Audit.Timeout, DefaultAuditTimeout)
+				}
+				if cfg.Audit.MaxConns != DefaultAuditMaxConns {
+					t.Errorf("max_conns = %d, want the default %d", cfg.Audit.MaxConns, DefaultAuditMaxConns)
+				}
+			},
 		},
 		{
 			// A typo is caught whether or not the block is enabled, because the

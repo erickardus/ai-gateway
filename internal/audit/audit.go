@@ -60,10 +60,34 @@
 // # Sinks
 //
 // A Sink takes a context and returns an error, and holds no assumptions about
-// files. The two shipped here write JSON Lines to a file and to stdout; a
-// database sink slots in behind the same three methods. The file sink is the
-// one that continues a chain across restarts, because it is the only one that
-// can read back what it wrote.
+// files. Three are shipped: JSON Lines to a file, the same to stdout, and rows
+// in Postgres. Only the two that can read back what they wrote continue a chain
+// across a restart, and only Postgres continues one chain across a fleet — a
+// file is per host, so several replicas keep several unrelated chains and no
+// ordering exists between them.
+//
+// # Sealing
+//
+// A chain that no longer verifies is never extended. A sink that opens onto one
+// — a file whose middle was edited, a table whose newest rows no longer link —
+// opens *sealed*: it appends nothing, every administrative action is refused
+// with the reason, and the gateway starts and serves inference as usual.
+//
+// The division there is the whole posture. Not appending is what the evidence
+// requires: a file half of which verifies, with nothing in it marking the
+// boundary, is worse than one that stops. Refusing to *start* is not what the
+// evidence requires, and a shared sink makes it expensive — one edited row
+// would crashloop every replica, and since inference is not audited here, that
+// outage protects no record. What this package exists to prevent is an
+// administrative action nobody recorded, and a sealed sink prevents exactly
+// that by refusing the action.
+//
+// Sealing is deliberately not the answer to a sink that cannot be reached. A
+// database that is down comes back, and a restart is how an orchestrator
+// retries it, so a sink that will not open at all stops the gateway starting —
+// the same posture auth.PostgresStore takes. A chain that does not verify never
+// comes back on its own: it wants a person to archive it and work out what
+// happened, and crashlooping a fleet until they do buys nothing.
 package audit
 
 import (
@@ -262,6 +286,94 @@ type Sink interface {
 	Close() error
 }
 
+// SealedError is what a sink returns once its chain has stopped verifying.
+//
+// It is a type rather than a bare error so a caller can tell two failures apart
+// that look identical from the outside: "this record could not be written",
+// which is a full disk or a database that is down and will pass again, from
+// "this chain is broken and no record will be written until a person deals with
+// it". The first is worth retrying. The second is worth waking someone.
+type SealedError struct {
+	// Reason is the verification failure the sink opened onto, in the words
+	// Verify used to describe it.
+	Reason string
+}
+
+func (e *SealedError) Error() string {
+	return "the audit chain is sealed and will take no further records: " + e.Reason
+}
+
+// state is the part of every sink that is not its position in a chain: whether
+// it may take records at all.
+//
+// Its mutex is the sink's only one. The chain sinks hold it across sealing and
+// writing, which is what keeps the order of the bytes identical to the order of
+// the sequence numbers; the Postgres sink holds it only to read these two
+// fields, because ordering there is the database's to enforce rather than this
+// process's.
+type state struct {
+	mu     sync.Mutex
+	closed bool
+	sealed string
+}
+
+// admit reports whether a record may be written.
+func (s *state) admit() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.admitLocked()
+}
+
+func (s *state) admitLocked() error {
+	if s.closed {
+		return errClosed
+	}
+	if s.sealed != "" {
+		return &SealedError{Reason: s.sealed}
+	}
+	return nil
+}
+
+// seal stops the sink appending, for the reason given.
+//
+// It is idempotent and the first reason wins: that one names what actually
+// happened, where a later one only describes a chain already known to be
+// broken.
+func (s *state) seal(reason string) {
+	if reason == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sealed == "" {
+		s.sealed = reason
+	}
+}
+
+// Sealed reports why this sink is refusing records, or "" if it is not.
+//
+// Exported because a sealed sink is invisible from the outside until somebody
+// tries to administer something, so the process assembling the gateway has to
+// say so at startup and publish it as a metric.
+func (s *state) Sealed() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sealed
+}
+
+func (s *state) shut(closer func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	if closer == nil {
+		return nil
+	}
+	return closer()
+}
+
 // chain holds a sink's position in its hash chain and serializes writes.
 //
 // The emit callback runs while the lock is held, which is what keeps the order
@@ -270,12 +382,11 @@ type Sink interface {
 // individually valid and collectively out of order, which verification would
 // then report as tampering.
 type chain struct {
-	mu     sync.Mutex
-	seq    uint64
-	prev   string
-	closed bool
-	now    func() time.Time
-	emit   func(line []byte) error
+	state
+	seq  uint64
+	prev string
+	now  func() time.Time
+	emit func(line []byte) error
 }
 
 // errClosed is returned rather than dropping a record, because a dropped record
@@ -336,14 +447,34 @@ func clipActor(a Actor) Actor {
 func (c *chain) record(e Event) (Record, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return Record{}, errClosed
+	if err := c.admitLocked(); err != nil {
+		return Record{}, err
 	}
 
+	rec, line, err := sealAt(c.seq+1, c.prev, c.now().UTC(), e)
+	if err != nil {
+		return Record{}, err
+	}
+	if err := c.emit(line); err != nil {
+		return Record{}, err
+	}
+	c.seq, c.prev = rec.Seq, rec.Hash
+	return rec, nil
+}
+
+// sealAt builds the sealed record an event occupies at one position in a chain.
+//
+// Position is a parameter rather than state because two kinds of sink answer
+// the question differently: the file and writer sinks know where they are, and
+// the Postgres sink is told by the row it has just locked. Keeping the sealing
+// itself in one place is what stops those two growing separate ideas of what a
+// record is — which would not fail loudly, it would produce two chains that
+// each verify and cannot be compared.
+func sealAt(seq uint64, prev string, at time.Time, e Event) (Record, []byte, error) {
 	rec := Record{
-		Seq:        c.seq + 1,
-		At:         c.now().UTC(),
-		Prev:       c.prev,
+		Seq:        seq,
+		At:         at,
+		Prev:       prev,
 		Action:     e.Action,
 		Actor:      clipActor(e.Actor),
 		TargetKind: e.TargetKind,
@@ -357,13 +488,9 @@ func (c *chain) record(e Event) (Record, error) {
 	}
 	line, err := seal(&rec)
 	if err != nil {
-		return Record{}, err
+		return Record{}, nil, err
 	}
-	if err := c.emit(line); err != nil {
-		return Record{}, err
-	}
-	c.seq, c.prev = rec.Seq, rec.Hash
-	return rec, nil
+	return rec, line, nil
 }
 
 // resume points the chain at the tail of an existing one.
@@ -371,19 +498,6 @@ func (c *chain) resume(seq uint64, hash string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.seq, c.prev = seq, hash
-}
-
-func (c *chain) close(closer func() error) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
-	c.closed = true
-	if closer == nil {
-		return nil
-	}
-	return closer()
 }
 
 // seal computes a record's hash and renders the line that carries it.

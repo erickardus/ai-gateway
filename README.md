@@ -142,6 +142,7 @@ interface waiting for it.
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
 | Multi-instance shared state (Redis) | ✅ |
 | Multi-instance shared key store (Postgres) | ✅ |
+| Tamper-evident audit log, one chain across a fleet (Postgres) | ✅ |
 | Admin UI — health, traffic, keys, spend, budgets | ✅ |
 | MCP gateway | ⏳ |
 
@@ -185,6 +186,12 @@ at the next. See
 kinds, and
 [docs/observability.md](docs/observability.md#running-more-than-one-instance)
 for what is shared and what stays local.
+
+So does the audit log, for a reason that is easy to miss: with the `file` sink,
+two replicas do not share a chain, they keep two unrelated ones — each starting
+at sequence 1, with no ordering between them, on a filesystem an orchestrator
+discards with the pod. Set `audit.sink: postgres` and every instance appends to
+one chain instead. See [docs/audit.md](docs/audit.md#one-chain-across-a-fleet).
 
 ## Development
 
