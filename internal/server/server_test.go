@@ -106,6 +106,10 @@ type harnessOpts struct {
 	// streamUsage overrides observability.stream_usage, which decides whether a
 	// streamed OpenAI-compatible request is asked to report any usage at all.
 	streamUsage *bool
+	// supportsCacheControl declares that the upstream reads a cache breakpoint
+	// while speaking the OpenAI wire format, which is what an operator says
+	// about a Qwen deployment.
+	supportsCacheControl bool
 	// extraAuthMode gives the extra deployments a different auth mode from the
 	// first. It is what builds a mixed fleet — subscription traffic beside API
 	// traffic in one group — which is the arrangement a per-deployment body
@@ -174,10 +178,11 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		format = core.FormatAnthropic
 	}
 	params := config.DeploymentParams{
-		Format:   format,
-		APIBase:  upstream.URL,
-		Model:    opts.modelGroup(),
-		AuthMode: core.AuthMode(mode),
+		Format:               format,
+		APIBase:              upstream.URL,
+		Model:                opts.modelGroup(),
+		AuthMode:             core.AuthMode(mode),
+		SupportsCacheControl: opts.supportsCacheControl,
 	}
 	if mode == "api_key" {
 		params.AuthHeader = "x-api-key"

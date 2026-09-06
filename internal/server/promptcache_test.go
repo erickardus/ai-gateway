@@ -817,3 +817,113 @@ func TestACallersOwnBadRequestLeavesAnnotationOn(t *testing.T) {
 		t.Errorf("a caller's own 400 was recorded as the upstream refusing an annotation:\n%s", logs)
 	}
 }
+
+// openaiPromptBody renders an OpenAI-format conversation whose system message is
+// long enough to be worth caching.
+func openaiPromptBody(turns ...string) string {
+	messages := []any{map[string]any{"role": "system", "content": longSystem}}
+	for _, turn := range turns {
+		messages = append(messages, map[string]any{"role": "user", "content": turn})
+	}
+	body, err := json.Marshal(map[string]any{"model": "openai-gpt", "messages": messages})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
+// TestABreakpointReachesAnOpenAIUpstreamThatReadsOne covers the providers whose
+// caching is explicit despite the OpenAI wire format.
+//
+// Alibaba's Qwen caches implicitly too, but its explicit cache — the one with
+// the higher hit ratio — is entered by marking a content block. The gateway used
+// to gate breakpoints on the wire format alone, so a Qwen deployment never got
+// one and only ever fell back to the implicit cache.
+//
+// It is a per-deployment capability rather than something inferred, because the
+// gateway cannot ask an arbitrary OpenAI-compatible base URL which kind it is,
+// and the explicit cache charges for writes the implicit one does not.
+func TestABreakpointReachesAnOpenAIUpstreamThatReadsOne(t *testing.T) {
+	// Both keys are required: the operator says this upstream reads a marker,
+	// and prompt_cache.inject says the gateway may place one. An openai fleet
+	// with injection on and no upstream declaring the capability is refused at
+	// load rather than served, so the interesting negative here is the other
+	// one — a capable upstream with the global switch off.
+	for _, tc := range []struct {
+		name   string
+		inject bool
+		want   bool
+	}{
+		{name: "the operator names the upstream and turns injection on", inject: true, want: true},
+		{name: "the upstream reads a marker but injection is off", inject: false, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, harnessOpts{
+				authMode: "api_key", allowPassthrough: true, format: core.FormatOpenAI,
+				supportsCacheControl: true,
+				promptCache:          config.PromptCacheConfig{Inject: tc.inject},
+				upstream: func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					io.WriteString(w, `{"id":"c1","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":5}}`)
+				},
+			})
+
+			rec := h.do(t, claudeCodeRequest("/v1/chat/completions", openaiPromptBody("hi")))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			_, forwarded, _, _ := h.seen.get()
+			if got := strings.Contains(string(forwarded), "cache_control"); got != tc.want {
+				t.Errorf("breakpoint forwarded = %v, want %v: %s", got, tc.want, forwarded)
+			}
+		})
+	}
+}
+
+// TestARefusedBreakpointKeepsTheUsageOption is the safety property the
+// capability flag needs.
+//
+// An operator naming an upstream that turns out not to read the marker gets a
+// 400, and the gateway stops annotating that deployment. If "stop annotating"
+// meant everything, it would also drop stream_options.include_usage — and an
+// OpenAI-compatible reply without it carries no usage anywhere, so every
+// streamed request to that deployment would be billed as nothing. A wrong guess
+// about an optimization would have cost the accounting.
+//
+// So a refusal drops the optional part first. The deployment loses its
+// breakpoint and keeps its bill.
+func TestARefusedBreakpointKeepsTheUsageOption(t *testing.T) {
+	var sawUsageOption atomic.Bool
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, format: core.FormatOpenAI,
+		supportsCacheControl: true,
+		promptCache:          config.PromptCacheConfig{Inject: true},
+		upstream: func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), "cache_control") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				io.WriteString(w, `{"error":{"message":"unrecognized field cache_control"}}`)
+				return
+			}
+			sawUsageOption.Store(strings.Contains(string(body), "include_usage"))
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, "data: {\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":5}}\n\n")
+		},
+	})
+
+	streamed := strings.Replace(openaiPromptBody("hi"), `"model":"openai-gpt"`, `"model":"openai-gpt","stream":true`, 1)
+	for i := 0; i < 2; i++ {
+		if rec := h.do(t, claudeCodeRequest("/v1/chat/completions", streamed)); rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, body = %s", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	_, forwarded, _, _ := h.seen.get()
+	if strings.Contains(string(forwarded), "cache_control") {
+		t.Errorf("the deployment is still being sent a breakpoint it refuses: %s", forwarded)
+	}
+	if !sawUsageOption.Load() {
+		t.Error("a refused breakpoint also cost this deployment its usage option, so its streamed traffic is now billed as nothing")
+	}
+}

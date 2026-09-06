@@ -703,3 +703,127 @@ func TestAnOpenAIFingerprintStillSeparatesConversationsBehindOneSystemPrompt(t *
 		t.Error("two conversations behind one shared system message share a pin")
 	}
 }
+
+// TestInjectOpenAIMarksTheLeadingSystemMessage covers the shape Alibaba's Qwen
+// documents for its explicit cache: the marker goes inside a content block of
+// the system message, and a string content field has to become an array to hold
+// one.
+func TestInjectOpenAIMarksTheLeadingSystemMessage(t *testing.T) {
+	long := strings.Repeat("You are a careful assistant. ", 200)
+	tests := []struct {
+		name string
+		body string
+		want string // a substring the marked body must contain
+	}{
+		{
+			name: "string content is promoted to a text block",
+			body: `{"model":"m","messages":[{"role":"system","content":"` + long + `"},{"role":"user","content":"hi"}]}`,
+			want: `"content":[{"type":"text","text":"` + long + `","cache_control":{"type":"ephemeral"}}]`,
+		},
+		{
+			name: "an existing content array is marked on its last block",
+			body: `{"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"` + long + `"}]},{"role":"user","content":"hi"}]}`,
+			want: `"text":"` + long + `","cache_control":{"type":"ephemeral"}`,
+		},
+		{
+			name: "developer is the newer spelling of system and occupies the same position",
+			body: `{"model":"m","messages":[{"role":"developer","content":"` + long + `"},{"role":"user","content":"hi"}]}`,
+			want: `"cache_control":{"type":"ephemeral"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, changed, err := InjectOpenAI([]byte(tt.body), 0)
+			if err != nil {
+				t.Fatalf("InjectOpenAI: %v", err)
+			}
+			if !changed {
+				t.Fatal("nothing was marked, so this caller only ever gets the implicit cache")
+			}
+			if !strings.Contains(string(out), tt.want) {
+				t.Errorf("marked body does not carry %s:\n%s", tt.want, out)
+			}
+			if !json.Valid(out) {
+				t.Errorf("marked body is not valid JSON:\n%s", out)
+			}
+		})
+	}
+}
+
+// The marker is only worth placing where it covers a prefix that repeats, and
+// only where the caller has not managed its own.
+func TestInjectOpenAIStandsDown(t *testing.T) {
+	long := strings.Repeat("filler text that is quite long. ", 200)
+	tests := []struct {
+		name string
+		body string
+		why  string
+	}{
+		{
+			name: "no system message",
+			body: `{"model":"m","messages":[{"role":"user","content":"` + long + `"}]}`,
+			why:  "a marker on the first user turn caches a prefix that differs per conversation, buying a write and no read",
+		},
+		{
+			name: "the caller placed its own",
+			body: `{"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"` + long + `","cache_control":{"type":"ephemeral"}}]}]}`,
+			why:  "a caller managing its own breakpoints knows where its prompt repeats",
+		},
+		{
+			name: "below the minimum",
+			body: `{"model":"m","messages":[{"role":"system","content":"short"}]}`,
+			why:  "the provider ignores a breakpoint under its own minimum",
+		},
+		{
+			name: "no messages at all",
+			body: `{"model":"m","messages":[]}`,
+			why:  "there is no prefix to mark",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			minBytes := 0
+			if tt.name == "below the minimum" {
+				minBytes = 4096
+			}
+			out, changed, err := InjectOpenAI([]byte(tt.body), minBytes)
+			if err != nil {
+				t.Fatalf("InjectOpenAI: %v", err)
+			}
+			if changed {
+				t.Errorf("marked a body it should have left alone (%s):\n%s", tt.why, out)
+			}
+			if string(out) != tt.body {
+				t.Errorf("body changed while reporting it had not:\n%s", out)
+			}
+		})
+	}
+}
+
+// The OpenAI format has no top-level cache_control field — that is Anthropic's
+// automatic caching — and an OpenAI tool declares no input_schema, so the shape
+// check that makes marking one safe does not apply. Adding either would be a
+// field the provider never asked for on every request.
+func TestInjectOpenAIMarksNothingButTheSystemMessage(t *testing.T) {
+	long := strings.Repeat("You are a careful assistant. ", 200)
+	body := `{"model":"m","tools":[{"type":"function","function":{"name":"read","parameters":{}}}],` +
+		`"messages":[{"role":"system","content":"` + long + `"},{"role":"user","content":"hi"}]}`
+
+	out, changed, err := InjectOpenAI([]byte(body), 0)
+	if err != nil || !changed {
+		t.Fatalf("InjectOpenAI: changed=%v err=%v", changed, err)
+	}
+	if got := strings.Count(string(out), "cache_control"); got != 1 {
+		t.Errorf("body carries %d markers, want exactly 1:\n%s", got, out)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := doc["cache_control"]; ok {
+		t.Error("a top-level cache_control field was added; that is Anthropic's automatic caching and an Anthropic construct")
+	}
+	if strings.Contains(string(doc["tools"]), "cache_control") {
+		t.Error("a tool was marked; an OpenAI tool's accepted shape cannot be checked the way an Anthropic one's can")
+	}
+}
