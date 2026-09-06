@@ -75,6 +75,7 @@ model_list:
 		{"observability.log_format", cfg.Observability.LogFormat, "text"},
 		{"observability.metrics", cfg.Observability.Metrics, false},
 		{"observability.spend_flush_interval", cfg.Observability.SpendFlushInterval.String(), "30s"},
+		{"observability.stream_usage", cfg.Observability.StreamUsageEnabled(), true},
 	}
 
 	for _, d := range documented {

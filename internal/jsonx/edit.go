@@ -363,3 +363,106 @@ func matchesKey(quoted []byte, key string) bool {
 	}
 	return decoded == key
 }
+
+// StripObjectKey removes every member named key, wherever it appears in doc,
+// and reports whether anything was removed. Every other byte is left exactly
+// where it was.
+//
+// It exists for prompt-cache fingerprinting, where the question is whether two
+// requests carry the same prompt rather than whether they are the same
+// document. A cache breakpoint is metadata about where a prefix ends, not part
+// of the prompt an upstream tokenizes: a client that walks its breakpoint
+// forward as a conversation grows — which is what Claude Code and the SDKs both
+// do — is sending the same prefix each turn, and the provider treats it as one.
+// Hashing the raw bytes would call each turn a different prefix and scatter the
+// conversation across deployments, paying a cache write per turn.
+//
+// The walk is structural rather than textual for the same reason
+// ContainsObjectKey is: prompt text discussing cache_control contains those
+// bytes without carrying a member of that name.
+func StripObjectKey(doc []byte, key string) ([]byte, bool, error) {
+	if !json.Valid(doc) {
+		return nil, false, errors.New("value is not valid JSON")
+	}
+	var spans [][2]int
+	if err := collectMembers(doc, key, 0, &spans); err != nil {
+		return nil, false, err
+	}
+	if len(spans) == 0 {
+		return doc, false, nil
+	}
+	return spliceOut(doc, spans), true, nil
+}
+
+// collectMembers appends the extent of every member named key within value, as
+// offsets into the document value was taken from. base is where value sits in
+// that document, so nested spans come back in the caller's coordinates.
+//
+// Members are visited in document order and recursion into a value happens
+// before the next member is read, so the spans accumulate already sorted, which
+// is what lets spliceOut run straight through them.
+func collectMembers(value []byte, key string, base int, out *[][2]int) error {
+	i := skipSpace(value, 0)
+	if i >= len(value) {
+		return nil
+	}
+	switch value[i] {
+	case '{':
+		return walkObject(value[i:], func(m member) error {
+			if m.key == key {
+				*out = append(*out, [2]int{base + i + int(m.keyStart), base + i + int(m.end)})
+				return nil
+			}
+			return collectMembers(m.raw, key, base+i+int(m.start), out)
+		})
+	case '[':
+		spans, err := elements(value[i:])
+		if err != nil {
+			return err
+		}
+		for _, s := range spans {
+			if err := collectMembers(value[i+s[0]:i+s[1]], key, base+i+s[0], out); err != nil {
+				return err
+			}
+		}
+	}
+	// A scalar holds no members. A string in particular is prompt text, which is
+	// exactly what must not be searched for a key name.
+	return nil
+}
+
+// spliceOut removes the given ascending, non-overlapping spans from doc, taking
+// one adjoining comma with each so the result is still valid JSON.
+//
+// The comma before the member is preferred, since it is the one that cannot
+// belong to a member that survives. Where there is none — the member opens its
+// object, or its predecessor was itself removed — the comma after it is taken
+// instead. Clamping each span to where the previous one ended is what keeps two
+// removed neighbours from consuming the same separator twice.
+func spliceOut(doc []byte, spans [][2]int) []byte {
+	out := make([]byte, 0, len(doc))
+	at := 0
+	for _, s := range spans {
+		start, end := s[0], s[1]
+		lo := start
+		for lo > at && isJSONSpace(doc[lo-1]) {
+			lo--
+		}
+		if lo > at && doc[lo-1] == ',' {
+			start = lo - 1
+		} else {
+			for end < len(doc) && isJSONSpace(doc[end]) {
+				end++
+			}
+			if end < len(doc) && doc[end] == ',' {
+				end++
+			}
+		}
+		if start < at {
+			start = at
+		}
+		out = append(out, doc[at:start]...)
+		at = end
+	}
+	return append(out, doc[at:]...)
+}

@@ -291,3 +291,72 @@ func TestHealthDistinguishesConfiguredFromActiveAffinity(t *testing.T) {
 		t.Error("no note explaining why affinity is inactive")
 	}
 }
+
+// claudeCodeBody renders a conversation the way Claude Code sends one: a
+// breakpoint on the last system block, one on the last tool, and one on the last
+// message. The third moves forward with every turn.
+func claudeCodeBody(system string, turns ...string) string {
+	mark := map[string]any{"type": "ephemeral"}
+	messages := make([]any, 0, len(turns))
+	for i, turn := range turns {
+		block := map[string]any{"type": "text", "text": turn}
+		if i == len(turns)-1 {
+			block["cache_control"] = mark
+		}
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		messages = append(messages, map[string]any{"role": role, "content": []any{block}})
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":    "anthropic-claude",
+		"system":   []any{map[string]any{"type": "text", "text": system, "cache_control": mark}},
+		"tools":    []any{map[string]any{"name": "read_file", "cache_control": mark}},
+		"messages": messages,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
+// TestPromptAffinitySurvivesAMovingBreakpoint starts a conversation where a real
+// one starts: a single user message, carrying the breakpoint because it is the
+// only thing there is to mark.
+//
+// On the next turn that marker has moved to the newest message and the opening
+// turn carries none. Nothing about the prompt has changed, and the upstream
+// still holds it warm — but a fingerprint taken over the raw bytes changes, the
+// conversation is re-pinned, and the deployment it warmed is now just one
+// candidate among three. This is the shape of the traffic the gateway exists to
+// carry, so it is the shape the pin has to survive.
+func TestPromptAffinitySurvivesAMovingBreakpoint(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, extraDeployments: 2,
+	})
+
+	first := h.do(t, claudeCodeRequest("/v1/messages", claudeCodeBody("be helpful", "opening question")))
+	if first.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", first.Code, first.Body.String())
+	}
+	pinned := first.Header().Get("x-gateway-deployment")
+	if got := first.Header().Get("x-gateway-prompt-affinity"); got != "new" {
+		t.Fatalf("opening turn affinity = %q, want new", got)
+	}
+
+	turns := []string{"opening question"}
+	for i, turn := range []string{"an answer", "second question", "another answer", "third question"} {
+		turns = append(turns, turn)
+		rec := h.do(t, claudeCodeRequest("/v1/messages", claudeCodeBody("be helpful", turns...)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("turn %d: status = %d", i+2, rec.Code)
+		}
+		if got := rec.Header().Get("x-gateway-prompt-affinity"); got != "hit" {
+			t.Errorf("turn %d affinity = %q, want hit: the breakpoint moved but the prompt did not", i+2, got)
+		}
+		if got := rec.Header().Get("x-gateway-deployment"); got != pinned {
+			t.Errorf("turn %d went to %s, leaving the warm cache on %s", i+2, got, pinned)
+		}
+	}
+}

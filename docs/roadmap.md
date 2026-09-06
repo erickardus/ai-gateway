@@ -159,16 +159,19 @@ An OpenAI-compatible provider caches automatically, keyed on the prefix itself.
 routing, and it earns its keep for a caller sending one prefix at high rates —
 which is what a company standardizing on one system prompt looks like.
 
-The gateway does not send it. Doing so means editing the request body, and body
-rewrites carry the constraints that already keep breakpoint injection off the
-passthrough path: the response-cache key, retry and fallback all assume one set
-of bytes per request, and an OpenAI-*compatible* server that is strict about
-unknown fields would 400 rather than ignore it.
+The gateway does not send it. It does now edit an OpenAI-format body — a
+streamed request gets `stream_options.include_usage` so the deployment can be
+billed at all — so the objection is no longer that such an edit is impossible.
+It is that this one is optional where that one is the difference between a bill
+and a zero: an OpenAI-*compatible* server strict about unknown fields would 400
+rather than ignore it, and the same risk buys much less.
 
-The seam is the same one injection wants: a per-deployment body transform
-carried on `provider.Request` and applied by `Client.Do`. Prefix affinity
-already gives the gateway the fingerprint such a key would be derived from, so
-the work is the plumbing rather than the value.
+Both edits happen before routing, so the response-cache key is taken from the
+body as it arrived and every retry and fallback attempt sends the same bytes.
+A per-deployment transform carried on `provider.Request` and applied by
+`Client.Do` is still what a field worth varying per upstream would want. Prefix
+affinity already gives the gateway the fingerprint such a key would be derived
+from, so the work is the plumbing rather than the value.
 
 ### 🔴 No cache-hit-rate signal per prefix
 
@@ -248,6 +251,8 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Cache scope | per-key by default | shared-by-default leaks completions across tenants |
 | Provider prompt cache | routed for | LiteLLM balances without regard to it, so every hop pays a cache write instead of a read |
 | OpenAI cached tokens | carved out of `prompt_tokens` | they are reported *inside* the input count, so adding them beside it bills every cached token twice |
+| Streamed OpenAI usage | asked for | a streamed reply reports none unless the request opted in, so the traffic is billed at zero |
+| A moving cache breakpoint | ignored when pinning | every Anthropic client walks one forward each turn, which would re-pin the conversation every time |
 | Anthropic cache-write tiers | priced apart | the one-hour cache costs 2x base input against the five-minute tier's 1.25x |
 | Passthrough cost | not billed to the operator | it is billed to the caller's subscription |
 

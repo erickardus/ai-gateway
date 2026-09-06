@@ -332,6 +332,34 @@ type ObservabilityConfig struct {
 	SpendStorePath string `yaml:"spend_store_path"`
 	// SpendFlushInterval is how often the ledger is written to disk.
 	SpendFlushInterval time.Duration `yaml:"spend_flush_interval"`
+
+	// StreamUsage asks an OpenAI-compatible upstream to report token usage on a
+	// streamed reply, by adding stream_options.include_usage to requests that
+	// did not set stream_options themselves.
+	//
+	// On by default, because without it such a reply carries no usage at all:
+	// the request is recorded as zero input, zero output and zero cached
+	// tokens, so it costs nothing, counts nothing against a budget or a rate
+	// limit, and reports no prompt-cache savings. That is the failure this
+	// gateway exists to make visible, and it is silent in every other respect.
+	//
+	// The cost of asking is one extra chunk at the end of the stream, carrying
+	// the usage and an empty choices array. It is part of the OpenAI protocol
+	// and the official clients expect it, but a hand-written client that indexes
+	// choices[0] on every chunk will not, and a strict OpenAI-compatible server
+	// may reject the field outright. Either is a reason to turn this off, at the
+	// price of an unpriced deployment.
+	//
+	// It does not apply to the Anthropic format, which reports usage on
+	// message_start whether or not it was asked to. A pointer, so an explicit
+	// false is not mistaken for an omitted field.
+	StreamUsage *bool `yaml:"stream_usage"`
+}
+
+// StreamUsageEnabled reports whether streamed OpenAI-compatible requests should
+// ask for usage.
+func (o ObservabilityConfig) StreamUsageEnabled() bool {
+	return o.StreamUsage == nil || *o.StreamUsage
 }
 
 // Groups returns deployments indexed by public model name, preserving

@@ -20,6 +20,11 @@ import (
 	"github.com/erickardus/ai-gateway/internal/router"
 )
 
+// streamUsageOptions is what a streamed OpenAI-compatible request needs in order
+// to be billed at all. The field is inert on a non-streamed request, which is
+// why it is only ever added to one that asked to stream.
+var streamUsageOptions = []byte(`{"include_usage":true}`)
+
 // handleMessages serves the Anthropic Messages API.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.serveInference(w, r, "/v1/messages", core.FormatAnthropic)
@@ -139,6 +144,24 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		body = stripped
 	}
 
+	// Ask an OpenAI-compatible upstream to report usage on a streamed reply.
+	// Without stream_options.include_usage the final chunk carries no usage at
+	// all, so the request is billed as nothing: no cost, no budget charge, no
+	// rate-limit tokens, and a prompt cache whose reads are invisible. A caller
+	// that set stream_options itself is left alone — AddMember reports the
+	// member already present and changes no byte — since it has said what it
+	// wants and the gateway's accounting is not worth overriding it for.
+	if format == core.FormatOpenAI && fields.Stream && s.cfg.Observability.StreamUsageEnabled() {
+		asked, added, err := jsonx.AddMember(body, "stream_options", streamUsageOptions)
+		if err != nil {
+			// As with injection below: a request the gateway could not annotate
+			// is forwarded as it arrived rather than refused.
+			s.log.Warn("stream usage request skipped", "error", err, "request_id", RequestIDFrom(ctx))
+		} else if added {
+			body = asked
+		}
+	}
+
 	// Mark the cacheable prefix last, once every gateway directive has been
 	// stripped: injection edits the body, and editing one that is about to
 	// change again would place a breakpoint against bytes the upstream never
@@ -181,6 +204,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	defer result.Response.Body.Close()
 
 	obs.deployment = result.Deployment.ID()
+	obs.format, obs.streaming = format, fields.Stream
 	obs.retries, obs.fallbacks = result.AttemptedRetries, result.AttemptedFallback
 	obs.promptAffinity = result.PromptAffinity
 	s.metrics.InFlightAdd(obs.model, obs.deployment, 1)

@@ -281,3 +281,132 @@ func TestSetTopLevelValuesMatchesRepeatedSingleEdits(t *testing.T) {
 		t.Errorf("an unrelated number was renormalized: %s", once)
 	}
 }
+
+// TestStripObjectKey covers the removals prompt-cache fingerprinting depends on.
+// The result must stay valid JSON and must differ from the input only by the
+// members named, since anything else would make two identical prompts hash
+// differently.
+func TestStripObjectKey(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    string
+		removed bool
+	}{
+		{"absent", `{"a":1}`, `{"a":1}`, false},
+		{"only member", `{"cc":{"type":"ephemeral"}}`, `{}`, true},
+		{"last member", `{"a":1,"cc":{"type":"ephemeral"}}`, `{"a":1}`, true},
+		{"first member", `{"cc":1,"a":2}`, `{"a":2}`, true},
+		{"middle member", `{"a":1,"cc":2,"b":3}`, `{"a":1,"b":3}`, true},
+		{"adjacent members", `{"cc":1,"cc":2}`, `{}`, true},
+		{"nested in array", `{"content":[{"text":"hi","cc":{"ttl":"1h"}}]}`, `{"content":[{"text":"hi"}]}`, true},
+		{
+			"several depths",
+			`{"system":[{"text":"s","cc":1}],"messages":[{"content":[{"text":"m","cc":2}]}]}`,
+			`{"system":[{"text":"s"}],"messages":[{"content":[{"text":"m"}]}]}`,
+			true,
+		},
+		{"whitespace around member", `{"a":1 , "cc" : 2 , "b":3}`, `{"a":1  , "b":3}`, true},
+		{"top-level array", `[{"cc":1,"a":2},{"a":3}]`, `[{"a":2},{"a":3}]`, true},
+		// The name in string data is prompt text, not a member: a conversation
+		// about prompt caching must not be edited by this.
+		{"name as a value", `{"a":"cc","b":"the cc member"}`, `{"a":"cc","b":"the cc member"}`, false},
+		{"name as escaped key", `{"a":1,"\u0063c":2}`, `{"a":1}`, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, removed, err := StripObjectKey([]byte(tc.in), "cc")
+			if err != nil {
+				t.Fatalf("StripObjectKey: %v", err)
+			}
+			if removed != tc.removed {
+				t.Errorf("removed = %v, want %v", removed, tc.removed)
+			}
+			if string(got) != tc.want {
+				t.Errorf("got  %s\nwant %s", got, tc.want)
+			}
+			if !json.Valid(got) {
+				t.Errorf("result is not valid JSON: %s", got)
+			}
+		})
+	}
+}
+
+// TestStripObjectKeyIsStableUnderPlacement is the property the fingerprint
+// rests on: two documents differing only in where a member sits strip to the
+// same bytes.
+func TestStripObjectKeyIsStableUnderPlacement(t *testing.T) {
+	first := `{"messages":[{"content":[{"text":"a","cc":1}]},{"content":[{"text":"b"}]}]}`
+	later := `{"messages":[{"content":[{"text":"a"}]},{"content":[{"text":"b","cc":1}]}]}`
+
+	a, _, err := StripObjectKey([]byte(first), "cc")
+	if err != nil {
+		t.Fatalf("StripObjectKey: %v", err)
+	}
+	b, _, err := StripObjectKey([]byte(later), "cc")
+	if err != nil {
+		t.Fatalf("StripObjectKey: %v", err)
+	}
+	if string(a) != string(b) {
+		t.Errorf("a moved member changed the stripped document:\n %s\n %s", a, b)
+	}
+}
+
+// FuzzStripObjectKey holds the two properties the fingerprint relies on against
+// arbitrary input: the result is still a document, and the member is gone from
+// it. A splice that miscounted a comma would break the first; one that missed a
+// nesting level would break the second, and the only symptom in production would
+// be a conversation quietly re-pinned every turn.
+func FuzzStripObjectKey(f *testing.F) {
+	for _, seed := range []string{
+		`{}`,
+		`{"a":1}`,
+		`{"cc":1}`,
+		`{"a":1,"cc":{"type":"ephemeral"},"b":2}`,
+		`{"system":[{"text":"s","cc":1}],"messages":[{"content":[{"text":"m","cc":2}]}]}`,
+		`[{"cc":1},{"cc":2}]`,
+		`{"a":"cc"}`,
+		`{"a":{"b":{"c":{"cc":[1,2,{"cc":3}]}}}}`,
+		`{"a":1 , "cc" : 2 , "b":3}`,
+		`"cc"`,
+		`null`,
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, doc string) {
+		if !json.Valid([]byte(doc)) {
+			return
+		}
+		got, removed, err := StripObjectKey([]byte(doc), "cc")
+		if err != nil {
+			t.Fatalf("StripObjectKey on valid JSON: %v", err)
+		}
+		if !json.Valid(got) {
+			t.Fatalf("result is not valid JSON\n in: %s\nout: %s", doc, got)
+		}
+		present, err := ContainsObjectKey(got, "cc")
+		if err != nil {
+			t.Fatalf("ContainsObjectKey: %v", err)
+		}
+		if present {
+			t.Fatalf("the member survived stripping\n in: %s\nout: %s", doc, got)
+		}
+		if !removed && string(got) != doc {
+			t.Fatalf("nothing was removed but the document changed\n in: %s\nout: %s", doc, got)
+		}
+		if len(got) > len(doc) {
+			t.Fatalf("stripping made the document longer\n in: %s\nout: %s", doc, got)
+		}
+		// Stripping twice must reach the same place as stripping once, or the
+		// fingerprint would depend on how many times a body had been handled.
+		again, removedAgain, err := StripObjectKey(got, "cc")
+		if err != nil {
+			t.Fatalf("second StripObjectKey: %v", err)
+		}
+		if removedAgain || string(again) != string(got) {
+			t.Fatalf("stripping is not idempotent\n once: %s\ntwice: %s", got, again)
+		}
+	})
+}

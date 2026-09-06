@@ -168,6 +168,13 @@ the request body, and passthrough exists to forward one unchanged.
 | `metrics` | `false` | Serves `GET /metrics`. |
 | `spend_store_path` | — | Persists budgets across restarts. |
 | `spend_flush_interval` | `30s` | |
+| `stream_usage` | `true` | Ask OpenAI-compatible upstreams to report usage on streamed replies. See [prompt-caching.md](prompt-caching.md#streamed-replies-report-nothing-unless-asked). |
+
+`stream_usage` adds `stream_options.include_usage` to a streamed request that did
+not set `stream_options` itself. Without it such a reply carries no usage at all
+and the request is billed as zero — no cost, no budget, no cached tokens. The
+cost of asking is one extra chunk at the end of the stream; turn it off for a
+client or an upstream that cannot take one.
 
 ## Endpoints
 

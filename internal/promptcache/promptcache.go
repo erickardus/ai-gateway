@@ -43,15 +43,27 @@ const controlKey = "cache_control"
 // too.
 var controlMarker = []byte(`"` + controlKey + `"`)
 
-// prefixLead is how many leading messages join the fingerprint.
+// prefixLead is how many leading messages join the fingerprint, which differs by
+// wire format because the two put their distinguishing turn in different places.
 //
-// Two is the smallest number that discriminates usefully in both wire formats.
 // Under the Anthropic format the first message is the opening user turn, which
-// differs per conversation; under OpenAI it is often a system message shared by
-// every caller, and the second is what tells two conversations apart. Both are
-// stable for the life of a conversation, which is the property the fingerprint
-// needs.
-const prefixLead = 2
+// differs per conversation and is therefore enough on its own. Under OpenAI the
+// first is often a system message shared by every caller, and the second is what
+// tells two conversations apart.
+//
+// The count has to be one a conversation satisfies from its very first request,
+// not merely later on. A lead of two under the Anthropic format would read one
+// message on the opening turn and two on every turn after it, so the opening
+// turn would fingerprint differently from the conversation it begins — and the
+// upstream it warmed would be the one deployment the second turn had no reason
+// to return to. An OpenAI conversation carrying a system message already holds
+// two messages on its first request, so two is stable there from the start.
+func prefixLead(format core.Format) int {
+	if format == core.FormatAnthropic {
+		return 1
+	}
+	return 2
+}
 
 // Fingerprint identifies the cacheable prefix of a request, or returns false
 // when the body has none worth pinning on.
@@ -60,6 +72,13 @@ const prefixLead = 2
 // grows — the tool definitions, the system blocks and the opening turns — and
 // deliberately not the trailing messages, which change on every turn and would
 // make the fingerprint useless as an affinity key.
+//
+// Cache breakpoints are excluded from the hash. They are metadata saying where
+// a prefix ends rather than prompt text an upstream tokenizes, and every client
+// that places its own walks the last one forward as the conversation grows —
+// Claude Code does, and so does the SDKs' automatic caching. Hashing them would
+// make each turn of one conversation a different prefix, which is the precise
+// condition this whole package exists to prevent.
 //
 // The model group and wire format are included so that two groups sharing a
 // prompt do not share a pin, and the whole thing is hashed rather than kept, so
@@ -78,12 +97,12 @@ func Fingerprint(format core.Format, model string, fields jsonx.Fields) (string,
 	}
 	write([]byte(format))
 	write([]byte(model))
-	write(fields.System)
-	write(fields.Tools)
+	write(stripBreakpoints(fields.System))
+	write(stripBreakpoints(fields.Tools))
 
-	lead := fields.LeadingMessages(prefixLead)
+	lead := fields.LeadingMessages(prefixLead(format))
 	for _, message := range lead {
-		write(message)
+		write(stripBreakpoints(message))
 	}
 
 	// A request with no prefix at all — no system, no tools, no messages — has
@@ -93,6 +112,25 @@ func Fingerprint(format core.Format, model string, fields jsonx.Fields) (string,
 		return "", false
 	}
 	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+// stripBreakpoints removes cache_control members from a value so that a
+// breakpoint moving through a conversation does not change its fingerprint.
+//
+// The byte scan is the same prefilter alreadyMarked uses, and for the same
+// reason: the bytes appear in any conversation that discusses prompt caching,
+// so their presence only means the structural walk is worth running. A value
+// that cannot be walked is hashed as it arrived — a fingerprint that is stable
+// for a request shape the gateway does not recognize is still better than none.
+func stripBreakpoints(value []byte) []byte {
+	if !bytes.Contains(value, controlMarker) {
+		return value
+	}
+	stripped, changed, err := jsonx.StripObjectKey(value, controlKey)
+	if err != nil || !changed {
+		return value
+	}
+	return stripped
 }
 
 // Inject marks the stable prefix of an Anthropic request as cacheable, and

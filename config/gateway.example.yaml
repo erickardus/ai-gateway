@@ -255,3 +255,16 @@ observability:
   # restart hands each key a fresh allowance.
   spend_store_path: ./data/spend.json
   spend_flush_interval: 30s
+
+  # Ask OpenAI-compatible upstreams to report usage on streamed replies, by
+  # adding stream_options.include_usage to a request that did not set
+  # stream_options itself. Without it a streamed reply carries no usage at all,
+  # so the request costs nothing, charges no budget and reports no cached
+  # tokens — a plausible-looking zero that nothing else contradicts.
+  #
+  # The cost of asking is one extra chunk at the end of the stream, carrying the
+  # usage and an empty choices array. It is part of the OpenAI protocol, but turn
+  # this off for a hand-written client that indexes choices[0] on every chunk, or
+  # for an upstream strict enough to reject the field. Anthropic is unaffected:
+  # it reports usage on message_start whether asked or not.
+  stream_usage: true

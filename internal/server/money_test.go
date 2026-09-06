@@ -95,7 +95,7 @@ func (u *cachingUpstream) handler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		if u.streaming {
 			w.Header().Set("Content-Type", "text/event-stream")
-			io.WriteString(w, u.streamBody(cached))
+			io.WriteString(w, u.streamBody(cached, askedForStreamUsage(body)))
 			return
 		}
 		io.WriteString(w, u.body(cached))
@@ -123,6 +123,10 @@ func (u *cachingUpstream) counts() (writes, reads int) {
 	defer u.mu.Unlock()
 	return u.writes, u.reads
 }
+
+// breakpoint is the ephemeral cache_control marker a caller places to say where
+// its cacheable prefix ends.
+var breakpoint = map[string]any{"type": "ephemeral"}
 
 // uncachedInput and output are the small per-turn figures that sit alongside the
 // cached prefix: the newest message and the reply.
@@ -153,10 +157,29 @@ func (u *cachingUpstream) body(cached bool) string {
 		uncachedInput, outputTokens, read, write)
 }
 
-// streamBody is the same response as the event sequence Anthropic actually
-// sends, with the cache counters on message_start and the output count on
-// message_delta.
-func (u *cachingUpstream) streamBody(cached bool) string {
+// askedForStreamUsage reports whether a request opted into usage on a streamed
+// reply. It is the condition OpenAI puts on reporting any: without it the stream
+// ends with no usage object anywhere, and a gateway has nothing to bill.
+func askedForStreamUsage(body []byte) bool {
+	var doc struct {
+		StreamOptions *struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return false
+	}
+	return doc.StreamOptions != nil && doc.StreamOptions.IncludeUsage
+}
+
+// streamBody is the response as an event sequence. Anthropic reports usage on
+// message_start whether or not it was asked to; an OpenAI-compatible server
+// reports it in a final chunk only when the request opted in, which is the
+// difference that decides whether the deployment is billed at all.
+func (u *cachingUpstream) streamBody(cached, withUsage bool) string {
+	if u.format == core.FormatOpenAI {
+		return u.openAIStreamBody(cached, withUsage)
+	}
 	read, write := 0, u.prefixTokens
 	if cached {
 		read, write = u.prefixTokens, 0
@@ -175,6 +198,29 @@ func (u *cachingUpstream) streamBody(cached bool) string {
 	}, "\n")
 }
 
+// openAIStreamBody is the chunk sequence a streamed Chat Completions reply
+// carries: content chunks throughout, and the whole tally in one final chunk
+// with an empty choices array — present only where the caller asked for it.
+func (u *cachingUpstream) openAIStreamBody(cached, withUsage bool) string {
+	events := []string{
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}`,
+		"",
+	}
+	if withUsage {
+		cachedTokens := 0
+		if cached {
+			cachedTokens = u.prefixTokens
+		}
+		events = append(events, fmt.Sprintf(
+			`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[],"usage":`+
+				`{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d,`+
+				`"prompt_tokens_details":{"cached_tokens":%d}}}`,
+			u.prefixTokens+uncachedInput, outputTokens,
+			u.prefixTokens+uncachedInput+outputTokens, cachedTokens), "")
+	}
+	return strings.Join(append(events, "data: [DONE]", ""), "\n")
+}
+
 // prefixOf hashes the part of a request a provider would cache: everything
 // except the trailing message. It stands in for the provider's own tokenized
 // prefix, and shares its property of being unchanged as a conversation grows.
@@ -188,15 +234,62 @@ func prefixOf(body []byte) string {
 		return "unparsed"
 	}
 	h := sha256.New()
-	h.Write(doc.System)
-	h.Write(doc.Tools)
+	h.Write(withoutBreakpoints(doc.System))
+	h.Write(withoutBreakpoints(doc.Tools))
 	for i, m := range doc.Messages {
 		if i >= 2 {
 			break
 		}
-		h.Write(m)
+		h.Write(withoutBreakpoints(m))
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// withoutBreakpoints renders a value with every cache_control member removed.
+//
+// A provider caches the tokenized prompt. A breakpoint says where a prefix ends
+// rather than forming part of it, so a client walking its marker forward as a
+// conversation grows is still sending the prefix the earlier turn warmed, and
+// the provider reads it back. A fake that hashed the marker would bill a write
+// on every turn however the gateway routed, which would make the tests below
+// unable to tell good routing from bad.
+//
+// It decodes and re-encodes rather than splicing bytes, so this oracle shares no
+// code with the stripping it is here to check.
+func withoutBreakpoints(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return raw
+	}
+	out, err := json.Marshal(stripControl(value))
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func stripControl(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, inner := range v {
+			if key == "cache_control" {
+				continue
+			}
+			out[key] = stripControl(inner)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, inner := range v {
+			out[i] = stripControl(inner)
+		}
+		return out
+	}
+	return value
 }
 
 // TestAConversationPaysForItsPrefixOnce is the headline guarantee. A ten-turn
@@ -472,13 +565,24 @@ func conversationBody(model string, turns ...string) string {
 			"type":     "function",
 			"function": map[string]any{"name": "read_file"},
 		}}
+		for _, turn := range turns {
+			messages = append(messages, map[string]any{"role": "user", "content": turn})
+		}
 	} else {
-		document["system"] = []any{map[string]any{"type": "text", "text": longSystem}}
-		document["tools"] = []any{map[string]any{"name": "read_file"}}
-	}
-
-	for _, turn := range turns {
-		messages = append(messages, map[string]any{"role": "user", "content": turn})
+		// Claude Code's own shape: a breakpoint on the last system block, one on
+		// the last tool, and one on the last message. The third is the
+		// interesting one — it walks forward with every turn while the prompt
+		// behind it does not change, which is the traffic prefix affinity has to
+		// survive.
+		document["system"] = []any{map[string]any{"type": "text", "text": longSystem, "cache_control": breakpoint}}
+		document["tools"] = []any{map[string]any{"name": "read_file", "cache_control": breakpoint}}
+		for i, turn := range turns {
+			block := map[string]any{"type": "text", "text": turn}
+			if i == len(turns)-1 {
+				block["cache_control"] = breakpoint
+			}
+			messages = append(messages, map[string]any{"role": "user", "content": []any{block}})
+		}
 	}
 	document["messages"] = messages
 
@@ -534,4 +638,102 @@ func nearly(a, b float64) bool {
 	const epsilon = 1e-9
 	d := a - b
 	return d < epsilon && d > -epsilon
+}
+
+// streamed marks a request body as a streaming request, which is how a chat UI
+// sends every one of them.
+func streamed(body string) string {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		panic(err)
+	}
+	doc["stream"] = true
+	out, err := json.Marshal(doc)
+	if err != nil {
+		panic(err)
+	}
+	return string(out)
+}
+
+// runStreamedOpenAIConversation drives a growing conversation through the
+// Chat Completions endpoint, the way a chat UI does.
+func runStreamedOpenAIConversation(t *testing.T, h *harness, turns int) {
+	t.Helper()
+	messages := []string{"first turn", "answer"}
+	for i := 0; i < turns; i++ {
+		body := streamed(conversationBody("openai-gpt", messages...))
+		rec := h.do(t, claudeCodeRequest("/v1/chat/completions", body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("turn %d: status = %d, body = %s", i, rec.Code, rec.Body.String())
+		}
+		messages = append(messages, fmt.Sprintf("turn %d", i))
+	}
+}
+
+// TestAStreamedOpenAIConversationIsBilled is the same arithmetic as the
+// non-streamed case, over the transport most OpenAI-compatible traffic actually
+// uses.
+//
+// A streamed Chat Completions reply reports no usage unless the request asked
+// for it, so the whole workload below is billed at zero by a gateway that does
+// not ask — and zero is a plausible-looking number that no error, header or
+// metric contradicts. The companion test says what that costs.
+func TestAStreamedOpenAIConversationIsBilled(t *testing.T) {
+	const (
+		turns  = 4
+		prefix = 25_000
+	)
+	upstream := newCachingUpstream(core.FormatOpenAI, prefix)
+	upstream.streaming = true
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, format: core.FormatOpenAI,
+		upstream: upstream.handler(),
+	})
+
+	runStreamedOpenAIConversation(t, h, turns)
+
+	price := harnessOpts{format: core.FormatOpenAI}.defaultPricing()
+	// The cold turn charges the whole prefix as input; each warm turn charges it
+	// once, at the cache-read price.
+	want := float64(prefix)*price.InputPer1M/1e6 +
+		float64(prefix*(turns-1))*price.CacheReadPer1M/1e6 +
+		float64(uncachedInput*turns)*price.InputPer1M/1e6 +
+		float64(outputTokens*turns)*price.OutputPer1M/1e6
+	assertLedgerCost(t, h, want)
+
+	// The prompt cache is only visible on this traffic because the usage arrived
+	// at all, so the savings figure rests on the same thing the cost does.
+	totals := deploymentTotals(t, h)
+	if totals.CacheReadTokens != prefix*(turns-1) {
+		t.Errorf("cache read tokens = %d, want %d", totals.CacheReadTokens, prefix*(turns-1))
+	}
+}
+
+// TestAnUnaskedStreamIsBilledAtNothing is the companion: the same workload with
+// observability.stream_usage off, which is what every gateway that does not ask
+// for usage reports for streamed OpenAI-compatible traffic.
+//
+// It exists so the test above is known to be measuring something. A cost model
+// can only be verified against a configuration where it produces a different
+// answer.
+func TestAnUnaskedStreamIsBilledAtNothing(t *testing.T) {
+	off := false
+	upstream := newCachingUpstream(core.FormatOpenAI, 25_000)
+	upstream.streaming = true
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, format: core.FormatOpenAI,
+		streamUsage: &off, upstream: upstream.handler(),
+	})
+
+	runStreamedOpenAIConversation(t, h, 4)
+
+	if got := ledgerCost(t, h); got != 0 {
+		t.Fatalf("cost = %.6f, want 0: this test only means something while the traffic is unbilled", got)
+	}
+	totals := deploymentTotals(t, h)
+	if totals.InputTokens != 0 || totals.CacheReadTokens != 0 {
+		t.Errorf("tokens recorded = %+v, want none", totals)
+	}
+	// Four turns of real traffic, worth real money, recorded as nothing at all.
+	t.Logf("four streamed turns over a 25k-token prefix billed $0.00")
 }

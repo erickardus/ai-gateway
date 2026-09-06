@@ -49,6 +49,33 @@ Trailing messages are deliberately excluded: they change on every turn, and a
 fingerprint that included them would be a different fingerprint each time, which
 is the same as having none.
 
+**Cache breakpoints are excluded too**, for the same reason and less obviously.
+A `cache_control` marker says where a prefix ends; it is not part of the prompt
+an upstream tokenizes, and a client that walks its marker forward as the
+conversation grows — Claude Code does, and so does the automatic caching in the
+SDKs — is still sending the prefix the previous turn warmed. Fingerprinting the
+raw bytes would read that moving marker as a new prefix on every turn: the pin
+would be rebuilt each time, and the deployment holding the warm cache would be
+one candidate among many. So the fingerprint is taken over the request with
+every `cache_control` member removed, which the structural walk under
+[injection](#cache-breakpoints) already knows how to distinguish from prompt
+text that merely mentions one.
+
+How much of the conversation joins the fingerprint depends on the format, and
+the count has to be one the *first* request already satisfies. Under Anthropic
+the opening user turn is distinctive on its own, so it is the only message read;
+reading two would mean a conversation's first request — which has one message
+where every later one has three — fingerprinting differently from its own second
+turn, and warming an upstream that nothing afterwards had a reason to return to.
+Under OpenAI the first message is usually a system prompt many callers share, so
+the second is read as well; a first request carrying a system message already has
+both.
+
+Two requests sharing everything that is fingerprinted share a pin even where
+they diverge later on. That is not a loss of precision: they carry the same
+prefix, so they belong on the same upstream, and it is
+[bounded](#the-bound-on-concentration) like any other concentration.
+
 **A pin is a preference, never a constraint.** The pinned deployment is filtered
 for health, format, permissions and capacity exactly like every other candidate.
 If it is cooling down, at its rate limit, or has already failed this request,
@@ -164,6 +191,52 @@ OpenAI-compatible servers — `prompt_tokens_details.cached_tokens`,
 `input_tokens_details.cached_tokens`, and DeepSeek's `prompt_cache_hit_tokens` —
 and a cached count larger than the input it belongs to is clamped rather than
 allowed to mint savings out of an upstream's arithmetic error.
+
+### Streamed replies report nothing unless asked
+
+An OpenAI-compatible reply reports usage in the response body. A **streamed** one
+does not: the chunks carry content and the stream ends, with no usage object
+anywhere, unless the request set `stream_options.include_usage`. Anthropic has no
+equivalent condition — it reports usage on `message_start` whether asked or not.
+
+Missing usage is not a missing field on an otherwise correct bill. It is the
+whole bill: the request records zero input, zero output and zero cached tokens,
+so it costs nothing, charges nothing against a budget or a token limit, and
+contributes nothing to the cache counters. On a deployment serving nothing but
+streamed traffic — the normal case for a chat UI — every figure in `/spend`
+reads zero, and `/metrics` reports that prompt caching is not working because it
+cannot see it working. Nothing errors.
+
+So the gateway asks, under `observability.stream_usage` (on by default):
+
+```yaml
+observability:
+  stream_usage: true
+```
+
+It adds `stream_options: {"include_usage": true}` to a streamed request in the
+OpenAI format that did not set `stream_options` itself. A caller that did has
+said what it wants and is left alone, byte for byte.
+
+What it costs is one extra chunk at the end of the stream, carrying the usage and
+an empty `choices` array. That is part of the OpenAI protocol and the official
+clients expect it, but a hand-written client that indexes `choices[0]` on every
+chunk does not, and a strict OpenAI-compatible server may reject the field
+outright. Either is a reason to turn it off — at the price of an unpriced
+deployment.
+
+Where a streamed reply still arrives with no usage — the setting is off, the
+caller asked for none, or the upstream ignored the field — the gateway says so
+once per deployment:
+
+```
+streamed reply reported no usage, so it is billed as nothing
+  deployment=openai/gpt-4o remedy=set observability.stream_usage, or have the
+  caller send stream_options.include_usage
+```
+
+It is a log line rather than an error because the response itself is fine. Only
+the accounting is missing, and nothing else would ever mention it.
 
 **Breakpoint injection does not apply.** `cache_control` is an Anthropic
 construct, caching on an OpenAI-compatible provider is automatic, and there is
@@ -364,4 +437,7 @@ than on mechanism:
 | `TestInjectionAddsBreakpointsAndNothingElse`, `FuzzInject` | a rewritten body that differs from the original by anything other than its breakpoints — which would change the very prefix bytes the cache keys on |
 | `TestInjectionIsIdempotent` | breakpoints accumulating past the API's cap through a retry or a second gateway |
 | `TestOneHourWritesArePricedAtTheirOwnRate` | the long tier billed at the short tier's price |
+| `TestPromptAffinitySurvivesAMovingBreakpoint` | a conversation re-pinned every turn because its caller's breakpoint moved, which is what every Anthropic client's does |
+| `TestFingerprintIgnoresAMovingBreakpoint`, `TestFingerprintReadsTheTurnThatDiscriminates` | the same at the fingerprint, in both wire formats |
+| `TestAStreamedOpenAIConversationIsBilled`, `TestAnUnaskedStreamIsBilledAtNothing` | a streamed OpenAI-compatible workload billed at zero, and the proof that the first test would notice |
 | `TestPricingValidation` | a cost model that would misreport what caching costs, accepted at load |

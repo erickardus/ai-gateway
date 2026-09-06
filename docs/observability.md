@@ -18,6 +18,14 @@ This distinction is why `Totals` reports `requests` and `billable_requests`
 separately: a key serving only subscription traffic is visibly busy but free,
 which a bare cost of `0` could not distinguish from an idle key.
 
+There is one way a billable request can nonetheless record nothing, and it is
+worth knowing before reading a zero as good news: a **streamed**
+OpenAI-compatible reply carries no usage unless the request asked for it. The
+gateway asks by default — see
+[prompt-caching.md](prompt-caching.md#streamed-replies-report-nothing-unless-asked)
+— and says so in the log, once per deployment, whenever a streamed reply arrives
+without any.
+
 ## Pricing
 
 Per million tokens, as providers publish it:

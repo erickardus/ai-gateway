@@ -48,6 +48,10 @@ type Server struct {
 	// token counter their cost model does not price. The warning belongs in a
 	// log once per deployment, not once per request.
 	mispriced sync.Map
+	// unmeasured records the deployments already warned about for answering a
+	// streamed request with no usage at all. Like mispriced, it is a fact about
+	// the deployment rather than the request, so it is worth one log line.
+	unmeasured sync.Map
 }
 
 // deploymentPricing is what one deployment costs the operator.

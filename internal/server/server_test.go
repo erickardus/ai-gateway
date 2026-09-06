@@ -95,6 +95,9 @@ type harnessOpts struct {
 	format core.Format
 	// pricing overrides the cost model applied to every api_key deployment.
 	pricing *core.Pricing
+	// streamUsage overrides observability.stream_usage, which decides whether a
+	// streamed OpenAI-compatible request is asked to report any usage at all.
+	streamUsage *bool
 	// upstreams, when set, gives each deployment its own handler — the first
 	// entry serves the primary deployment and the rest serve the extras. It is
 	// what lets a test model several independent providers, each holding its
@@ -203,6 +206,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		},
 	}
 	cfg.Observability.Metrics = true
+	cfg.Observability.StreamUsage = opts.streamUsage
 	if opts.maxBudget > 0 {
 		cfg.VirtualKeys.Keys[0].MaxBudget = opts.maxBudget
 	}

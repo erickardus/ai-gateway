@@ -66,7 +66,6 @@ func TestFingerprintDiscriminates(t *testing.T) {
 	}{
 		{"different system", "m", conversation("be terse", "one", "two")},
 		{"different opening turn", "m", conversation("be helpful", "different", "two")},
-		{"different second turn", "m", conversation("be helpful", "one", "different")},
 		{"different model group", "other", base},
 	}
 	for _, tt := range tests {
@@ -86,6 +85,55 @@ func TestFingerprintDiscriminates(t *testing.T) {
 	openai, _ := Fingerprint(core.FormatOpenAI, "m", peek(t, base))
 	if openai == baseline {
 		t.Error("fingerprint ignored the wire format")
+	}
+}
+
+// TestFingerprintReadsTheTurnThatDiscriminates covers the one place the two wire
+// formats need different treatment.
+//
+// Under the Anthropic format the opening user turn is the distinguishing one, so
+// the fingerprint stops there and two requests that differ only from the second
+// turn onwards share a pin. That is deliberate rather than a loss of precision:
+// they carry the same system prompt, the same tools and the same opening turn,
+// which is the prefix an upstream actually holds warm, so the same deployment is
+// where both of them belong. Reading further would buy nothing and would cost
+// the property the whole feature rests on — a first turn carries one message
+// where every later turn carries three, so a two-message lead would fingerprint
+// a conversation's opening request differently from its own second one.
+//
+// Under OpenAI the first message is a system prompt many callers share, so it is
+// the second that has to be read.
+func TestFingerprintReadsTheTurnThatDiscriminates(t *testing.T) {
+	anthropic := func(second string) string {
+		fp, ok := Fingerprint(core.FormatAnthropic, "m", peek(t, conversation("be helpful", "one", second)))
+		if !ok {
+			t.Fatal("Fingerprint: ok = false")
+		}
+		return fp
+	}
+	if anthropic("two") != anthropic("different") {
+		t.Error("an Anthropic request was re-pinned over a turn behind the cached prefix")
+	}
+
+	openai := func(second string) string {
+		body, err := json.Marshal(map[string]any{
+			"model": "openai-gpt",
+			"messages": []any{
+				map[string]any{"role": "system", "content": "be helpful"},
+				map[string]any{"role": "user", "content": second},
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		fp, ok := Fingerprint(core.FormatOpenAI, "m", peek(t, body))
+		if !ok {
+			t.Fatal("Fingerprint: ok = false")
+		}
+		return fp
+	}
+	if openai("one") == openai("another") {
+		t.Error("two OpenAI conversations behind one shared system message share a pin")
 	}
 }
 
@@ -351,4 +399,80 @@ func benchBody() []byte {
 		panic(err)
 	}
 	return body
+}
+
+// TestFingerprintIgnoresAMovingBreakpoint is the property affinity depends on
+// for the traffic this gateway primarily carries.
+//
+// Claude Code, the SDKs' automatic caching and the documented multi-turn
+// pattern all mark the last message of the conversation, so the breakpoint
+// walks forward as turns accumulate while the prompt behind it does not change.
+// A fingerprint that moved with it would call every turn a new prefix: each one
+// would be free to land on a cold deployment, and the conversation would pay a
+// cache write per turn on the largest prefix it has.
+func TestFingerprintIgnoresAMovingBreakpoint(t *testing.T) {
+	// The system block and the tool table are marked once and never move; the
+	// marker on the trailing message is the one that walks.
+	turn := func(messages string) []byte {
+		return []byte(`{"model":"m",` +
+			`"system":[{"type":"text","text":"S","cache_control":{"type":"ephemeral"}}],` +
+			`"tools":[{"name":"read_file","cache_control":{"type":"ephemeral"}}],` +
+			`"messages":[` + messages + `]}`)
+	}
+	marked := func(text string) string {
+		return `{"role":"user","content":[{"type":"text","text":"` + text + `","cache_control":{"type":"ephemeral"}}]}`
+	}
+	plain := func(text string) string {
+		return `{"role":"user","content":[{"type":"text","text":"` + text + `"}]}`
+	}
+
+	bodies := [][]byte{
+		turn(marked("one")),
+		turn(plain("one") + "," + plain("two") + "," + marked("three")),
+		turn(plain("one") + "," + plain("two") + "," + plain("three") + "," + marked("four")),
+	}
+
+	fingerprints := make([]string, len(bodies))
+	for i, body := range bodies {
+		fields, err := jsonx.Peek(body)
+		if err != nil {
+			t.Fatalf("turn %d: Peek: %v", i+1, err)
+		}
+		fp, ok := Fingerprint(core.FormatAnthropic, "m", fields)
+		if !ok {
+			t.Fatalf("turn %d: no fingerprint for a request carrying a system prompt", i+1)
+		}
+		fingerprints[i] = fp
+	}
+
+	for i, fp := range fingerprints[1:] {
+		if fp != fingerprints[0] {
+			t.Errorf("turn %d fingerprinted as %s, turn 1 as %s: the same conversation must pin to one deployment",
+				i+2, fp[:12], fingerprints[0][:12])
+		}
+	}
+}
+
+// TestFingerprintStillSeparatesDifferentPrompts guards the other half: ignoring
+// breakpoints must not blur two conversations into one pin, which would
+// concentrate unrelated traffic on a single deployment.
+func TestFingerprintStillSeparatesDifferentPrompts(t *testing.T) {
+	body := func(system string) []byte {
+		return []byte(`{"model":"m","system":[{"type":"text","text":"` + system +
+			`","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	}
+	fingerprint := func(b []byte) string {
+		fields, err := jsonx.Peek(b)
+		if err != nil {
+			t.Fatalf("Peek: %v", err)
+		}
+		fp, ok := Fingerprint(core.FormatAnthropic, "m", fields)
+		if !ok {
+			t.Fatal("no fingerprint")
+		}
+		return fp
+	}
+	if fingerprint(body("one prompt")) == fingerprint(body("another prompt")) {
+		t.Error("two different system prompts share a fingerprint")
+	}
 }
