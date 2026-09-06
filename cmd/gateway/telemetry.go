@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/audit"
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/metrics"
@@ -26,7 +27,7 @@ const gaugeReadTimeout = 2 * time.Second
 // them into counters here would create a second copy to keep in step, and the
 // copy would be wrong exactly when something updated the original by a path
 // nobody remembered to instrument.
-func registerLiveGauges(reg *metrics.Registry, cfg *config.Config, rtr *router.Router, store auth.KeyStore, shared *rstate.Store, version string) {
+func registerLiveGauges(reg *metrics.Registry, cfg *config.Config, rtr *router.Router, store auth.KeyStore, shared *rstate.Store, auditSink audit.Sink, version string) {
 	if reg == nil {
 		return
 	}
@@ -84,6 +85,24 @@ func registerLiveGauges(reg *metrics.Registry, cfg *config.Config, rtr *router.R
 					return nil
 				}
 				return []metrics.Point{{Value: float64(len(keys))}}
+			})
+	}
+
+	// Whether this instance's audit chain has stopped verifying, which is the
+	// one gateway state with no other outward sign: a sealed sink refuses every
+	// administrative action with a 500 that looks like any other 500, and the
+	// startup log line saying why has usually scrolled away by the time anyone
+	// notices. Worth an alert at any value above zero, alongside
+	// gateway_audit_write_failures_total.
+	if sealer, ok := auditSink.(interface{ Sealed() string }); ok && sealer != nil {
+		reg.RegisterGauge(metrics.MAuditSealed,
+			"1 while this instance's audit chain does not verify, so every administrative action is being refused. Inference is unaffected; nothing else reports this.", "{sink}",
+			func() []metrics.Point {
+				var sealed float64
+				if sealer.Sealed() != "" {
+					sealed = 1
+				}
+				return []metrics.Point{{Value: sealed}}
 			})
 	}
 

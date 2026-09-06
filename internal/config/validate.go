@@ -927,9 +927,42 @@ func validateAudit(c *Config) []error {
 				"audit.path: required when audit.sink is %q, since a file sink has nowhere to write without one",
 				AuditSinkFile))
 		}
+	case AuditSinkPostgres:
+		if a.DSN == "" {
+			errs = append(errs, fmt.Errorf(
+				"audit.dsn: required when audit.sink is %q (unset or empty ${ENV} reference?)",
+				AuditSinkPostgres))
+		}
+		// The mirror of the path check above, and the more consequential
+		// direction: an operator switching a file chain to a shared one edits
+		// the line under the sink, and a leftover path names a file the gateway
+		// no longer writes while looking exactly like the place to go and read
+		// the records.
+		if a.Path != "" {
+			errs = append(errs, fmt.Errorf(
+				"audit.path: %s is set while audit.sink is %q, which keeps no file; remove the path or use sink: %q",
+				strconv.Quote(a.Path), AuditSinkPostgres, AuditSinkFile))
+		}
 	default:
-		errs = append(errs, fmt.Errorf("audit.sink: must be %q or %q, got %q",
-			AuditSinkStdout, AuditSinkFile, a.Sink))
+		errs = append(errs, fmt.Errorf("audit.sink: must be %q, %q or %q, got %q",
+			AuditSinkStdout, AuditSinkFile, AuditSinkPostgres, a.Sink))
+	}
+	// A dsn on any other sink is refused rather than ignored, for the reason
+	// the key store refuses one: the two ways to arrive here are an operator
+	// who set the connection string and forgot the sink, and one who moved back
+	// off Postgres and left the dsn behind. The first records nowhere it
+	// expects; the second leaves a live database credential in a file with no
+	// use for it.
+	if a.SinkKind() != AuditSinkPostgres && a.DSN != "" {
+		errs = append(errs, fmt.Errorf(
+			"audit.dsn: set while audit.sink is %q, which never connects to a database; use sink: %q or remove the dsn",
+			a.SinkKind(), AuditSinkPostgres))
+	}
+	if a.Timeout < 0 {
+		errs = append(errs, fmt.Errorf("audit.timeout: must not be negative, got %s", a.Timeout))
+	}
+	if a.MaxConns < 0 {
+		errs = append(errs, fmt.Errorf("audit.max_conns: must be >= 0, got %d", a.MaxConns))
 	}
 	return errs
 }

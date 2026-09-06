@@ -79,6 +79,8 @@ model_list:
 
 		{"audit.enabled", cfg.Audit.On(), true},
 		{"audit.sink", cfg.Audit.SinkKind(), "stdout"},
+		{"audit.timeout", cfg.Audit.Timeout.String(), "5s"},
+		{"audit.max_conns", cfg.Audit.MaxConns, int32(4)},
 
 		{"observability.log_level", cfg.Observability.LogLevel, "info"},
 		{"observability.log_format", cfg.Observability.LogFormat, "text"},

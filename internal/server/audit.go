@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -129,12 +130,24 @@ func sourceIP(r *http.Request) string {
 // here leaves nothing behind. recordAuditFailure is the other half of that
 // arrangement.
 func (s *Server) recordAudit(w http.ResponseWriter, r *http.Request, e audit.Event) bool {
-	if err := s.recordAuditErr(r, e); err != nil {
+	err := s.recordAuditErr(r, e)
+	if err == nil {
+		return true
+	}
+	// A sealed chain says something different to the operator holding the
+	// master key than a failed write does. One is "try again"; the other is
+	// "nobody can administer this gateway until the chain is dealt with", and
+	// an operator who reads the first when it is the second will retry for a
+	// while before going to look at the logs.
+	var sealed *audit.SealedError
+	if errors.As(err, &sealed) {
 		writeError(w, http.StatusInternalServerError, "internal_error",
-			"the action was refused because it could not be written to the audit log")
+			"the action was refused because this gateway's audit chain no longer verifies and has been sealed; no administrative action will be accepted until it is archived — see the gateway's logs")
 		return false
 	}
-	return true
+	writeError(w, http.StatusInternalServerError, "internal_error",
+		"the action was refused because it could not be written to the audit log")
+	return false
 }
 
 // recordAuditErr is recordAudit for the callers that render their own failure —
@@ -205,7 +218,11 @@ func detail(kv ...string) map[string]string {
 // other, and only this line says the gateway is currently unable to administer
 // anything.
 func (s *Server) auditWriteFailed(r *http.Request, e audit.Event, err error) {
-	s.log.Error("an administrative action could not be written to the audit log",
-		"action", e.Action, "error", err, "request_id", RequestIDFrom(r.Context()))
+	msg := "an administrative action could not be written to the audit log"
+	var sealed *audit.SealedError
+	if errors.As(err, &sealed) {
+		msg = "an administrative action was refused because the audit chain is sealed; it will take no records until somebody archives it"
+	}
+	s.log.Error(msg, "action", e.Action, "error", err, "request_id", RequestIDFrom(r.Context()))
 	s.metrics.Add(metrics.MAuditFailures, 1, "action", e.Action)
 }

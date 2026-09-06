@@ -67,7 +67,7 @@ func run() error {
 		addr        = flag.String("addr", "", "override server.addr from the configuration")
 		logLevel    = flag.String("log-level", "", "override observability.log_level (debug, info, warn, error)")
 		showVersion = flag.Bool("version", false, "print the version and exit")
-		verifyAudit = flag.String("verify-audit", "", "verify the hash chain of an audit log and exit")
+		verifyAudit = flag.String("verify-audit", "", "verify the hash chain of an audit log — a file path or a postgres dsn — and exit")
 	)
 	flag.Parse()
 
@@ -98,11 +98,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Opened first among the gateway's dependencies. A file sink verifies the
-	// chain it is about to continue, and a gateway whose audit log does not
-	// verify should refuse to start before it has opened a socket or reached an
-	// upstream, not after.
-	auditSink, err := newAuditSink(cfg.Audit, log)
+	// Opened first among the gateway's dependencies. A sink verifies the chain
+	// it is about to continue, and whether that chain is usable decides how
+	// this gateway may be administered — a question to settle before it has
+	// opened a socket or reached an upstream, not after.
+	auditSink, err := newAuditSink(ctx, cfg.Audit, log)
 	if err != nil {
 		return err
 	}
@@ -203,7 +203,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initialize router: %w", err)
 	}
-	registerLiveGauges(reg, cfg, rtr, store, shared, version)
+	registerLiveGauges(reg, cfg, rtr, store, shared, auditSink, version)
 
 	// Push the same snapshot /metrics serves to an OTLP collector. The two are
 	// independent: either, both or neither may be on, and both render the same
