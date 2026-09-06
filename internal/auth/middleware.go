@@ -8,7 +8,6 @@ import (
 
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
-	"github.com/erickardus/ai-gateway/internal/limiter"
 	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
@@ -26,7 +25,10 @@ type Authenticator struct {
 	store       KeyStore
 	headerNames []string
 	masterKey   string
-	limits      *limiter.Limiter
+	// limits counts each key's own rate allowance. It starts per-process and is
+	// replaced by a shared implementation where the gateway runs as a fleet;
+	// see UseKeyLimiter.
+	limits KeyLimiter
 }
 
 // NewAuthenticator builds an Authenticator and seeds the store with the keys
@@ -37,7 +39,7 @@ func NewAuthenticator(ctx context.Context, store KeyStore, cfg config.VirtualKey
 		store:       store,
 		headerNames: cfg.HeaderNames,
 		masterKey:   cfg.MasterKey,
-		limits:      limiter.New(),
+		limits:      NewLocalLimiter(),
 	}
 	for i, spec := range cfg.Keys {
 		k := &core.Key{
@@ -63,9 +65,40 @@ func NewAuthenticator(ctx context.Context, store KeyStore, cfg config.VirtualKey
 // HeaderNames returns the custom headers that may carry a virtual key.
 func (a *Authenticator) HeaderNames() []string { return a.headerNames }
 
-// Limiter exposes the per-key limiter so completed requests can report token
-// usage back against the calling key.
-func (a *Authenticator) Limiter() *limiter.Limiter { return a.limits }
+// UseKeyLimiter replaces the per-key rate limiter, so that several replicas
+// enforce one allowance between them rather than one each.
+//
+// It is set after construction rather than taken as configuration because
+// sharing is a deployment decision, not a property of the keys: the same key
+// list runs as a single instance with no Redis and as a fleet with one, and
+// only the process wiring the gateway together knows which. A nil limiter is
+// ignored, so a caller that has no shared store need not branch.
+func (a *Authenticator) UseKeyLimiter(l KeyLimiter) {
+	if l != nil {
+		a.limits = l
+	}
+}
+
+// RecordKeyTokens charges a completed response's tokens against the calling
+// key's token-per-minute allowance.
+//
+// It is separate from Admit because tokens are only known once the response has
+// been read, where requests are known before it is sent. Both land on the same
+// counter.
+func (a *Authenticator) RecordKeyTokens(ctx context.Context, keyHash string, tokens int) {
+	if keyHash == "" || tokens <= 0 {
+		return
+	}
+	a.limits.AddTokens(ctx, keyHash, tokens)
+}
+
+// ForgetKey drops a revoked key's rate-limit counters.
+func (a *Authenticator) ForgetKey(ctx context.Context, keyHash string) {
+	if keyHash == "" {
+		return
+	}
+	a.limits.Forget(ctx, keyHash)
+}
 
 // HasMasterKey reports whether key-management endpoints are enabled.
 func (a *Authenticator) HasMasterKey() bool { return a.masterKey != "" }
@@ -128,11 +161,15 @@ func (a *Authenticator) CheckBudget(ctx context.Context, ac *Context, ledger spe
 // separate from Authenticate: charging at authentication time would bill a key
 // for requests the gateway then rejects for an unknown or forbidden model, and
 // would let model discovery consume inference budget.
-func (a *Authenticator) Admit(ac *Context) error {
+func (a *Authenticator) Admit(ctx context.Context, ac *Context) error {
 	if ac == nil || ac.Key == nil {
 		return core.ErrKeyInvalid
 	}
-	if !a.limits.Reserve(ac.Key.Hash, ac.Key.RPMLimit, ac.Key.TPMLimit) {
+	ok, err := a.limits.Reserve(ctx, ac.Key.Hash, ac.Key.RPMLimit, ac.Key.TPMLimit)
+	if err != nil {
+		return fmt.Errorf("reserve capacity for key %q: %w", ac.Key.Alias, err)
+	}
+	if !ok {
 		return core.ErrRateLimited
 	}
 	return nil

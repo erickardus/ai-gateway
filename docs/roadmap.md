@@ -9,15 +9,26 @@ Status: 🔴 not started · 🟡 partial · ⚪ deliberate non-goal
 
 ## Blocking real use
 
-### 🔴 Verify against a live provider
+### 🟡 Verify against a live provider
 
-**Nothing in this repository has ever talked to a real LLM provider.** Every
-test runs against `httptest` fakes; the end-to-end runs used local fake
-upstreams and placeholder credentials.
+The gateway has now served real traffic, but not from the provider the design
+turns on.
 
-The whole design turns on Anthropic accepting a relayed OAuth token alongside an
-intact `anthropic-beta`, and that specific assertion is untested against the real
-endpoint. Everything else is downstream of it.
+What has been exercised live: a third-party upstream reached in both wire
+formats — an `openai` deployment and an `anthropic`-format one on the same
+account — under an `api_key` deployment. That run paid for itself immediately by
+finding two faults no fake had: `/key/generate` silently discarding
+`max_budget`, and `validateRates` refusing to price any `anthropic`-format
+deployment whose upstream writes its cache for free. Both are fixed, and the
+second is why `cost.cache_writes_free` exists.
+
+What has **not**: `api.anthropic.com`, and therefore the assertion everything
+else is downstream of — that Anthropic accepts a relayed subscription OAuth
+token alongside an intact `anthropic-beta`. Every test of that path still runs
+against an `httptest` fake, and a fake agrees with whatever it was written to
+agree with. Until this is done, treat the passthrough path as *correct against a
+faithful fake*, and the rest as correct against one real upstream that is not
+Anthropic.
 
 The check is about five minutes on a machine with a Claude subscription:
 
@@ -41,8 +52,6 @@ Failure signatures worth recognising:
 | Works, but billed per token | `ANTHROPIC_API_KEY` is set somewhere, or an `apiKeyHelper` is configured |
 | Long completions truncate | a proxy between client and gateway is buffering |
 | `400` naming an unknown field | something is reshaping the request body |
-
-Until this is done, treat "functional" as *correct against a faithful fake*.
 
 ---
 
@@ -222,6 +231,22 @@ at the lower rate. Refusing the request instead would be worse — the traffic i
 already served — and refusing the config would demand a price from every
 operator whose callers never use the longer TTL.
 
+### 🟡 A budget is checked before the call, so concurrency overshoots it
+
+`CheckBudget` reads what a key has spent and compares it against the cap. It
+reserves nothing, and the cost of a request is not known until its response has
+been read — so every request already in flight when the boundary is crossed is
+admitted, and the cap is exceeded by roughly their combined cost. A key at its
+limit is refused from the next request onward, which is the behaviour that
+matters; the overshoot is bounded by that key's concurrency, not by time.
+
+Closing it properly means reserving an estimate at admission and reconciling
+against the real cost at completion, which puts a guess into the ledger and a
+second Redis round trip on the request path. The cheaper half — refusing once
+spend plus the cost of what is already in flight would cross the cap — needs a
+per-key in-flight cost estimate the gateway does not currently keep. Both want
+the same seam: a reservation alongside `Record` in `spend.Store`.
+
 ### 🟡 Budget windows reset lazily
 
 A key's budget window resets on its **first request after** the window elapses,
@@ -330,15 +355,30 @@ by the first request to fail on it.
 
 ## Operational
 
-### 🔴 No Helm chart or compose file
+### 🟡 No Helm chart
 
-A `Dockerfile` exists. No deployment manifests, no readiness/liveness wiring
-beyond the endpoints themselves.
+`deploy/docker-compose.yml` runs two gateway instances against one Redis, which
+is the arrangement every shared limit is written for and the one a single
+container cannot exercise. There are still no Kubernetes manifests, and no
+readiness/liveness wiring beyond the endpoints themselves — the compose file
+deliberately declares no container healthcheck, because the runtime image is
+distroless and the only command available to it proves the binary runs rather
+than that it serves.
 
 ### 🔴 No structured audit log
 
 Access logs carry the key alias, model and outcome, but there is no separate
 tamper-evident audit stream.
+
+### ✅ Per-key rate limits were enforced per instance
+
+Resolved. `keys[].rpm_limit` and `tpm_limit` went through a process-local
+counter while the deployment limits beside them were shared, so a fleet handed
+every key its allowance once per replica — the exact arithmetic
+[observability.md](observability.md#what-is-shared-and-what-is-not) promised
+Redis prevented. `auth.KeyLimiter` is now the seam, `rstate.KeyLimiter` the
+shared implementation, and the two counters live in separate keyspaces so a key
+hash and a deployment id cannot draw on one window.
 
 ### ✅ Metrics have no build info
 

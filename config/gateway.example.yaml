@@ -215,10 +215,13 @@ virtual_keys:
 # If Redis becomes unreachable the gateway keeps serving with per-instance
 # limits rather than failing requests, and says so loudly in the logs and on
 # /health/readiness.
-# redis:
-#   addr: localhost:6379
-#   key_prefix: ai-gateway
-#   timeout: 250ms
+#
+# An empty addr disables sharing, so this stays a single-instance gateway until
+# REDIS_ADDR names a server. deploy/docker-compose.yml sets it.
+redis:
+  addr: ${REDIS_ADDR:-}
+  key_prefix: ai-gateway
+  timeout: 250ms
 
 # Serve an identical request from a stored response instead of calling the
 # provider again.

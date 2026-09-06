@@ -112,6 +112,11 @@ func run() error {
 		}
 		state = shared
 		ledger = rstate.NewLedger(shared, localLedger, cfg.Redis.KeyPrefix, log, cfg.Redis.Timeout)
+		// A virtual key's own rpm/tpm allowance is shared for the same reason
+		// a deployment's is: counted per process, it is multiplied by the
+		// replica count, and a key limited to 60 requests a minute gets 180
+		// across three instances.
+		authn.UseKeyLimiter(shared.KeyLimiter())
 	}
 
 	// A shared cache means a hit on one instance serves them all; a local cache

@@ -119,6 +119,21 @@ unchanged, and translation is the opposite of that.
 - **[docs/prompt-caching.md](docs/prompt-caching.md)** — keeping the provider's prompt cache hittable behind a load balancer
 - **[docs/roadmap.md](docs/roadmap.md)** — what is not built, and what is unverified
 
+## Running more than one instance
+
+Every limit the gateway enforces — a deployment's `rpm`, a key's `rpm_limit`, a
+key's budget — is counted per process until several instances share one Redis.
+`deploy/docker-compose.yml` wires up two gateways against one Redis so that
+arrangement can actually be run:
+
+```bash
+cp config/gateway.example.yaml config/gateway.yaml   # then edit it
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+See [docs/observability.md](docs/observability.md#running-more-than-one-instance)
+for what is shared and what stays local.
+
 ## Development
 
 ```bash
