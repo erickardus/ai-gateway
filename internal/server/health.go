@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"slices"
@@ -110,16 +111,13 @@ type deploymentHealth struct {
 	InFlight   int    `json:"in_flight"`
 }
 
-// handleHealth reports per-deployment status. It never includes credentials,
-// but it does disclose the upstream topology — hostnames, auth modes and which
-// deployments are currently ejected — so it requires a valid key. Orchestrator
-// probes should use /health/liveliness, which is unauthenticated by design.
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	if _, err := s.auth.Authenticate(ctx, r.Header); err != nil {
-		s.fail(w, r, err)
-		return
-	}
+// deploymentRows gathers every deployment's current state, sorted by ID, with a
+// count of those not cooling down.
+//
+// It is separate from handleHealth because the admin UI reports the same state
+// on its overview alongside things /health does not carry, and two code paths
+// answering "is this deployment ejected" would eventually answer differently.
+func (s *Server) deploymentRows(ctx context.Context) ([]deploymentHealth, int) {
 	groups := s.router.Groups()
 	rows := make([]deploymentHealth, 0)
 	healthy := 0
@@ -141,6 +139,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	slices.SortFunc(rows, func(a, b deploymentHealth) int { return strings.Compare(a.Deployment, b.Deployment) })
+	return rows, healthy
+}
+
+// handleHealth reports per-deployment status. It never includes credentials,
+// but it does disclose the upstream topology — hostnames, auth modes and which
+// deployments are currently ejected — so it requires a valid key. Orchestrator
+// probes should use /health/liveliness, which is unauthenticated by design.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if _, err := s.auth.Authenticate(ctx, r.Header); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	rows, healthy := s.deploymentRows(ctx)
 
 	code := http.StatusOK
 	overall := "healthy"

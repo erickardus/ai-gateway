@@ -17,10 +17,12 @@ import (
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/metrics"
+	"github.com/erickardus/ai-gateway/internal/reqlog"
 	"github.com/erickardus/ai-gateway/internal/router"
 	"github.com/erickardus/ai-gateway/internal/rstate"
 	"github.com/erickardus/ai-gateway/internal/spend"
 	"github.com/erickardus/ai-gateway/internal/sso"
+	"github.com/erickardus/ai-gateway/internal/ui"
 )
 
 // Server wires the gateway's dependencies to its HTTP handlers.
@@ -37,6 +39,14 @@ type Server struct {
 	shared *rstate.Store
 	// cache is nil when response caching is disabled.
 	cache cache.Cache
+	// uiSessions is nil unless the admin UI is enabled; see UseUI. Its absence
+	// is what leaves the /ui routes unregistered, in the same way the SSO
+	// provider's does.
+	uiSessions *ui.Sessions
+	// traffic holds recent completed requests for the UI's traffic view. It is
+	// always present and answers Enabled() for itself, so the recording path
+	// needs no nil check on the hot side of a request.
+	traffic *reqlog.Ring
 	// sso and ssoState are nil unless SSO is configured; see UseSSO. Their
 	// absence is what leaves the /sso/* routes unregistered.
 	sso      *sso.Provider
@@ -113,7 +123,20 @@ func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr
 		ledger: ledger, metrics: reg, pricing: pricing, shared: shared, cache: responses,
 		pinnable:          pinnable,
 		marksOpenAIPrefix: marksOpenAIPrefix,
+		traffic:           newTrafficRing(cfg),
 	}
+}
+
+// newTrafficRing sizes the recent-request buffer.
+//
+// A gateway with no UI keeps no records: the buffer exists to be read by the
+// traffic page, and retaining request metadata that nothing can display would
+// be memory spent on nothing.
+func newTrafficRing(cfg *config.Config) *reqlog.Ring {
+	if !cfg.UI.Enabled {
+		return reqlog.NewRing(0)
+	}
+	return reqlog.NewRing(cfg.UI.RequestLog())
 }
 
 // worthPinning reports whether pinning a prefix inside this group can change
@@ -188,8 +211,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /health/liveness", s.handleLiveliness)
 	mux.HandleFunc("GET /health/readiness", s.handleReadiness)
 
-	// SSO, when an identity provider is configured. These are the only routes
-	// a browser reaches, and the only ones no gateway credential guards: the
+	// SSO, when an identity provider is configured. Along with the admin UI's
+	// sign-in these are the only routes a browser reaches, and the only ones no
+	// gateway credential guards: the
 	// whole point is to issue the credential a caller does not yet have. What
 	// stands in for one is the provider's own authentication, the single-use
 	// state and code, and the client's PKCE verifier.
@@ -204,7 +228,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /key/generate", s.handleKeyGenerate)
 	mux.HandleFunc("GET /key/info", s.handleKeyInfo)
 	mux.HandleFunc("GET /key/list", s.handleKeyList)
+	mux.HandleFunc("POST /key/update", s.handleKeyUpdate)
 	mux.HandleFunc("POST /key/delete", s.handleKeyDelete)
+
+	// The admin UI, when enabled. It is registered last because it is the only
+	// thing here that is not part of the gateway's API surface.
+	s.registerUI(mux)
 
 	return s.withMiddleware(mux)
 }

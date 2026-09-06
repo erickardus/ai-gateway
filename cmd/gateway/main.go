@@ -27,6 +27,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/server"
 	"github.com/erickardus/ai-gateway/internal/spend"
 	"github.com/erickardus/ai-gateway/internal/sso"
+	"github.com/erickardus/ai-gateway/internal/ui"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -199,6 +200,16 @@ func run() error {
 	}
 
 	gw := server.New(cfg, authn, store, rtr, log, ledger, reg, shared, responses)
+
+	if cfg.UI.Enabled {
+		sessions, err := ui.NewSessions(cfg.VirtualKeys.MasterKey, cfg.UI.SessionTTL)
+		if err != nil {
+			return fmt.Errorf("initialize admin ui: %w", err)
+		}
+		gw.UseUI(sessions)
+		log.Info("admin ui enabled", "path", "/ui",
+			"session_ttl", cfg.UI.SessionTTL, "request_log_size", cfg.UI.RequestLog())
+	}
 
 	// SSO, when an identity provider is configured. Pending logins go to Redis
 	// wherever it is available: a login leaves for the provider and comes back

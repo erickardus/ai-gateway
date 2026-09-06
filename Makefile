@@ -3,11 +3,24 @@ PKG    := ./...
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 .PHONY: all
-all: vet test build
+all: vet test ui build
 
 .PHONY: build
 build:
 	go build -ldflags "-X main.version=$(VERSION)" -o $(BINARY) ./cmd/gateway
+
+# The admin UI is a Vite build embedded into the binary by internal/ui. It is a
+# separate target rather than a prerequisite of build so that a Go-only change
+# does not need node installed; a binary built without it serves a page saying
+# to run this.
+.PHONY: ui
+ui:
+	cd web && npm ci && npm run build
+
+# Serves the UI with hot reload against a gateway already running on :4000.
+.PHONY: ui-dev
+ui-dev:
+	cd web && npm run dev
 
 .PHONY: run
 run: build
@@ -60,4 +73,5 @@ docker:
 
 .PHONY: clean
 clean:
-	rm -rf bin coverage.out
+	rm -rf bin coverage.out web/node_modules
+	find internal/ui/dist -mindepth 1 ! -name .gitkeep -delete

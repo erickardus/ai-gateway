@@ -8,6 +8,7 @@ import (
 
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/metrics"
+	"github.com/erickardus/ai-gateway/internal/reqlog"
 	"github.com/erickardus/ai-gateway/internal/spend"
 )
 
@@ -35,6 +36,10 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w, r) {
 		return
 	}
+	s.cachePurge(w, r)
+}
+
+func (s *Server) cachePurge(w http.ResponseWriter, r *http.Request) {
 	if err := s.cache.Purge(r.Context()); err != nil {
 		s.fail(w, r, err)
 		return
@@ -150,7 +155,53 @@ func (s *Server) record(r *http.Request, obs observation) {
 		}
 	}
 
+	s.recordTraffic(r, obs, cost, savings, pricing.billable)
 	s.metrics.Observe(obs.toResult(cost, discount, premium))
+}
+
+// recordTraffic keeps one completed request for the UI's traffic view.
+//
+// It sits beside the ledger write rather than anywhere else on the request path
+// because this is the only point where the routing decision, the usage and the
+// resulting cost are all known at once. Everything it stores is metadata the
+// gateway already holds; nothing is read from a body.
+func (s *Server) recordTraffic(r *http.Request, obs observation, cost, savings float64, billable bool) {
+	if !s.traffic.Enabled() {
+		return
+	}
+	scope := ""
+	if len(obs.scopes) > 0 {
+		// Innermost first, so the first entry is the project or team the key
+		// actually sits in rather than the organisation above it.
+		scope = obs.scopes[0]
+	}
+	s.traffic.Add(reqlog.Record{
+		ID:              RequestIDFrom(r.Context()),
+		At:              time.Now().UTC(),
+		KeyAlias:        obs.keyAlias,
+		SpendSubject:    obs.keyHash,
+		Scope:           scope,
+		ModelGroup:      obs.model,
+		Deployment:      obs.deployment,
+		Format:          string(obs.format),
+		Streaming:       obs.streaming,
+		Outcome:         obs.outcome,
+		RejectReason:    obs.rejectReason,
+		StatusClass:     obs.statusClass,
+		Retries:         obs.retries,
+		Fallbacks:       obs.fallbacks,
+		PromptAffinity:  obs.promptAffinity,
+		Usage:           reqlog.UsageOf(obs.usage),
+		Cost:            cost,
+		Billable:        billable,
+		CacheSavings:    savings,
+		LatencyMS:       float64(obs.latency.Microseconds()) / 1000,
+		TTFTMS:          float64(obs.timeToFirstToken.Microseconds()) / 1000,
+		StreamCompleted: obs.streamCompleted,
+		ThroughputTPS:   obs.throughput,
+		RequestBytes:    obs.requestBytes,
+		ResponseBytes:   obs.responseBytes,
+	})
 }
 
 // recordTimeout bounds accounting so a wedged store cannot pin a handler open

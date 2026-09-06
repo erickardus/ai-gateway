@@ -59,11 +59,13 @@ func (c *Config) Validate() error {
 		{"prompt_cache.affinity_ttl", c.PromptCache.AffinityTTL},
 		{"observability.otlp.interval", c.Observability.OTLP.Interval},
 		{"observability.otlp.timeout", c.Observability.OTLP.Timeout},
+		{"ui.session_ttl", c.UI.SessionTTL},
 	} {
 		if d.value < 0 {
 			errs = append(errs, fmt.Errorf("%s: must not be negative, got %s", d.path, d.value))
 		}
 	}
+	errs = append(errs, validateUI(c)...)
 	errs = append(errs, validateOTLP(c.Observability.OTLP)...)
 	errs = append(errs, validateSSO(c)...)
 	errs = append(errs, validateRBAC(c)...)
@@ -865,6 +867,27 @@ func validateRBAC(c *Config) []error {
 	}
 	for i, r := range c.SSO.Roles {
 		check(fmt.Sprintf("sso.roles[%d].scope", i), r.Scope)
+	}
+	return errs
+}
+
+// validateUI checks the admin UI's configuration.
+//
+// The only hard requirement is a master key. The UI signs an operator in by
+// checking one against the configured master key and handing back a session
+// cookie, so a UI enabled without one is a sign-in page nobody can pass —
+// which is worth refusing at load rather than discovering in a browser.
+func validateUI(c *Config) []error {
+	if !c.UI.Enabled {
+		return nil
+	}
+	var errs []error
+	if c.UI.RequestLog() < 0 {
+		errs = append(errs, fmt.Errorf("ui.request_log_size: must be >= 0, got %d", c.UI.RequestLog()))
+	}
+	if c.VirtualKeys.MasterKey == "" {
+		errs = append(errs, errors.New(
+			"ui.enabled: requires virtual_keys.master_key, since signing in to the UI means presenting it"))
 	}
 	return errs
 }

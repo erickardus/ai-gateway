@@ -332,6 +332,26 @@ prompt_cache:
   # messages together, since the conversation is cached too.
   inject_min_bytes: 4096
 
+# The admin console, served from this binary at /ui.
+#
+# It is off by default. The console lists every key, everyone signed in and what
+# they spent, so it is an operator surface rather than something to expose
+# alongside the inference API by omission. Enabling it requires a master key:
+# signing in means presenting one, and the session it issues is scoped to /ui so
+# the browser never attaches it to an inference request.
+ui:
+  enabled: false
+  # How long a browser session lives. Short, because the session stands in for
+  # the master key — anything the cookie can do, the master key can do. The
+  # expiry is signed into the token rather than left to the cookie's Max-Age,
+  # which is the browser's to decide.
+  session_ttl: 12h
+  # How many recently completed requests the console's traffic view can show.
+  # Metadata only — no request or response body is ever retained — and held in
+  # the process that served the traffic, so a fleet behind a load balancer shows
+  # each instance its own slice rather than the whole. 0 keeps none.
+  request_log_size: 1000
+
 observability:
   log_level: info
   # text | json

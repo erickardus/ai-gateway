@@ -71,6 +71,18 @@ rbac:
           budget_duration: 720h
 ```
 
+Watch what the gateway is doing from a browser, rather than from curl — see
+**[docs/admin-ui.md](docs/admin-ui.md)**:
+
+```yaml
+ui:
+  enabled: true
+```
+
+```bash
+make ui && make build     # the console is a separate build step
+```
+
 Then point Claude Code at it:
 
 ```bash
@@ -92,10 +104,11 @@ claude    # /login → "Claude account with subscription"
 | `GET /health` | Per-deployment status and the active strategy. Requires a key: it discloses upstream hosts. |
 | `GET /health/liveliness`, `/health/readiness` | Probes, unauthenticated. |
 | `GET /sso/login`, `GET /sso/callback`, `POST /sso/exchange`, `POST /sso/renew` | SSO login, when `sso.issuer` is configured. Issues a virtual key from an OpenID Connect identity. |
-| `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | Key management, master-key only. |
+| `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/update`, `POST /key/delete` | Key management, master-key only. `update` edits a key in place, so blocking or re-budgeting one keeps the hash its spend is addressed by. |
 | `GET /spend/keys`, `GET /spend/scopes`, `GET /spend/deployments` | Usage and cost reports, master-key only. `/spend/scopes` reports each team's pooled spend. |
 | `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. The same metrics push to an OpenTelemetry collector when `observability.otlp.endpoint` is set. |
 | `POST /cache/purge` | Empty the response cache, master-key only. |
+| `GET /ui/`, `/ui/api/*` | The admin console, when `ui.enabled`. A browser session, never a virtual key. |
 
 ## Scope
 
@@ -127,7 +140,8 @@ interface waiting for it.
 | Guardrails | ⏳ |
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
 | Multi-instance shared state (Redis) | ✅ |
-| Admin UI, MCP gateway | ⏳ |
+| Admin UI — health, traffic, keys, spend, budgets | ✅ |
+| MCP gateway | ⏳ |
 
 There is **no cross-format translation** in v1: an Anthropic ingress routes only
 to `anthropic` deployments, an OpenAI ingress only to `openai` ones. That is a
@@ -144,6 +158,7 @@ would take.
 - **[docs/sso.md](docs/sso.md)** — one command to sign a developer in and configure Claude Code
 - **[docs/configuration.md](docs/configuration.md)** — every config key, endpoint and status code
 - **[docs/routing.md](docs/routing.md)** — strategies, retries, cooldowns, fallbacks
+- **[docs/admin-ui.md](docs/admin-ui.md)** — the operator console, and how its session stays out of the inference plane
 - **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics, response caching
 - **[docs/prompt-caching.md](docs/prompt-caching.md)** — keeping the provider's prompt cache hittable behind a load balancer
 - **[docs/roadmap.md](docs/roadmap.md)** — what is not built, and what is unverified
@@ -170,5 +185,11 @@ make test     # go test -race ./...
 make vet
 make cover
 make fuzz     # fuzz the JSON splicer
+make ui       # build the admin console into internal/ui/dist
+make ui-dev   # serve it with hot reload against a gateway on :4000
 make docker
 ```
+
+`make build` deliberately does not depend on `make ui`, so a Go-only change does
+not need node installed. A binary built without the console serves a page saying
+which command to run; inference is unaffected.

@@ -22,6 +22,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/router"
 	"github.com/erickardus/ai-gateway/internal/spend"
 	"github.com/erickardus/ai-gateway/internal/testutil"
+	"github.com/erickardus/ai-gateway/internal/ui"
 )
 
 const testVirtualKey = "sk-vk-TESTKEY"
@@ -123,6 +124,9 @@ type harnessOpts struct {
 	// traffic in one group — which is the arrangement a per-deployment body
 	// transform exists to serve.
 	extraAuthMode core.AuthMode
+	// ui enables the admin console, which requires a master key: signing in
+	// means presenting one.
+	ui bool
 	// upstreams, when set, gives each deployment its own handler — the first
 	// entry serves the primary deployment and the rest serve the extras. It is
 	// what lets a test model several independent providers, each holding its
@@ -252,6 +256,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		},
 		RBAC: opts.rbac,
 	}
+	cfg.UI.Enabled = opts.ui
 	cfg.Observability.Metrics = true
 	cfg.Observability.StreamUsage = opts.streamUsage
 	if opts.maxBudget > 0 {
@@ -297,6 +302,13 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	}
 
 	srv := New(cfg, authn, store, rtr, log, ledger, reg, nil, responses)
+	if opts.ui {
+		sessions, err := ui.NewSessions(cfg.VirtualKeys.MasterKey, cfg.UI.SessionTTL)
+		if err != nil {
+			t.Fatalf("ui.NewSessions: %v", err)
+		}
+		srv.UseUI(sessions)
+	}
 	ids := make([]string, 0, len(cfg.ModelList))
 	for i := range cfg.ModelList {
 		ids = append(ids, cfg.ModelList[i].ID())
