@@ -25,6 +25,7 @@ type Config struct {
 	PromptCache   PromptCacheConfig   `yaml:"prompt_cache"`
 	SSO           SSOConfig           `yaml:"sso"`
 	RBAC          RBACConfig          `yaml:"rbac"`
+	UI            UIConfig            `yaml:"ui"`
 
 	// scopes is the flattened hierarchy, resolved once at load. Keyed by fully
 	// qualified id, with Parent pointers already wired.
@@ -615,4 +616,39 @@ func (c *Config) Groups() map[string][]*Deployment {
 		out[d.ModelName] = append(out[d.ModelName], d)
 	}
 	return out
+}
+
+// UIConfig controls the admin UI the gateway serves from its own binary.
+//
+// It is off by default, and deliberately so. The UI answers the operator's
+// questions — who is signed in, what did they spend, revoke this person — and
+// answering them means one page that lists every key and every developer. A
+// gateway whose whole job is to stand in front of an inference API should not
+// grow a browser-shaped surface as well unless its operator asked for one.
+type UIConfig struct {
+	// Enabled mounts the UI at /ui and its API at /ui/api.
+	Enabled bool `yaml:"enabled"`
+	// RequestLogSize is how many recently completed requests the gateway keeps
+	// in memory for the UI's traffic view. Zero keeps none.
+	//
+	// The buffer holds metadata only — never a request or response body — and
+	// lives in the process that served the traffic, so a fleet behind a load
+	// balancer shows each instance its own slice rather than the whole.
+	RequestLogSize *int `yaml:"request_log_size"`
+	// SessionTTL is how long a browser session lives before the operator signs
+	// in again.
+	//
+	// It is short because the session stands in for the master key: anything
+	// the cookie can do, the master key can do. Its expiry is signed into the
+	// token rather than left to the cookie's own Max-Age, which the browser
+	// holding it decides.
+	SessionTTL time.Duration `yaml:"session_ttl"`
+}
+
+// RequestLog is how many recent requests to retain, with the default applied.
+func (u UIConfig) RequestLog() int {
+	if u.RequestLogSize == nil {
+		return DefaultUIRequestLogSize
+	}
+	return *u.RequestLogSize
 }

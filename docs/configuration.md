@@ -397,6 +397,56 @@ one snapshot, so they cannot disagree about a number. See
 silent, so a collector sidecar that configures everything else in a fleet
 configures this too.
 
+## `ui`
+
+The admin console, served from the gateway's own binary at `/ui`. Off by
+default.
+
+| Key | Default | Notes |
+|---|---|---|
+| `enabled` | `false` | Mounts `/ui` and `/ui/api`. Requires `virtual_keys.master_key`. |
+| `session_ttl` | `12h` | How long a browser session lives. |
+| `request_log_size` | `1000` | Recent requests kept for the traffic view. `0` keeps none. |
+
+Enabling it without a master key is refused at load: signing in means presenting
+one, so a console without it is a sign-in page nobody can pass.
+
+The session is a signed token carrying its own expiry, held in a cookie scoped
+to `Path=/ui`. That scope is load-bearing rather than tidy — a cookie the
+browser also attached to `POST /v1/messages` would be a session riding along on
+every inference request a page could be tricked into making, which is the
+credential collision this gateway exists to avoid wearing a different hat.
+`auth.ExtractGatewayKey` reads headers only, so nothing on the inference path
+can read a cookie even if one arrived.
+
+The signing key is derived from the master key, so every instance verifies every
+other's sessions without sharing any state — the arrangement
+`deploy/docker-compose.yml` runs, where a session held in one process's memory
+would sign the operator out on every second request. The cost of statelessness
+is that a session cannot be revoked before it expires, which is why the TTL is
+short; rotating the master key invalidates all of them at once.
+
+Mutating requests must carry an `x-gateway-ui` header. `SameSite=Strict` is the
+first defence and this is the second: SameSite is a browser policy, while a
+header a cross-site form post cannot set is a property of the request itself.
+
+`request_log_size` bounds an in-memory ring of completed requests — metadata
+only, never a request or response body. It lives in the process that served the
+traffic, so a fleet behind a load balancer shows each instance its own slice
+rather than the whole, and the console says so rather than implying otherwise.
+Unauthenticated refusals are counted in the metrics but deliberately not kept:
+they are decided before any credential is verified, so recording them would let
+anyone able to open a socket evict the buffer.
+
+The console is built separately from the binary:
+
+```bash
+make ui && make build
+```
+
+A binary built without it serves a page saying so; the gateway proxies inference
+normally either way.
+
 ## Endpoints
 
 | Endpoint | Auth |
@@ -411,9 +461,23 @@ configures this too.
 | `GET /sso/login`, `GET /sso/callback` | none — the identity provider, plus a single-use state. Registered only when `sso.issuer` is set |
 | `POST /sso/exchange` | none — a single-use code and the client's PKCE verifier |
 | `POST /sso/renew` | the provider's refresh token |
-| `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | master key |
+| `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/update`, `POST /key/delete` | master key |
 | `GET /spend/keys`, `GET /spend/scopes`, `GET /spend/deployments` | master key |
 | `POST /cache/purge` | master key |
+| `GET /ui/`, `POST /ui/api/session` | none — the sign-in page and the exchange itself. Registered only when `ui.enabled` |
+| `GET|POST /ui/api/*` | the browser session, plus `x-gateway-ui` on anything that changes state |
+
+`POST /key/update` edits a stored key in place. Every field is optional and an
+omitted one is left alone, so a partial update cannot silently reset what it did
+not mention; an empty `duration` or `budget_duration` clears that window. It
+exists because revoke-and-reissue is not equivalent: a key's hash is what its
+spend, its budget window and its rate-limit counters are addressed by, so
+replacing a key to raise its budget resets the window it was spending against
+and hands its holder a new secret to install everywhere.
+
+Blocking is therefore distinct from deleting. A blocked key stops spending but
+keeps answering "what did this cost"; a deleted one takes its ledger entry with
+it.
 
 ## Error responses
 

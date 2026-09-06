@@ -37,6 +37,18 @@ jobs:
             exit 1
           fi
 
+      # The admin console is typechecked and built here rather than only in the
+      # Docker image, so a broken front end fails the same push a broken
+      # handler would. The Go build embeds whatever this produces.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the admin UI
+        run: make ui
+
       - name: Vet
         run: go vet ./...
 

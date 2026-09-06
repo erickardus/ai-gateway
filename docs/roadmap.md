@@ -459,12 +459,64 @@ provisioned can usually front it with an OIDC-speaking broker.
 `memory` and `file` only. `file` is single-node: two instances with the same path
 will clobber each other. `auth.KeyStore` is ready for Postgres.
 
-### 🔴 Admin UI
+### ✅ Admin UI
 
-Everything is config plus the `/key/*` and `/spend/*` endpoints. SSO removes the
-usual reason to want one — a developer no longer needs a page to mint a key
-from — but not the operator's reason: there is still no way to see who is
-signed in, or to revoke someone, without curl.
+There was no way to see who was signed in, or to revoke someone, without curl.
+
+Built as a Vite + React console embedded into the binary and served at `/ui`,
+off by default. Seven pages: health, per-request traffic, keys, the three spend
+ledgers, deployments, the RBAC tree and an ops page. `POST /key/update` came
+with it, so blocking or re-budgeting a key is an edit rather than a
+revoke-and-reissue that would reset the window its spend accumulates in.
+
+The load-bearing decision is that the browser session is a third credential
+plane, not a reuse of the first. Its cookie is scoped to `Path=/ui` so the
+browser never attaches it to `/v1/messages`, and the console has its own API
+under `/ui/api` rather than reusing the master-key endpoints — an endpoint
+outside `/ui` is one the cookie cannot reach. See
+[admin-ui.md](admin-ui.md#why-a-third-credential-plane).
+
+Two gaps found while building it, both fixed: the scope ledger is keyed by
+`Scope.SpendSubject()` rather than the bare id, so the first version of the
+organisations page reported every pool as having spent nothing; and throughput
+was measured on unstreamed replies, where the interval after the "first chunk"
+is the time to write one buffer, reporting millions of tokens per second into a
+histogram whose largest bucket is 1000.
+
+### 🔴 The console signs in with the master key, not SSO
+
+`ui.enabled` accepts one credential: the master key, typed into a form. That is
+the most powerful credential the gateway has, and a page that asks for it is a
+page that can be imitated.
+
+Three things narrow it — the session is short-lived, the cookie cannot reach the
+inference plane, and the key is never written anywhere the browser can read back
+— but the real fix is to sign the operator in through the identity provider that
+already exists. The OIDC flow is built; what is missing is a browser variant of
+it that sets a session cookie instead of returning a key to a CLI, and a role
+that grants console access. Until then the form should stay behind an operator's
+deliberate `enabled: true`.
+
+### 🔴 The console has no history, so it has no charts
+
+The ledger holds current-window totals only, so every figure the console shows
+is a number rather than a line. "Spend is $40" cannot be read as rising or
+falling, which is the question an operator actually has.
+
+The traffic ring is not the answer: it is a fixed thousand requests in one
+process, sized for reading rather than archiving. Charting needs the same thing
+[No spend history](#-no-spend-history) needs — time-bucketed rollups behind
+`spend.Store` — after which the console is a rendering problem rather than a
+data one.
+
+### 🟡 Sign-in is not rate limited
+
+`POST /ui/api/session` compares the presented master key in constant time and
+logs a refusal, but nothing throttles attempts. A master key is 32 bytes of
+entropy, so this is not a guessing risk; it is an unbounded log-writing and
+hashing endpoint reachable by anyone who can open a socket, which is the same
+gap [the SSO endpoints](#-the-sso-endpoints-are-not-rate-limited) have and wants
+the same fix.
 
 ### 🔴 MCP gateway, batches, embeddings, audio
 
@@ -494,7 +546,11 @@ than that it serves.
 ### 🔴 No structured audit log
 
 Access logs carry the key alias, model and outcome, but there is no separate
-tamper-evident audit stream.
+tamper-evident audit stream. The admin console widens this: minting, blocking
+and deleting a key are now things that happen from a browser, and the only
+record is an ordinary log line saying a key changed — not who was signed in when
+it did. Every console session is the master key, so there is nobody to name yet;
+that changes the day it signs in through the identity provider.
 
 ### ✅ Per-key rate limits were enforced per instance
 

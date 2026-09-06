@@ -4,3 +4,9 @@ coverage.out
 data/
 config/gateway.yaml
 *.test
+
+# The admin UI is a build output. A .gitkeep is tracked so that `go:embed
+# all:dist` compiles on a clean checkout, where `make ui` has not run yet.
+internal/ui/dist/*
+!internal/ui/dist/.gitkeep
+web/node_modules/

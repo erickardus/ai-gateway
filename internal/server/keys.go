@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -62,7 +63,16 @@ func (s *Server) handleKeyGenerate(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w, r) {
 		return
 	}
+	s.keyGenerate(w, r)
+}
 
+// keyGenerate is handleKeyGenerate without the gate.
+//
+// The management handlers are split this way because the admin UI reaches the
+// same operations through a browser session rather than a master-key header.
+// Two callers, one authorization question each, and one implementation of the
+// work — the alternative is a second set of handlers that drifts.
+func (s *Server) keyGenerate(w http.ResponseWriter, r *http.Request) {
 	var req generateRequest
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -151,6 +161,10 @@ func (s *Server) handleKeyInfo(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w, r) {
 		return
 	}
+	s.keyInfo(w, r)
+}
+
+func (s *Server) keyInfo(w http.ResponseWriter, r *http.Request) {
 	hash := r.URL.Query().Get("hash")
 	if hash == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "the \"hash\" query parameter is required")
@@ -170,6 +184,10 @@ func (s *Server) handleKeyList(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w, r) {
 		return
 	}
+	s.keyList(w, r)
+}
+
+func (s *Server) keyList(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.store.List(r.Context())
 	if err != nil {
 		s.fail(w, r, err)
@@ -184,6 +202,10 @@ func (s *Server) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w, r) {
 		return
 	}
+	s.keyDelete(w, r)
+}
+
+func (s *Server) keyDelete(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Hash string `json:"hash"`
 	}
@@ -208,3 +230,172 @@ func (s *Server) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "hash": req.Hash})
 }
+
+// updateRequest is the body of POST /key/update.
+//
+// Every editable field is a pointer, so an omitted field means "leave this
+// alone" and a present one means "set it to exactly this". A plain struct
+// cannot express that difference: zero is a meaningful value for every one of
+// these — an empty models list, an unlimited rpm, a cleared budget — and a
+// partial update built on zero values would silently reset whatever the caller
+// did not mention.
+type updateRequest struct {
+	Hash             string    `json:"hash"`
+	Alias            *string   `json:"alias"`
+	Models           *[]string `json:"models"`
+	RPMLimit         *int      `json:"rpm_limit"`
+	TPMLimit         *int      `json:"tpm_limit"`
+	AllowPassthrough *bool     `json:"allow_passthrough"`
+	// Blocked disables a key without deleting it, which is the difference
+	// between suspending someone and losing their spend history: a deleted key
+	// takes its ledger entry with it, a blocked one keeps answering "what did
+	// this cost" while refusing to spend more.
+	Blocked   *bool    `json:"blocked"`
+	MaxBudget *float64 `json:"max_budget"`
+	// BudgetDuration and Duration are Go duration strings. An empty string
+	// clears the window and the expiry respectively, which is how a key is made
+	// permanent again after having been given a lifetime.
+	BudgetDuration *string `json:"budget_duration"`
+	Duration       *string `json:"duration"`
+	Scope          *string `json:"scope"`
+}
+
+// handleKeyUpdate edits a stored key in place.
+//
+// It exists because revoke-and-reissue is not an equivalent: a key's hash is
+// what its spend, its budget window and its rate-limit counters are addressed
+// by, so replacing a key to raise its budget resets the window it was spending
+// against and hands its holder a new secret to install everywhere. Blocking,
+// re-budgeting and re-scoping are all edits to a credential that stays the
+// same credential.
+func (s *Server) handleKeyUpdate(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w, r) {
+		return
+	}
+	s.keyUpdate(w, r)
+}
+
+func (s *Server) keyUpdate(w http.ResponseWriter, r *http.Request) {
+	var req updateRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
+		return
+	}
+	if req.Hash == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "a \"hash\" field is required")
+		return
+	}
+
+	key, err := s.store.Get(r.Context(), req.Hash)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found_error", "no such key")
+		return
+	}
+
+	// Edit a copy. The store hands back a pointer into its own state, and
+	// mutating that before the request has been validated would leave a
+	// rejected update half applied.
+	updated := *key
+
+	if req.Alias != nil {
+		updated.Alias = *req.Alias
+	}
+	if req.Models != nil {
+		updated.Models = *req.Models
+	}
+	if req.RPMLimit != nil {
+		if *req.RPMLimit < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "rpm_limit must not be negative")
+			return
+		}
+		updated.RPMLimit = *req.RPMLimit
+	}
+	if req.TPMLimit != nil {
+		if *req.TPMLimit < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "tpm_limit must not be negative")
+			return
+		}
+		updated.TPMLimit = *req.TPMLimit
+	}
+	if req.AllowPassthrough != nil {
+		updated.AllowPassthrough = *req.AllowPassthrough
+	}
+	if req.Blocked != nil {
+		updated.Blocked = *req.Blocked
+	}
+	if req.MaxBudget != nil {
+		if *req.MaxBudget < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "max_budget must not be negative")
+			return
+		}
+		updated.MaxBudget = *req.MaxBudget
+	}
+	if req.BudgetDuration != nil {
+		d, err := parseOptionalDuration(*req.BudgetDuration)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error",
+				"budget_duration must be empty or a positive Go duration string, for example \"720h\"")
+			return
+		}
+		updated.BudgetDuration = d
+	}
+	// Checked against the merged key rather than the request, so raising a
+	// budget to zero on a key that already has a window is refused for the same
+	// reason setting both at once would be.
+	if updated.BudgetDuration > 0 && updated.MaxBudget == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error",
+			"budget_duration requires max_budget; a window with no cap limits nothing")
+		return
+	}
+	if req.Duration != nil {
+		d, err := parseOptionalDuration(*req.Duration)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error",
+				"duration must be empty or a positive Go duration string, for example \"720h\"")
+			return
+		}
+		if d == 0 {
+			updated.ExpiresAt = nil
+		} else {
+			// Measured from now, not from the key's creation: an operator
+			// extending a key means "another 30 days", and dating it from a
+			// creation months ago would silently expire the key they just
+			// renewed.
+			t := time.Now().UTC().Add(d)
+			updated.ExpiresAt = &t
+		}
+	}
+	if req.Scope != nil {
+		if *req.Scope != "" && s.cfg.Scope(*req.Scope) == nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error",
+				"scope "+strconv.Quote(*req.Scope)+" is not declared under rbac")
+			return
+		}
+		updated.Scope = *req.Scope
+	}
+
+	if err := s.store.Put(r.Context(), &updated); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	s.log.Info("virtual key updated", "alias", updated.Alias, "hash", updated.Hash,
+		"blocked", updated.Blocked, "request_id", RequestIDFrom(r.Context()))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(&updated)
+}
+
+// parseOptionalDuration reads a Go duration string in which the empty string
+// means "none" and anything non-positive is an error.
+func parseOptionalDuration(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, errNotAPositiveDuration
+	}
+	return d, nil
+}
+
+var errNotAPositiveDuration = errors.New("not a positive duration")

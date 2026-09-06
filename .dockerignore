@@ -2,5 +2,7 @@
 .github
 bin
 data
+web/node_modules
+internal/ui/dist
 coverage.out
 *.md

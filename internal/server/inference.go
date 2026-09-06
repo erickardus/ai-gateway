@@ -56,7 +56,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	authCtx, err := s.auth.Authenticate(ctx, r.Header)
 	if err != nil {
-		s.reject(r, &obs, "unauthenticated", started)
+		s.reject(r, &obs, rejectUnauthenticated, started)
 		s.fail(w, r, err)
 		return
 	}
@@ -124,6 +124,11 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 			s.metrics.RecordResponseCache(fields.Model, metrics.OutcomeHit)
 			s.serveFromCache(w, entry, fields.Model, format)
 			s.metrics.Observe(obs.toResult(0, 0, 0))
+			// recordTraffic rather than record: a hit is a served request and
+			// belongs in the traffic view, but obs.deployment is the sentinel
+			// "cache" and record would take that for a real upstream and write
+			// a ledger entry for an answer nobody was billed for.
+			s.recordTraffic(r, obs, 0, 0, false)
 			return
 		}
 		s.metrics.RecordResponseCache(fields.Model, metrics.OutcomeMiss)
@@ -286,7 +291,13 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// Throughput is measured after the first chunk so it describes generation
 	// rather than the queueing that preceded it — the two move independently,
 	// and averaging them together hides both.
-	if !relayed.FirstChunkAt.IsZero() && usage.OutputTokens > 0 {
+	//
+	// Only for a streamed reply. A single-shot response's "first chunk" is its
+	// whole body, so the interval after it is the time to write one buffer —
+	// microseconds — and dividing output tokens by that reports millions of
+	// tokens per second into a histogram whose largest bucket is 1000. One such
+	// observation moves p99 permanently.
+	if obs.streaming && !relayed.FirstChunkAt.IsZero() && usage.OutputTokens > 0 {
 		if generating := time.Since(relayed.FirstChunkAt).Seconds(); generating > 0 {
 			obs.throughput = float64(usage.OutputTokens) / generating
 		}
@@ -350,12 +361,35 @@ func (s *Server) promptPrefix(format core.Format, fields jsonx.Fields, inference
 
 // reject records a request refused before dispatch. Such a request consumed no
 // upstream capacity, so it carries a reason rather than a deployment.
+//
+// It does not go through record: there is no spend to account for, and a ledger
+// entry with no deployment would be a charge against a request that never made
+// one. It does reach the traffic buffer, because a refusal is the thing an
+// operator most often needs to see one of — a budget exhausted, a key blocked, a
+// model that is not in the group they think it is — and the counter that already
+// tallies rejections cannot say whose.
 func (s *Server) reject(r *http.Request, obs *observation, reason string, started time.Time) {
 	obs.outcome = metrics.OutcomeRejected
 	obs.rejectReason = reason
 	obs.latency = time.Since(started)
 	s.metrics.Observe(obs.toResult(0, 0, 0))
+
+	// An unauthenticated refusal is counted but not kept.
+	//
+	// It is the one rejection decided before any credential is verified, so it
+	// is reachable by anyone who can open a socket — and the ring is a fixed
+	// thousand entries shared with the traffic an operator opened the page to
+	// read. Recording it would let an anonymous client evict the whole buffer
+	// in well under a second. The rejection counter still tallies these by
+	// reason, so the signal survives; only the per-request record does not.
+	if reason != rejectUnauthenticated {
+		s.recordTraffic(r, *obs, 0, 0, false)
+	}
 }
+
+// rejectUnauthenticated names the refusal that precedes authentication, and so
+// precedes knowing who to attribute it to.
+const rejectUnauthenticated = "unauthenticated"
 
 // readBody reads the request body under the configured size limit.
 func (s *Server) readBody(r *http.Request) ([]byte, error) {

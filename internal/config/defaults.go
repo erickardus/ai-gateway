@@ -37,6 +37,17 @@ const (
 	// DefaultSpendFlushInterval paces persistence of the spend ledger.
 	DefaultSpendFlushInterval = 30 * time.Second
 
+	// DefaultUISessionTTL is one working day, so an operator signs in once in
+	// the morning rather than every hour, and a browser left open overnight is
+	// signed out by the time nobody is watching it.
+	DefaultUISessionTTL = 12 * time.Hour
+
+	// DefaultUIRequestLogSize is a few minutes of history on a busy gateway and
+	// a few days on a quiet one, for roughly a megabyte of memory. It is sized
+	// for reading rather than for archiving: anything that needs to outlive the
+	// process belongs in the access log.
+	DefaultUIRequestLogSize = 1000
+
 	// DefaultOTLPInterval matches the OpenTelemetry SDK's own default export
 	// interval, so a collector sees this gateway arrive at the same cadence as
 	// everything else pointed at it.
@@ -233,6 +244,10 @@ func (c *Config) applyDefaults() {
 	}
 	if c.PromptCache.InjectMinBytes == 0 {
 		c.PromptCache.InjectMinBytes = DefaultInjectMinBytes
+	}
+
+	if c.UI.SessionTTL == 0 {
+		c.UI.SessionTTL = DefaultUISessionTTL
 	}
 }
 

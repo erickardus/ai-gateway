@@ -418,6 +418,19 @@ Spend and metrics are recorded together at a single place in the request path,
 because both want the same facts: which key, which deployment, what usage, what
 outcome, how long. Measuring twice would let the two drift apart.
 
+## Recent requests
+
+Metrics and the spend ledger both aggregate, and most questions an operator asks
+about a gateway are about one request: why did this call fall back, did that
+conversation hit the prompt cache it warmed, which deployment served the request
+that took nine seconds.
+
+The admin console keeps the last `ui.request_log_size` completed requests in
+memory and answers those. It holds metadata only — never a request or response
+body — and lives in the process that served the traffic, so it is a debugging
+view rather than an archive. Anything that must outlive the process belongs in
+the access log. See [admin-ui.md](admin-ui.md#the-traffic-buffer).
+
 ## Running more than one instance
 
 By default every replica keeps its own counters, so a `rpm: 100` limit across

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/otlp"
+	"github.com/erickardus/ai-gateway/internal/reqlog"
 )
 
 // scrape renders the harness's registry.
@@ -341,5 +343,33 @@ func TestScrapeAndExportCarryTheSameMetrics(t *testing.T) {
 		if !bytes.Contains(export, []byte(f.Name)) {
 			t.Errorf("metric %q is in the snapshot but not in the OTLP export", f.Name)
 		}
+	}
+}
+
+// Throughput describes generation, so it is measured only where generation was
+// observable: a streamed reply. A single-shot response's "first chunk" is its
+// whole body, and the interval after it is the time to write one buffer — which
+// divided into the output tokens reports millions of tokens per second, into a
+// histogram whose largest bucket is 1000. One such observation moves p99 for
+// the life of the process.
+func TestThroughputIsNotMeasuredOnUnstreamedReplies(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", masterKey: testMasterKey, ui: true})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"anthropic-claude","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-gateway-key", testVirtualKey)
+	if rec := h.do(t, req); rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	records := h.srv.traffic.Recent(1, reqlog.Filter{})
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	if got := records[0].ThroughputTPS; got != 0 {
+		t.Fatalf("throughput = %v tok/s on an unstreamed reply, want 0", got)
+	}
+	if records[0].Usage.OutputTokens == 0 {
+		t.Fatal("the reply reported no output tokens, so this proves nothing")
 	}
 }

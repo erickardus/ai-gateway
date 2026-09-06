@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/erickardus/ai-gateway/internal/auth"
+	"github.com/erickardus/ai-gateway/internal/core"
 )
 
 // A key minted at runtime must be able to carry a budget.
@@ -105,4 +108,104 @@ func TestGeneratedKeyAcceptsALifetimeBudget(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("/key/generate = %d, body = %s", rec.Code, rec.Body.String())
 	}
+}
+
+// A key's hash is what its spend, its budget window and its rate-limit counters
+// are addressed by, so raising a budget must be an edit rather than a
+// revoke-and-reissue — which would reset the window it was spending against and
+// hand its holder a new secret to install everywhere.
+func TestKeyUpdatePreservesIdentity(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", masterKey: testMasterKey, maxBudget: 0.01})
+
+	before := h.keyInfo(t, auth.HashKey(testVirtualKey))
+	body := `{"hash":"` + auth.HashKey(testVirtualKey) + `","max_budget":5,"alias":"renamed"}`
+	req := httptest.NewRequest(http.MethodPost, "/key/update", strings.NewReader(body))
+	req.Header.Set("x-gateway-key", testMasterKey)
+	rec := h.do(t, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	after := h.keyInfo(t, auth.HashKey(testVirtualKey))
+	if after.Hash != before.Hash {
+		t.Fatalf("hash changed from %q to %q", before.Hash, after.Hash)
+	}
+	if after.MaxBudget != 5 || after.Alias != "renamed" {
+		t.Fatalf("update did not apply: %+v", after)
+	}
+	if !after.CreatedAt.Equal(before.CreatedAt) {
+		t.Fatal("update rewrote the creation time")
+	}
+}
+
+// Omitted fields must be left alone. A partial update built on zero values
+// would silently reset whatever the caller did not mention.
+func TestKeyUpdateLeavesOmittedFieldsAlone(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", masterKey: testMasterKey, rpmLimit: 42})
+
+	body := `{"hash":"` + auth.HashKey(testVirtualKey) + `","blocked":true}`
+	req := httptest.NewRequest(http.MethodPost, "/key/update", strings.NewReader(body))
+	req.Header.Set("x-gateway-key", testMasterKey)
+	if rec := h.do(t, req); rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	after := h.keyInfo(t, auth.HashKey(testVirtualKey))
+	if !after.Blocked {
+		t.Fatal("blocked was not applied")
+	}
+	if after.RPMLimit != 42 {
+		t.Fatalf("rpm_limit = %d, want the untouched 42", after.RPMLimit)
+	}
+	if after.Alias != "test-key" {
+		t.Fatalf("alias = %q, want the untouched test-key", after.Alias)
+	}
+}
+
+// The window-without-a-cap rule is checked against the merged key, not the
+// request: clearing a budget on a key that already has a window has to be
+// refused for the same reason setting both at once is.
+func TestKeyUpdateRefusesAWindowWithNoCap(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", masterKey: testMasterKey})
+
+	set := `{"hash":"` + auth.HashKey(testVirtualKey) + `","max_budget":5,"budget_duration":"720h"}`
+	req := httptest.NewRequest(http.MethodPost, "/key/update", strings.NewReader(set))
+	req.Header.Set("x-gateway-key", testMasterKey)
+	if rec := h.do(t, req); rec.Code != http.StatusOK {
+		t.Fatalf("setting a budget: status %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	clear := `{"hash":"` + auth.HashKey(testVirtualKey) + `","max_budget":0}`
+	req = httptest.NewRequest(http.MethodPost, "/key/update", strings.NewReader(clear))
+	req.Header.Set("x-gateway-key", testMasterKey)
+	rec := h.do(t, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("clearing the cap but not the window: status %d, want 400", rec.Code)
+	}
+}
+
+func TestKeyUpdateRequiresTheMasterKey(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", masterKey: testMasterKey})
+	body := `{"hash":"` + auth.HashKey(testVirtualKey) + `","blocked":true}`
+	req := httptest.NewRequest(http.MethodPost, "/key/update", strings.NewReader(body))
+	req.Header.Set("x-gateway-key", testVirtualKey)
+	if rec := h.do(t, req); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d, want 401", rec.Code)
+	}
+}
+
+// keyInfo reads one key's stored metadata through the management endpoint.
+func (h *harness) keyInfo(t *testing.T, hash string) core.Key {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/key/info?hash="+hash, nil)
+	req.Header.Set("x-gateway-key", testMasterKey)
+	rec := h.do(t, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("key info: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	var key core.Key
+	if err := json.Unmarshal(rec.Body.Bytes(), &key); err != nil {
+		t.Fatalf("decode key: %v", err)
+	}
+	return key
 }
