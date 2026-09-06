@@ -66,38 +66,6 @@ status ≥400 into an error, so the branch is unreachable today. It stays as
 defence in depth. A mutation test cannot currently reach it, and the code says
 so rather than looking covered.
 
-### 🟡 Breakpoint injection is refused alongside passthrough
-
-`prompt_cache.inject` rewrites the request body to mark a cacheable prefix. The
-passthrough path must forward a body unchanged, so configuration refuses the two
-together rather than letting subscription traffic be quietly rewritten. A gateway
-fronting both Claude Code and plain API callers therefore cannot use injection
-at all today, even for the callers that would benefit.
-
-The seam is a per-deployment body rewrite: `provider.Request` would carry the
-transform rather than a finished body, and `Client.Do` would apply it only for
-deployments whose auth mode permits it. That means the router can no longer
-assume one set of bytes per request, which touches retry, fallback and the
-response-cache key, so it was not worth doing before the feature had users.
-
-Claude Code places its own breakpoints, so nothing is lost on the traffic this
-gateway primarily carries.
-
-### 🟡 A deployment that refuses an annotation is retried, not remembered
-
-Injection marks three positions, one of which — the top-level `cache_control`
-field — is not accepted everywhere; the legacy Bedrock integration rejects it.
-An upstream answering `400` to an annotated body is retried once with the
-request as it arrived, so the caller never loses a request, and the deployment
-is named in the log.
-
-The round trip is paid on **every** request until an operator acts on that line.
-Remembering the rejection per deployment would avoid it, but injection is decided
-before the router picks one, so the body would have to be annotated per attempt
-rather than per request — the same per-deployment body transform the entry above
-wants. Until then the log line is the mechanism, which is why it names the
-setting to unset rather than just reporting the status.
-
 ### 🟡 A declared one-hour cache is read from the prefix only
 
 A pin lives as long as the cache entry it points at, so a request declaring the
@@ -144,8 +112,9 @@ below its minimum rather than rejecting it.
 
 The gap is an operator on a small model who leaves the default and gets
 breakpoints the provider ignores. [prompt-caching.md](prompt-caching.md#cache-breakpoints)
-says to raise it; a per-deployment minimum would say it for them, and wants the
-same per-deployment body rewrite that injection alongside passthrough does.
+says to raise it; a per-deployment minimum would say it for them. The
+per-deployment body transform it wanted now exists, so the remaining work is a
+`prompt_cache_min_bytes` on `DeploymentParams` read by the annotator.
 
 ### 🟡 Injected breakpoints are always ephemeral, and always in the same three places
 
@@ -164,7 +133,8 @@ identify structurally; an index into a message array is a shape only the caller
 knows.
 
 Both would become reasonable alongside a per-deployment or per-key injection
-policy, which is the same seam as above.
+policy. The per-deployment half of that seam now exists; a per-key one would
+have to reach the annotator from the auth context.
 
 ### 🟡 Savings do not say which breakpoints earned them
 
@@ -261,17 +231,18 @@ It is that this one is optional where that one is the difference between a bill
 and a zero: an OpenAI-*compatible* server strict about unknown fields would 400
 rather than ignore it, and the same risk buys much less.
 
-The same objection covers OpenAI's explicit `prompt_cache_breakpoint` marker,
-which is the newer of the two and narrower still: it applies to a handful of
-models, and on the rest of an OpenAI-compatible fleet caching is automatic and
-needs no marker at all.
-
-Both edits happen before routing, so the response-cache key is taken from the
-body as it arrived and every retry and fallback attempt sends the same bytes.
-A per-deployment transform carried on `provider.Request` and applied by
-`Client.Do` is still what a field worth varying per upstream would want. Prefix
+The plumbing is now in place. `provider.Request` carries an `Annotator` rather
+than a finished body, and `Client.Do` derives what one deployment receives at
+dispatch, so a field worth varying per upstream has somewhere to be decided —
+and an upstream that refuses it is remembered rather than re-asked. Prefix
 affinity already gives the gateway the fingerprint such a key would be derived
-from, so the work is the plumbing rather than the value.
+from, so what remains is choosing the key, not carrying it.
+
+The same seam covers OpenAI's explicit `prompt_cache_breakpoint` marker, which
+LiteLLM does send on `gpt-5.6` and later. It is narrower: it applies to a
+handful of models, and on the rest of an OpenAI-compatible fleet caching is
+automatic and needs no marker at all. Sending it wants a per-model capability
+check of the kind the cost map already holds.
 
 ### 🔴 No cache-hit-rate signal per prefix
 
@@ -360,6 +331,7 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Pin lifetime | follows the declared cache TTL | a five-minute pin on a one-hour entry pays the long tier's premium a second time |
 | `cache_savings` | net of the write premium | a gross figure cannot report that caching is costing money, which is what scattering looks like |
 | Injected breakpoints | tools, system **and** the conversation | marking only the static prefix re-reads a growing history at full price every turn |
+| An upstream that refuses an annotation | retried without it, then not annotated again | LiteLLM strips `cache_control` ahead of time per provider from a static rule and never retries, so an upstream that refuses for a reason not in that rule costs the caller their request |
 | Passthrough cost | not billed to the operator | it is billed to the caller's subscription |
 
 ---

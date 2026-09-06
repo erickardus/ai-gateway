@@ -307,8 +307,9 @@ the accounting is missing, and nothing else would ever mention it.
 
 **Breakpoint injection does not apply.** `cache_control` is an Anthropic
 construct, caching on an OpenAI-compatible provider is automatic, and there is
-nothing for the gateway to mark. Configuration refuses `inject` alongside an
-`openai` deployment rather than silently doing nothing to it.
+nothing for the gateway to mark. An `openai` deployment is simply never sent a
+breakpoint, whatever `inject` says; configuration refuses the setting only where
+*no* deployment in the fleet could carry one.
 
 What the gateway does not yet do is pass OpenAI's `prompt_cache_key`, which
 biases that provider's own cache routing for callers sending the same prefix at
@@ -420,44 +421,80 @@ The top-level field additionally goes only to `/v1/messages`. Token counting
 takes the same body and answers a different question, so asking it to cache the
 conversation is at best inert.
 
+### The body is decided per deployment
+
+Everything above is something the gateway adds for its own benefit; the caller
+asked for none of it. Whether an upstream will take it is a fact about that
+upstream rather than about the request, so the decision is made once routing has
+chosen one — at dispatch, beside the model rewrite that was always per
+deployment.
+
+| Deployment | What it is sent |
+|---|---|
+| passthrough | the caller's bytes, untouched |
+| `anthropic`, api-key | breakpoints, per this page |
+| `openai`, api-key | `stream_options.include_usage` on a streamed request |
+| one that has refused an annotation | the caller's bytes, untouched |
+
+**A passthrough deployment is never annotated.** It forwards the caller's own
+credential to an upstream that bills their subscription, and its body must
+arrive as they sent it: Anthropic's gateway rules require it, and the endpoint
+strips Claude Code's system-prompt attribution block positionally, which only
+works on an array that was not spliced.
+
+Standing down per deployment rather than refusing at load is what lets one
+gateway front both kinds of traffic. Injection alongside passthrough used to
+fail configuration outright, because a single body fixed before routing had to
+suit every deployment in the group — so an operator running Claude Code and
+plain API callers through one gateway had to choose which half to serve
+properly. Now the subscription traffic is forwarded verbatim and the API traffic
+gets its breakpoints, in the same model group.
+
+What configuration still refuses is `inject` on a fleet where **no** deployment
+could carry a breakpoint — every deployment passthrough, or none of them
+`anthropic`. That is a setting that says one thing and does nothing, which is
+refused for the same reason [a partial cost model
+is](configuration.md#a-partial-cost-model-is-refused-at-load).
+
 ### When an upstream refuses an annotation
 
-Every marker above is something the gateway added for its own benefit; the
-caller asked for none of it. Which shapes a breakpoint may legally hang on
-differs between providers and changes over time — the legacy Bedrock
-integration, for one, rejects the top-level field outright — so a wrong guess
-must not cost the request.
+Which shapes a breakpoint may legally hang on differs between providers and
+changes over time — the legacy Bedrock integration, for one, rejects the
+top-level field outright — so a wrong guess must not cost the request.
 
 An upstream answering `400` to an annotated body gets one more attempt with the
-request exactly as it arrived, and the deployment is named once in the log:
+request exactly as it arrived. If that is accepted, the annotation was the cause:
+the deployment is named once in the log and **is not annotated again**.
 
 ```
-upstream rejected an annotated request; retrying without the annotation costs a
-round trip on every request until it is turned off
-  deployment=… remedy=unset prompt_cache.inject or observability.stream_usage
+upstream rejected an annotated request, so this deployment will not be annotated
+again
+  deployment=… cost=one round trip, paid once per deployment per process
 ```
 
-The retry applies to any body the gateway annotated, the streamed-usage field
-included. A `400` the caller earned is still relayed to them, wording intact —
-it just costs one extra round trip to establish that it was theirs.
+Remembering is the point. The retry alone serves the request, so nothing errors
+and nothing is lost except a round trip — paid on *every* request, for as long
+as the deployment is configured, which is a doubling of upstream calls visible
+only as latency. It could not be remembered while the body was fixed before
+routing, because nothing then knew which deployment had refused.
+
+**A `400` the caller earned is not a refusal.** It fails the plain body too, so
+the annotation is only blamed once removing it is shown to help. Without that
+rule one malformed request would switch prompt caching off for every other
+caller of that deployment, silently and until a restart. The caller still gets
+their own error, wording intact; it just costs one extra round trip to establish
+that it was theirs.
+
+The memory is per process rather than persisted. What an upstream accepts can
+change with a release in either direction, and a restart is the cheapest way to
+re-ask: it costs one round trip on one request.
+
+The whole arrangement applies to any body the gateway annotated, the
+streamed-usage field included.
 
 A string `system` prompt has nowhere to hang a breakpoint, so it is promoted to
 the single text block the API defines it to equal. The original string's bytes
 are reused verbatim rather than decoded and re-encoded.
-
-### Why it is refused alongside passthrough
-
-**Configuration fails at load if `inject` is on while any passthrough deployment
-exists.** Injection edits the request body. The passthrough path exists to
-forward a body unchanged: Anthropic's gateway rules require it, and the endpoint
-strips Claude Code's system-prompt attribution block positionally, which only
-works when the array arrives exactly as sent.
-
-This is a real limitation, not a technicality — a gateway fronting both Claude
-Code and plain API callers cannot use injection today. It is refused at load
-rather than left to surprise an operator whose subscription traffic quietly
-starts being rewritten. [roadmap.md](roadmap.md) records the seam that would
-lift it.
 
 Everything the gateway does edit, it edits by splicing rather than re-encoding.
 A body run through a JSON decoder and back reorders object keys and renormalizes
@@ -658,6 +695,9 @@ than on mechanism:
 | `TestInjectionCachesTheConversationToo` | a growing conversation re-read at full price behind a breakpoint that only covers tools and system |
 | `TestInjectionOnlyMarksAToolItUnderstands` | a breakpoint hung on a server tool or an MCP toolset, whose accepted shape the gateway cannot check |
 | `TestAnUpstreamThatRefusesAnAnnotationStillServesTheRequest` | a caller losing a request over an optimization it never asked for |
+| `TestInjectionMarksOnlyTheDeploymentsThatCanTakeIt` | a subscription body rewritten, or an API caller left uncached, because one fleet holds both |
+| `TestARefusedAnnotationIsNotAskedForAgain` | an upstream's refusal rediscovered on every request, doubling its call count for as long as it is configured |
+| `TestACallersOwnBadRequestLeavesAnnotationOn` | one malformed request switching prompt caching off for every other caller of a deployment |
 | `TestAPinOutlivesTheCacheItPointsAt` | a five-minute pin on a one-hour cache, which pays the long tier's premium twice |
 | `TestPromptCacheCostConsumesABudget` | a budget that prices only input and output, letting a key run indefinitely on the tokens it costs most for |
 | `TestAFailedAttemptIsNotBilled` | a retry billed twice, or billed to the deployment that failed rather than the one whose cache is now warm |

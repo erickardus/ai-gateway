@@ -106,6 +106,11 @@ type harnessOpts struct {
 	// streamUsage overrides observability.stream_usage, which decides whether a
 	// streamed OpenAI-compatible request is asked to report any usage at all.
 	streamUsage *bool
+	// extraAuthMode gives the extra deployments a different auth mode from the
+	// first. It is what builds a mixed fleet — subscription traffic beside API
+	// traffic in one group — which is the arrangement a per-deployment body
+	// transform exists to serve.
+	extraAuthMode core.AuthMode
 	// upstreams, when set, gives each deployment its own handler — the first
 	// entry serves the primary deployment and the rest serve the extras. It is
 	// what lets a test model several independent providers, each holding its
@@ -189,6 +194,14 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		t.Cleanup(extra.Close)
 		extraParams := params
 		extraParams.APIBase = extra.URL
+		if opts.extraAuthMode != "" {
+			extraParams.AuthMode = opts.extraAuthMode
+			if opts.extraAuthMode == core.AuthModePassthrough {
+				// A passthrough deployment relays the caller's own credential,
+				// so it must carry none of its own.
+				extraParams.AuthHeader, extraParams.AuthScheme, extraParams.APIKey = "", "", ""
+			}
+		}
 		deployments = append(deployments, config.Deployment{
 			ModelName: opts.modelGroup(), Params: extraParams, Weight: intPtr(1),
 		})
@@ -198,9 +211,11 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 			ModelName: soloModel, Params: params, Weight: intPtr(1),
 		})
 	}
-	if mode == "api_key" {
-		// Priced so cost accounting has something to compute.
-		for i := range deployments {
+	// Priced so cost accounting has something to compute. Asked per deployment
+	// rather than per fleet: a passthrough deployment bills the caller's own
+	// subscription, so a cost model on one is refused at load.
+	for i := range deployments {
+		if deployments[i].Params.AuthMode == core.AuthModeAPIKey {
 			deployments[i].Cost = opts.defaultPricing()
 		}
 	}

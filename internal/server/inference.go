@@ -20,11 +20,6 @@ import (
 	"github.com/erickardus/ai-gateway/internal/router"
 )
 
-// streamUsageOptions is what a streamed OpenAI-compatible request needs in order
-// to be billed at all. The field is inert on a non-streamed request, which is
-// why it is only ever added to one that asked to stream.
-var streamUsageOptions = []byte(`{"include_usage":true}`)
-
 // pathMessages is Anthropic's inference endpoint, and pathCountTokens the
 // endpoint that takes the same body to answer a different question. Both are
 // served by serveInference below, and two of the things it does — asking the
@@ -154,74 +149,32 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		body = stripped
 	}
 
-	// Everything below annotates the request for the gateway's own benefit
-	// rather than the caller's. The body as it stood before is kept so a request
-	// an upstream rejects because of an annotation can be served without it: the
-	// shapes a breakpoint or a stream option may legally be attached to differ
-	// between providers and change over time, and a gateway that guessed wrong
-	// would otherwise turn an optimization into a failed request.
-	unannotated := body
-	annotated := false
-
-	// Ask an OpenAI-compatible upstream to report usage on a streamed reply.
-	// Without stream_options.include_usage the final chunk carries no usage at
-	// all, so the request is billed as nothing: no cost, no budget charge, no
-	// rate-limit tokens, and a prompt cache whose reads are invisible. A caller
-	// that set stream_options itself is left alone — AddMember reports the
-	// member already present and changes no byte — since it has said what it
-	// wants and the gateway's accounting is not worth overriding it for.
-	if format == core.FormatOpenAI && fields.Stream && s.cfg.Observability.StreamUsageEnabled() {
-		asked, added, err := jsonx.AddMember(body, "stream_options", streamUsageOptions)
-		if err != nil {
-			// As with injection below: a request the gateway could not annotate
-			// is forwarded as it arrived rather than refused.
-			s.log.Warn("stream usage request skipped", "error", err, "request_id", RequestIDFrom(ctx))
-		} else if added {
-			body, annotated = asked, true
-		}
-	}
-
-	// Mark the cacheable prefix last, once every gateway directive has been
-	// stripped: injection edits the body, and editing one that is about to
-	// change again would place a breakpoint against bytes the upstream never
-	// sees. Configuration refuses injection alongside any passthrough
-	// deployment, so no rewritten body can reach the path that must forward one
-	// unchanged.
-	if s.cfg.PromptCache.Inject && format == core.FormatAnthropic {
-		// The top-level breakpoint is Anthropic's automatic caching, a field of
-		// the Messages request. Token counting takes the same body but answers a
-		// different question, and asking it to cache anything is at best inert,
-		// so only the inference path carries it.
-		injected, changed, err := promptcache.Inject(body, s.cfg.PromptCache.InjectMinBytes, upstreamPath == pathMessages)
-		if err != nil {
-			// The request is forwarded exactly as it arrived. An optimization
-			// that could not be applied is not a reason to refuse a request.
-			s.log.Warn("prompt cache injection skipped", "error", err, "request_id", RequestIDFrom(ctx))
-		} else if changed {
-			body, annotated = injected, true
-		}
-	}
-
+	// Body is now the request as the caller wrote it, less the gateway
+	// directives that must never reach an upstream. Everything the gateway adds
+	// for its own benefit — a cache breakpoint so there is something to cache, a
+	// usage option so a streamed reply can be billed — is added per deployment
+	// instead, once routing has chosen one.
+	//
+	// It has to be. Which annotation an upstream will take is a fact about that
+	// upstream: a passthrough deployment must receive the caller's bytes
+	// untouched, breakpoints are an Anthropic construct, and a server may simply
+	// refuse a field it does not recognize. Deciding here, where the group is
+	// still a set of candidates, would mean annotating all of them or none.
 	req := &provider.Request{
-		Path:   upstreamPath,
-		Query:  r.URL.RawQuery,
-		Body:   body,
-		Format: format,
-		Header: r.Header,
-		Creds:  authCtx.Credentials,
-		Stream: fields.Stream,
+		Path:     upstreamPath,
+		Query:    r.URL.RawQuery,
+		Body:     body,
+		Annotate: s.annotatorFor(format, fields.Stream, upstreamPath == pathMessages, RequestIDFrom(ctx)),
+		Format:   format,
+		Header:   r.Header,
+		Creds:    authCtx.Credentials,
+		Stream:   fields.Stream,
 	}
 
+	// An upstream that refuses an annotated body is retried with the request as
+	// it arrived by the attempt that annotated it, which is the only place that
+	// knows which deployment refused and can stop annotating it.
 	result, err := s.router.Route(ctx, fields.Model, req, overrides)
-	if err != nil && annotated && rejectedAsBadRequest(err) {
-		// An upstream that refuses the annotated body is refusing something the
-		// caller never asked for, so it gets one more chance with the request as
-		// it arrived. Anything still failing is the caller's own 400 and is
-		// relayed as such.
-		s.warnAnnotationRejected(err)
-		req.Body = unannotated
-		result, err = s.router.Route(ctx, fields.Model, req, overrides)
-	}
 	if err != nil {
 		obs.outcome = metrics.OutcomeGateway
 		var upstream *core.UpstreamError
@@ -470,32 +423,3 @@ func writeError(w http.ResponseWriter, status int, kind, message string) {
 
 // authHeaderNames is used by the key endpoints to find a presented credential.
 func (s *Server) authHeaderNames() []string { return s.auth.HeaderNames() }
-
-// rejectedAsBadRequest reports whether an upstream refused the request outright,
-// which is the answer an annotation it does not accept produces.
-func rejectedAsBadRequest(err error) bool {
-	var upstream *core.UpstreamError
-	return errors.As(err, &upstream) && upstream.StatusCode == http.StatusBadRequest
-}
-
-// warnAnnotationRejected reports, once per deployment, that an upstream refused
-// a body the gateway had annotated.
-//
-// The request itself is retried without the annotation, so nothing is lost but
-// one round trip — and that round trip is paid on every request until the
-// configuration changes, which is why it is worth a line naming the deployment.
-// The likely causes are an upstream that predates automatic caching, such as the
-// legacy Bedrock integration, or an OpenAI-compatible server strict about fields
-// it does not recognize.
-func (s *Server) warnAnnotationRejected(err error) {
-	var upstream *core.UpstreamError
-	if !errors.As(err, &upstream) {
-		return
-	}
-	if _, seen := s.rejectedAnnotation.LoadOrStore(upstream.Deployment, true); seen {
-		return
-	}
-	s.log.Warn("upstream rejected an annotated request; retrying without the annotation costs a round trip on every request until it is turned off",
-		"deployment", upstream.Deployment,
-		"remedy", "unset prompt_cache.inject or observability.stream_usage for this deployment's group")
-}

@@ -196,13 +196,19 @@ The **provider's** cache of a request's leading tokens, as distinct from
 | `inject` | `false` | Place cache breakpoints on an Anthropic request that carries none of its own: the tools, the system prompt, and the top-level field that caches the conversation. |
 | `inject_min_bytes` | `4096` | Prompts smaller than this are left unmarked; a provider would ignore the breakpoint anyway. Measured over tools, system **and** messages, since the conversation is cached too. |
 
-`inject: true` is **refused at load** while any passthrough deployment exists,
-and while any deployment speaks a format other than `anthropic`. Injection edits
-the request body, and passthrough exists to forward one unchanged.
+Which deployments a breakpoint reaches is decided per deployment, at dispatch. A
+passthrough deployment is never annotated — it must forward the caller's body
+unchanged — and neither is one speaking a format other than `anthropic`, so a
+mixed fleet serves both halves correctly: the API deployments get breakpoints
+and the subscription traffic is forwarded verbatim.
+
+`inject: true` is **refused at load** only where *no* deployment could carry a
+breakpoint, which is a setting that says one thing and does nothing.
 
 An upstream that answers `400` to an annotated body is retried once with the
-request as it arrived, and named in the log. See
-[prompt-caching.md](prompt-caching.md#when-an-upstream-refuses-an-annotation).
+request as it arrived. Where that succeeds the deployment is named in the log and
+is not annotated again, so the round trip is paid once rather than per request.
+See [prompt-caching.md](prompt-caching.md#when-an-upstream-refuses-an-annotation).
 
 ## `observability`
 

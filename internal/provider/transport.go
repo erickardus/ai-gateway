@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,6 +22,36 @@ import (
 // relay, so a misbehaving upstream cannot exhaust memory on the error path.
 const maxErrorBodyBytes = 1 << 20
 
+// Annotator supplies the body one deployment should receive.
+//
+// The gateway annotates a request for its own benefit — a cache breakpoint so
+// there is something to cache, a usage option so the reply can be billed — and
+// the caller asked for none of it. Which of those an upstream will take is a
+// fact about that upstream rather than about the request: a passthrough
+// deployment must receive the caller's bytes untouched, breakpoints are an
+// Anthropic construct, the usage option belongs only to an OpenAI-compatible
+// server, and any upstream may simply refuse a field it does not know.
+//
+// So the decision belongs here, after routing has chosen a deployment, rather
+// than to one body fixed before anything knew where the request was going. One
+// body for every attempt is what forces the choice between annotating a
+// passthrough deployment and annotating nothing at all.
+type Annotator interface {
+	// Annotate returns the body to send to dep, and whether it differs from the
+	// one that arrived.
+	//
+	// It returns base unchanged rather than an error when it cannot annotate:
+	// an optimization that could not be applied is never a reason to refuse a
+	// request.
+	Annotate(dep *config.Deployment, base []byte) (body []byte, annotated bool)
+	// Refused reports that dep rejected an annotation this Annotator added.
+	//
+	// It is called only once that is established — the annotated body was
+	// refused and the very same request as it arrived was accepted — so a 400
+	// the caller earned, which fails both bodies, is never reported through it.
+	Refused(dep *config.Deployment)
+}
+
 // Request is one attempt at an upstream call, independent of which deployment
 // eventually serves it.
 type Request struct {
@@ -28,7 +59,14 @@ type Request struct {
 	// separately so routing can match on path alone.
 	Path  string
 	Query string
-	Body  []byte
+	// Body is the request as the caller sent it, less any gateway directive
+	// that must not reach an upstream. It is never mutated: every attempt,
+	// retry and fallback hop starts from these same bytes, and whatever one
+	// deployment is sent is derived from them by Annotate.
+	Body []byte
+	// Annotate, when set, produces the body for the deployment an attempt
+	// actually reaches. Nil means every deployment is sent Body verbatim.
+	Annotate Annotator
 	// Format is the wire protocol the caller spoke. The router only dispatches
 	// to deployments declaring the same format, since the gateway does not
 	// translate between them.
@@ -91,17 +129,59 @@ func NewClient(keyHeaderNames, allowedHosts []string) *Client {
 // headers arrive, leaving the body unread. Separating "headers received" from
 // "body relayed" is what lets the router retry a failed attempt before any bytes
 // have reached the client, and never after.
+//
+// The body this deployment receives is derived here rather than handed down
+// ready-made, so an annotation the gateway adds for its own benefit can be
+// applied to the deployments that take one and withheld from those that do not.
 func (c *Client) Do(ctx context.Context, dep *config.Deployment, req *Request) (*Response, error) {
-	params := dep.Params
-
-	if params.AuthMode == core.AuthModePassthrough {
-		host := config.HostOf(params.APIBase)
+	if dep.Params.AuthMode == core.AuthModePassthrough {
+		host := config.HostOf(dep.Params.APIBase)
 		if host == "" || !c.allowedHosts[host] {
 			return nil, fmt.Errorf("deployment %s targets %q: %w", dep.ID(), host, core.ErrUpstreamHostNotAllowed)
 		}
 	}
 
-	body := req.Body
+	body, annotated := req.Body, false
+	if req.Annotate != nil {
+		body, annotated = req.Annotate.Annotate(dep, req.Body)
+	}
+
+	resp, err := c.dispatch(ctx, dep, req, body)
+	if err == nil || !annotated || !refusedAsBadRequest(err) {
+		return resp, err
+	}
+
+	// The upstream refused something the caller never asked for, so it gets one
+	// more attempt with the request exactly as it arrived. That second answer
+	// settles it either way: accepted, and the annotation was the cause, so this
+	// deployment is not annotated again and the round trip is paid once rather
+	// than on every request; refused again, and the 400 was the caller's own and
+	// is relayed as they wrote it, wording intact.
+	//
+	// Refused is called only on the accepting branch. A 400 the caller earned
+	// fails both bodies, and reading that as "this upstream will not take an
+	// annotation" would let one malformed request switch the optimization off
+	// for every other caller of the deployment.
+	plain, plainErr := c.dispatch(ctx, dep, req, req.Body)
+	if plainErr != nil {
+		return nil, plainErr
+	}
+	req.Annotate.Refused(dep)
+	return plain, nil
+}
+
+// refusedAsBadRequest reports whether an upstream rejected the request outright,
+// which is the answer an annotation it does not accept produces.
+func refusedAsBadRequest(err error) bool {
+	var upstream *core.UpstreamError
+	return errors.As(err, &upstream) && upstream.StatusCode == http.StatusBadRequest
+}
+
+// dispatch sends one body to one deployment. It is separate from Do because the
+// same attempt may send two: the annotated body, and — where that is refused —
+// the request as it arrived.
+func (c *Client) dispatch(ctx context.Context, dep *config.Deployment, req *Request, body []byte) (*Response, error) {
+	params := dep.Params
 	// Rewrite the model only when the upstream's identifier differs from the one
 	// the body actually carries. Comparing against dep.ModelName instead would
 	// skip the rewrite on a fallback hop, where the body still names the

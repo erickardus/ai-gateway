@@ -51,10 +51,12 @@ type Server struct {
 	// streamed request with no usage at all. Like mispriced, it is a fact about
 	// the deployment rather than the request, so it is worth one log line.
 	unmeasured sync.Map
-	// rejectedAnnotation records the deployments already warned about for
-	// refusing a body the gateway annotated. Also once per deployment: it is a
-	// fact about what that upstream accepts.
-	rejectedAnnotation sync.Map
+	// refusesAnnotation records the deployments that have refused a body the
+	// gateway annotated, proved by the same request being served once the
+	// annotation was removed. They are not annotated again: what an upstream
+	// accepts is a fact about that upstream, so the round trip that establishes
+	// it is worth paying once rather than on every request.
+	refusesAnnotation sync.Map
 }
 
 // deploymentPricing is what one deployment costs the operator.

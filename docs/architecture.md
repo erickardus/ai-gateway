@@ -45,10 +45,7 @@ policy, and what may be cached — and each of those is called out below.
         ├─ 8  admit                   charge the key's rate limit
         ├─ 9  fingerprint prefix      hash the part of the body that survives a
         │                             turn, for prompt-cache affinity
-        ├─ 10 mark cacheable prefix   opt-in, Anthropic only, never alongside a
-        │                             passthrough deployment
-        │
-        ├─ 11 route ──────────────────┐
+        ├─ 10 route ──────────────────┐
         │     filter cooldowns        │  retry excludes already-failed
         │     filter passthrough      │  deployments; backoff only when
         │     filter format           │  nothing untried remains
@@ -57,12 +54,15 @@ policy, and what may be cached — and each of those is called out below.
         │     strategy picks          │  a constraint
         │     reserve capacity        │  fallback to another group once the
         │                             │  first is exhausted
-        ├─ 12 relay ──────────────────┘  byte-for-byte, flushed per chunk
-        ├─ 13 store in cache             complete successful responses only
-        └─ 14 record                     spend + metrics, on a detached context
+        │       └─ 10a annotate       │  per deployment, at dispatch: a cache
+        │                             │  breakpoint, a usage option, or nothing
+        │                             │  at all for a passthrough upstream
+        ├─ 11 relay ──────────────────┘  byte-for-byte, flushed per chunk
+        ├─ 12 store in cache             complete successful responses only
+        └─ 13 record                     spend + metrics, on a detached context
 ```
 
-Steps 6 and 14 are where several subtle decisions live; see below.
+Steps 6 and 13 are where several subtle decisions live; see below.
 
 ## Packages
 
@@ -74,7 +74,7 @@ Steps 6 and 14 are where several subtle decisions live; see below.
 | `auth` | Virtual keys, the header-extraction rules, key storage. |
 | `limiter` | Monotonic-window request and token counters. |
 | `router` | Model groups, the four strategies, retries, cooldowns, fallbacks. |
-| `provider` | Upstream transport, the header policy, the SSE relay. |
+| `provider` | Upstream transport, the header policy, the SSE relay, and the per-deployment body an attempt actually sends. |
 | `server` | HTTP surface, middleware, and the single instrumentation point. |
 | `spend` | Usage and cost ledger with windowed budgets. |
 | `metrics` | Prometheus text exposition, hand-rolled. |
@@ -97,6 +97,29 @@ costs 14 allocations rather than ~123,000.
 Duplicate top-level keys are rejected outright. Parsers disagree about which
 occurrence wins, so a body relying on one could be authorized against
 `"model": "allowed"` and executed against a later `"model": "forbidden"`.
+
+### The body is decided per deployment, not per request
+
+The gateway annotates a request for its own benefit — a cache breakpoint so an
+Anthropic upstream has something to cache, `stream_options.include_usage` so a
+streamed OpenAI-compatible reply can be billed at all. Whether an upstream takes
+one is a fact about that upstream, not about the request, so `provider.Request`
+carries the body as it arrived plus an `Annotator`, and `Client.Do` derives what
+one deployment receives at dispatch — beside the model rewrite, which was always
+per deployment.
+
+A passthrough deployment is therefore sent the caller's bytes untouched while an
+API deployment in the same group gets its breakpoints. Fixing one body before
+routing forced the opposite: injection alongside passthrough had to be refused
+at load, so a gateway fronting both Claude Code and plain API callers could
+cache for neither.
+
+It also makes a refusal knowable. An upstream that answers `400` to an annotated
+body is retried with the request as it arrived, and where that succeeds the
+deployment is not annotated again — the round trip is paid once rather than on
+every request. Refusal is recorded only on that succeeding branch, so a `400` the
+caller earned, which fails both bodies, cannot switch the optimization off for
+everyone else.
 
 ### Headers are forwarded as an open list
 

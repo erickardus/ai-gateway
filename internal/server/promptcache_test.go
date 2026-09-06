@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -657,5 +658,162 @@ func TestAnUncachedPrefixIsNotPinned(t *testing.T) {
 	second := h.do(t, claudeCodeRequest("/v1/messages", body))
 	if got := second.Header().Get("x-gateway-prompt-affinity"); got != "new" {
 		t.Errorf("second turn affinity = %q, want new: nothing was cached for a pin to point at", got)
+	}
+}
+
+// TestInjectionMarksOnlyTheDeploymentsThatCanTakeIt is the acceptance test for
+// deciding the body per deployment rather than per request.
+//
+// The fleet is the one this gateway exists for: Claude Code's subscription
+// traffic, which must reach the upstream byte for byte, beside an API-key
+// deployment whose callers place no breakpoints of their own and get no caching
+// without one. A body fixed before routing has to choose between rewriting the
+// subscription request and caching nothing, which is why the two used to be
+// refused at load.
+//
+// What it asserts is that both halves are served correctly at once: every body
+// the API-key upstream saw carries a breakpoint, and every body the passthrough
+// upstream saw is exactly what the caller wrote.
+func TestInjectionMarksOnlyTheDeploymentsThatCanTakeIt(t *testing.T) {
+	var apiKeySeen, passthroughSeen []string
+	var mu sync.Mutex
+	collect := func(into *[]string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			*into = append(*into, string(body))
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"msg_1","type":"message","usage":{"input_tokens":5,"output_tokens":9}}`)
+		}
+	}
+
+	off := false
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		extraDeployments: 1, extraAuthMode: core.AuthModePassthrough,
+		// Affinity would pin this one prompt to whichever deployment served it
+		// first and starve the other, leaving half the assertion unexercised.
+		promptCache: config.PromptCacheConfig{Inject: true, Affinity: &off},
+		upstreams:   []http.HandlerFunc{collect(&apiKeySeen), collect(&passthroughSeen)},
+	})
+
+	for i := 0; i < 12; i++ {
+		rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody(longSystem, fmt.Sprintf("turn %d", i))))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, body = %s", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(apiKeySeen) == 0 || len(passthroughSeen) == 0 {
+		t.Fatalf("api_key saw %d requests and passthrough saw %d: both legs must be exercised for this to mean anything",
+			len(apiKeySeen), len(passthroughSeen))
+	}
+	for i, body := range apiKeySeen {
+		if !strings.Contains(body, "cache_control") {
+			t.Errorf("api_key request %d carried no breakpoint, so this caller pays full price for a prefix it repeats: %s", i, body)
+		}
+	}
+	for i, body := range passthroughSeen {
+		if strings.Contains(body, "cache_control") {
+			t.Errorf("passthrough request %d was rewritten; a subscription body must reach the upstream as the caller sent it: %s", i, body)
+		}
+	}
+}
+
+// TestARefusedAnnotationIsNotAskedForAgain covers what the retry costs when it
+// is the only mechanism.
+//
+// An upstream that will not take an annotation refuses it every time. Retrying
+// without one serves the request, so nothing errors and nothing is lost except a
+// round trip — paid on every request, for as long as the deployment is
+// configured. That is a doubling of upstream calls that shows up only as
+// latency, which is why the answer has to be remembered rather than rediscovered.
+func TestARefusedAnnotationIsNotAskedForAgain(t *testing.T) {
+	var calls atomic.Int64
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		promptCache: config.PromptCacheConfig{Inject: true},
+		upstream: func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			calls.Add(1)
+			if strings.Contains(string(body), "cache_control") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"cache_control: unexpected field"}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"msg_1","type":"message","usage":{"input_tokens":5,"output_tokens":9}}`)
+		},
+	})
+
+	const requests = 4
+	for i := 0; i < requests; i++ {
+		rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody(longSystem, fmt.Sprintf("turn %d", i))))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, body = %s", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	// One request pays two calls to establish that this deployment refuses an
+	// annotation; every request after it pays one.
+	if got, want := calls.Load(), int64(requests+1); got != want {
+		t.Errorf("upstream saw %d calls over %d requests, want %d: the refusal is being rediscovered rather than remembered",
+			got, requests, want)
+	}
+}
+
+// TestACallersOwnBadRequestLeavesAnnotationOn is the guard on the test above.
+//
+// A deployment stops being annotated once it refuses an annotation, so what
+// counts as a refusal has to be narrow. A 400 the caller earned also arrives as
+// a 400 on an annotated body, and reading that as "this upstream refuses
+// breakpoints" would let one malformed request switch prompt caching off for
+// every other caller of that deployment — silently, and until a restart.
+//
+// So the annotation is only blamed once removing it is shown to help: the plain
+// body has to be accepted. Here it is not, and the deployment must still be
+// annotated afterwards.
+func TestACallersOwnBadRequestLeavesAnnotationOn(t *testing.T) {
+	var refusing atomic.Bool
+	refusing.Store(true)
+	var lastBody atomic.Value
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		promptCache: config.PromptCacheConfig{Inject: true},
+		upstream: func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			lastBody.Store(string(body))
+			if refusing.Load() {
+				// Refused whether or not it was annotated, which is what the
+				// caller's own mistake looks like.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: required"}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"msg_1","type":"message","usage":{"input_tokens":5,"output_tokens":9}}`)
+		},
+	})
+
+	rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody(longSystem, "hi")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: the caller's own error must reach them", rec.Code)
+	}
+
+	refusing.Store(false)
+	rec = h.do(t, claudeCodeRequest("/v1/messages", promptBody(longSystem, "hello")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if body, _ := lastBody.Load().(string); !strings.Contains(body, "cache_control") {
+		t.Errorf("one caller's malformed request turned prompt caching off for this deployment: %s", body)
+	}
+	if logs := h.logBuf.String(); strings.Contains(logs, "will not be annotated again") {
+		t.Errorf("a caller's own 400 was recorded as the upstream refusing an annotation:\n%s", logs)
 	}
 }

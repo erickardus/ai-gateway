@@ -115,27 +115,29 @@ func (c *Config) Validate() error {
 	if c.PromptCache.InjectMinBytes < 0 {
 		errs = append(errs, fmt.Errorf("prompt_cache.inject_min_bytes: must be >= 0, got %d", c.PromptCache.InjectMinBytes))
 	}
-	if c.PromptCache.Inject {
-		// Injection edits the request body. The passthrough path exists to
-		// forward a body unchanged — Anthropic's gateway rules require it, and
-		// the endpoint strips Claude Code's attribution block positionally — so
-		// the combination is refused at load rather than left to surprise an
-		// operator whose subscription traffic starts being rewritten.
+	if c.PromptCache.Inject && len(c.ModelList) > 0 {
+		// A breakpoint is only ever placed on an Anthropic deployment that is
+		// not a passthrough one: breakpoints are an Anthropic construct, and a
+		// passthrough deployment must forward the caller's body unchanged, since
+		// Anthropic's gateway rules require it and the endpoint strips Claude
+		// Code's attribution block positionally.
+		//
+		// Both are decided per deployment, at dispatch, so a mixed fleet is
+		// served correctly: the deployments that can take a breakpoint get one
+		// and the rest are sent the request as it arrived. What is refused here
+		// is the fleet where that set is empty, which is a setting that says one
+		// thing and does nothing — the same reason a partial cost model is
+		// refused rather than quietly completed.
+		injectable := 0
 		for i := range c.ModelList {
-			if c.ModelList[i].Params.AuthMode == core.AuthModePassthrough {
-				errs = append(errs, fmt.Errorf(
-					"prompt_cache.inject: cannot be enabled while model_list[%d] is a passthrough deployment; injection rewrites the request body and a passthrough deployment must forward it unchanged",
-					i))
-				break
+			d := &c.ModelList[i]
+			if d.Params.Format == core.FormatAnthropic && d.Params.AuthMode != core.AuthModePassthrough {
+				injectable++
 			}
 		}
-		for i := range c.ModelList {
-			if c.ModelList[i].Params.Format != core.FormatAnthropic {
-				errs = append(errs, fmt.Errorf(
-					"prompt_cache.inject: model_list[%d] speaks %q; cache breakpoints are an Anthropic construct and are only placed on anthropic deployments",
-					i, c.ModelList[i].Params.Format))
-				break
-			}
+		if injectable == 0 {
+			errs = append(errs, errors.New(
+				"prompt_cache.inject: no deployment can carry a cache breakpoint, so this does nothing; breakpoints are placed only on an anthropic deployment that is not a passthrough one, since a passthrough deployment must forward the caller's body unchanged"))
 		}
 	}
 
