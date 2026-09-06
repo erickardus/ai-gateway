@@ -554,4 +554,10 @@ than on mechanism:
 | `TestInjectionOnlyMarksAToolItUnderstands` | a breakpoint hung on a server tool or an MCP toolset, whose accepted shape the gateway cannot check |
 | `TestAnUpstreamThatRefusesAnAnnotationStillServesTheRequest` | a caller losing a request over an optimization it never asked for |
 | `TestAPinOutlivesTheCacheItPointsAt` | a five-minute pin on a one-hour cache, which pays the long tier's premium twice |
+| `TestPromptCacheCostConsumesABudget` | a budget that prices only input and output, letting a key run indefinitely on the tokens it costs most for |
+| `TestAFailedAttemptIsNotBilled` | a retry billed twice, or billed to the deployment that failed rather than the one whose cache is now warm |
+| `TestSpendTotalsCarryBothSignsOfSavings`, `TestSavingsAccumulateWithTheirSign` | a fleet losing money on caching reported as breaking even |
+| `TestNegativeSavingsSurviveRedis`, `TestFilePersistenceCarriesEveryFigure` | a figure that survives one process and not a restart or a second replica |
+| `TestAnUnpricedLongWriteIsReported` | a deployment quietly understating every long write, with nothing to say so |
+| `TestPromptCacheMetricsCarryTheirValues` | a scrape naming the right series with the wrong numbers, which looks like an answer |
 | `TestPricingValidation` | a cost model that would misreport what caching costs, accepted at load |

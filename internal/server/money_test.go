@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/erickardus/ai-gateway/internal/config"
@@ -781,5 +783,228 @@ func TestAWriteNobodyReadsIsReportedAsALoss(t *testing.T) {
 	}
 	if !nearly(rows[0].CacheSavings, want) {
 		t.Errorf("cache savings = %.6f, want %.6f", rows[0].CacheSavings, want)
+	}
+}
+
+// spendMasterKey reaches the master-key-only reporting endpoints.
+const spendMasterKey = "sk-master-MONEY"
+
+// TestPromptCacheCostConsumesABudget covers the half of a budget that is easy to
+// forget it has.
+//
+// A conversation through this gateway can spend most of its money on cache reads
+// and writes rather than on ordinary input: that is the traffic the whole prompt
+// cache exists for. A budget check that priced only input and output would let a
+// key run indefinitely on the tokens it actually costs the most for.
+func TestPromptCacheCostConsumesABudget(t *testing.T) {
+	price := harnessOpts{}.defaultPricing()
+	const read, write = 400_000, 200_000
+	perRequest := float64(read)*price.CacheReadPer1M/1e6 + float64(write)*price.CacheWritePer1M/1e6
+
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		// Exhausted by one such request, whose entire cost is cache tokens: a
+		// budget check pricing only input and output would see nothing spent
+		// and admit the next one.
+		maxBudget: perRequest * 0.9,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"id":"msg_1","type":"message","usage":`+
+				`{"input_tokens":0,"output_tokens":0,`+
+				`"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d}}`, read, write)
+		},
+	})
+
+	body := promptBody("be helpful", "hi")
+	if rec := h.do(t, claudeCodeRequest("/v1/messages", body)); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d, want 200", rec.Code)
+	}
+	rec := h.do(t, claudeCodeRequest("/v1/messages", body))
+	if rec.Code != http.StatusPaymentRequired {
+		t.Fatalf("second request = %d, want 402: a budget spent entirely on cache tokens was not spent at all", rec.Code)
+	}
+
+	if got := ledgerCost(t, h); !nearly(got, perRequest) {
+		t.Errorf("billed $%.6f for one request, want $%.6f", got, perRequest)
+	}
+}
+
+// TestAFailedAttemptIsNotBilled covers what a retry does to the ledger.
+//
+// A request that failed on one deployment and succeeded on another is one
+// answer, and the operator pays for one. Charging the failed attempt would bill
+// for a response nobody received; charging the wrong deployment would send an
+// operator looking for capacity in the wrong place.
+func TestAFailedAttemptIsNotBilled(t *testing.T) {
+	// The first request to reach any upstream fails, so a retry is certain
+	// whichever deployment the strategy picked first.
+	var served atomic.Int64
+	upstream := func(w http.ResponseWriter, _ *http.Request) {
+		if served.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"overloaded"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"msg_1","type":"message","usage":`+
+			`{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":20000,"cache_creation_input_tokens":2000}}`)
+	}
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, extraDeployments: 1,
+		upstreams: []http.HandlerFunc{upstream, upstream},
+	})
+
+	rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody("be helpful", "hi")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := served.Load(); got != 2 {
+		t.Fatalf("upstreams saw %d requests, want 2: the retry this test needs did not happen", got)
+	}
+
+	price := harnessOpts{}.defaultPricing()
+	want := 1000*price.InputPer1M/1e6 + 500*price.OutputPer1M/1e6 +
+		20000*price.CacheReadPer1M/1e6 + 2000*price.CacheWritePer1M/1e6
+	assertLedgerCost(t, h, want)
+
+	// And it is charged to the deployment that answered, which is the one whose
+	// prompt cache is now warm.
+	rows, err := h.ledger.Deployments(t.Context())
+	if err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	served2 := rec.Header().Get("x-gateway-deployment")
+	if len(rows) != 1 {
+		t.Fatalf("%d deployments hold ledger rows for one answer: %+v", len(rows), rows)
+	}
+	if rows[0].Subject != served2 {
+		t.Errorf("the bill landed on %s, but %s served the request", rows[0].Subject, served2)
+	}
+}
+
+// TestSpendTotalsCarryBothSignsOfSavings covers the report an operator reads.
+//
+// A fleet has turns that read caches and turns that only write them, and the
+// total has to be their arithmetic sum. Summing magnitudes, or floored at zero,
+// would report a fleet that is losing money on caching as one that is breaking
+// even.
+func TestSpendTotalsCarryBothSignsOfSavings(t *testing.T) {
+	var served atomic.Int64
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, masterKey: spendMasterKey,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if served.Add(1) == 1 {
+				// A cold turn: the prefix is written and nothing is read.
+				io.WriteString(w, `{"usage":{"input_tokens":10,"output_tokens":20,`+
+					`"cache_read_input_tokens":0,"cache_creation_input_tokens":100000}}`)
+				return
+			}
+			// A warm turn: the same prefix read back.
+			io.WriteString(w, `{"usage":{"input_tokens":10,"output_tokens":20,`+
+				`"cache_read_input_tokens":100000,"cache_creation_input_tokens":0}}`)
+		},
+	})
+
+	body := promptBody("be helpful", "hi")
+	for range 2 {
+		if rec := h.do(t, claudeCodeRequest("/v1/messages", body)); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+	}
+
+	price := harnessOpts{}.defaultPricing()
+	cold := 100_000 * (price.InputPer1M - price.CacheWritePer1M) / 1e6
+	warm := 100_000 * (price.InputPer1M - price.CacheReadPer1M) / 1e6
+	if cold >= 0 || warm <= 0 {
+		t.Fatal("this test needs one turn of each sign to mean anything")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/spend/deployments", nil)
+	req.Header.Set("x-gateway-key", spendMasterKey)
+	var report struct {
+		TotalCacheSavings float64 `json:"total_cache_savings"`
+	}
+	if err := json.Unmarshal(h.do(t, req).Body.Bytes(), &report); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !nearly(report.TotalCacheSavings, cold+warm) {
+		t.Errorf("total_cache_savings = %.6f, want %.6f (a %.6f loss and a %.6f saving)",
+			report.TotalCacheSavings, cold+warm, cold, warm)
+	}
+}
+
+// TestAnUnpricedLongWriteIsReported covers the gap between what a deployment is
+// billed and what its cost model can express.
+//
+// A one-hour cache write costs twice base input where the five-minute tier costs
+// 1.25x. A deployment configured without cache_write_1h_per_1m falls back to the
+// shorter price, which is right until a caller opts into the longer TTL and then
+// understates every long write it makes by more than a third. Nothing else would
+// say so: the request succeeds, the tokens are counted, and only the total is
+// wrong — so the log line naming the deployment and the missing key is the whole
+// mechanism.
+func TestAnUnpricedLongWriteIsReported(t *testing.T) {
+	const long = 50_000
+	// No cache_write_1h_per_1m, which validation permits: it is correct until a
+	// caller asks for the longer lifetime.
+	priced := core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, pricing: &priced,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"usage":{"input_tokens":10,"output_tokens":20,`+
+				`"cache_creation_input_tokens":%d,`+
+				`"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":%d}}}`, long, long)
+		},
+	})
+
+	body := promptBody("be helpful", "hi")
+	for range 3 {
+		if rec := h.do(t, claudeCodeRequest("/v1/messages", body)); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+	}
+
+	logs := h.logBuf.String()
+	if !strings.Contains(logs, "one-hour cache writes at a deployment priced only for five-minute ones") {
+		t.Errorf("nothing in the log says the bill is understated:\n%s", logs)
+	}
+	// It is a fact about the deployment's configuration, so it is said once
+	// however much traffic is mispriced.
+	if got := strings.Count(logs, "cache_write_1h_per_1m"); got != 1 {
+		t.Errorf("warned %d times, want 1", got)
+	}
+	if !strings.Contains(logs, h.deploymentID) {
+		t.Errorf("the warning does not name the deployment to fix:\n%s", logs)
+	}
+
+	// Meanwhile the traffic is billed at the price that exists, which is the
+	// understatement the warning is about.
+	want := 3 * (float64(long)*priced.CacheWritePer1M/1e6 + 10*priced.InputPer1M/1e6 + 20*priced.OutputPer1M/1e6)
+	assertLedgerCost(t, h, want)
+}
+
+// A deployment that does price the long tier says nothing, or the warning would
+// be noise on a correctly configured fleet.
+func TestACorrectlyPricedLongWriteIsSilent(t *testing.T) {
+	priced := core.Pricing{
+		InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3,
+		CacheWritePer1M: 3.75, CacheWrite1hPer1M: 6,
+	}
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, pricing: &priced,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"usage":{"input_tokens":10,"output_tokens":20,`+
+				`"cache_creation_input_tokens":50000,`+
+				`"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":50000}}}`)
+		},
+	})
+
+	h.do(t, claudeCodeRequest("/v1/messages", promptBody("be helpful", "hi")))
+
+	if logs := h.logBuf.String(); strings.Contains(logs, "cache_write_1h_per_1m") {
+		t.Errorf("a correctly priced deployment was warned about:\n%s", logs)
 	}
 }

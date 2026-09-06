@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/erickardus/ai-gateway/internal/config"
+	"github.com/erickardus/ai-gateway/internal/core"
 )
 
 // longSystem is past the injection threshold, so a test that expects a
@@ -516,5 +518,87 @@ func TestAffinityIsSkippedForAGroupWithNothingToChoose(t *testing.T) {
 	balanced := h.do(t, claudeCodeRequest("/v1/messages", promptBody("be helpful", "first turn", "answer")))
 	if got := balanced.Header().Get("x-gateway-prompt-affinity"); got != "new" {
 		t.Errorf("affinity = %q on the balanced group, want new", got)
+	}
+}
+
+// TestPromptCacheMetricsCarryTheirValues goes past the label names the test
+// above checks for.
+//
+// These counters are how an operator sees the prompt cache working without
+// reading a bill, so the figures have to be the provider's own. A scrape naming
+// the right series with the wrong numbers is worse than a missing one: it looks
+// like an answer.
+func TestPromptCacheMetricsCarryTheirValues(t *testing.T) {
+	const (
+		read    = 20_000
+		write5m = 3_000
+		write1h = 7_000
+	)
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		pricing: &core.Pricing{
+			InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3,
+			CacheWritePer1M: 3.75, CacheWrite1hPer1M: 6,
+		},
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"usage":{"input_tokens":10,"output_tokens":20,`+
+				`"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d,`+
+				`"cache_creation":{"ephemeral_5m_input_tokens":%d,"ephemeral_1h_input_tokens":%d}}}`,
+				read, write5m+write1h, write5m, write1h)
+		},
+	})
+
+	if rec := h.do(t, claudeCodeRequest("/v1/messages", promptBody(longSystem, "hi"))); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	scrape := h.do(t, httptest.NewRequest(http.MethodGet, "/metrics", nil)).Body.String()
+	for _, want := range []struct {
+		outcome string
+		tokens  int
+	}{
+		{"read", read},
+		// The write total, with the long tier inside it rather than beside it.
+		{"write", write5m + write1h},
+		{"write_1h", write1h},
+	} {
+		line := fmt.Sprintf(`outcome="%s"} %d`, want.outcome, want.tokens)
+		if !strings.Contains(scrape, line) {
+			t.Errorf("scrape has no %s counter reading %d:\n%s", want.outcome, want.tokens, scrape)
+		}
+	}
+
+	// A request that read from the cache counts as a hit, not a miss: the
+	// hit-rate series is what says caching is working at all.
+	if !strings.Contains(scrape, `gateway_prompt_cache_requests_total{model="anthropic-claude",deployment="`+h.deploymentID+`",outcome="hit"} 1`) {
+		t.Errorf("no hit recorded for a request that read the cache:\n%s", scrape)
+	}
+	if strings.Contains(scrape, `outcome="miss"} 1`) {
+		t.Errorf("a cache read was counted as a miss:\n%s", scrape)
+	}
+}
+
+// A request that read nothing back is a miss, which is the other half of the
+// ratio. Counting it as a hit would make the series say caching worked on
+// exactly the traffic where it did not.
+func TestARequestThatReadNothingCountsAsAMiss(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"usage":{"input_tokens":10,"output_tokens":20,`+
+				`"cache_read_input_tokens":0,"cache_creation_input_tokens":5000}}`)
+		},
+	})
+
+	h.do(t, claudeCodeRequest("/v1/messages", promptBody(longSystem, "hi")))
+
+	scrape := h.do(t, httptest.NewRequest(http.MethodGet, "/metrics", nil)).Body.String()
+	if !strings.Contains(scrape, `outcome="miss"} 1`) {
+		t.Errorf("a request that read nothing was not counted as a miss:\n%s", scrape)
+	}
+	if strings.Contains(scrape, `gateway_prompt_cache_requests_total{model="anthropic-claude",deployment="`+h.deploymentID+`",outcome="hit"}`) {
+		t.Errorf("a request that read nothing was counted as a hit:\n%s", scrape)
 	}
 }

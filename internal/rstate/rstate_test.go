@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -476,5 +477,157 @@ func TestRedisLedgerMatchesTheLocalLedgerFieldForField(t *testing.T) {
 		default:
 			t.Errorf("%s has kind %s, which this comparison does not cover — extend it", name, want.Kind())
 		}
+	}
+}
+
+// TestNegativeSavingsSurviveRedis is the multi-instance half of a figure that
+// can now be either sign.
+//
+// Savings are net of the prompt cache's write premium, so a workload writing
+// caches nobody reads reports a negative one. Redis accumulates it with
+// HINCRBYFLOAT and reads it back as a string, and both a formatter that dropped
+// the sign and a parser that gave up on a leading minus would turn a reported
+// loss into a reported nothing — which is exactly the direction an operator
+// needs to see.
+func TestNegativeSavingsSurviveRedis(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	s := newStore(t, prefix)
+	l := NewLedger(s, spend.New(), prefix, discard(), 2*time.Second)
+
+	// A write nobody read, three times over, then one turn that read it back.
+	for _, savings := range []float64{-0.75, -0.75, -0.75, 1.00} {
+		if err := l.Record(ctx, spend.Entry{
+			KeyHash: "k1", DeploymentID: "dep-1",
+			Usage:        core.Usage{InputTokens: 10, OutputTokens: 5, CacheWriteTokens: 200},
+			Cost:         0.25,
+			CacheSavings: savings,
+			Billable:     true,
+		}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+
+	rows, err := l.Keys(ctx)
+	if err != nil {
+		t.Fatalf("Keys: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if got := rows[0].CacheSavings; got > -1.2499 || got < -1.2501 {
+		t.Errorf("cache savings = %v via Redis, want -1.25", got)
+	}
+	if rows[0].Cost < 0.99 || rows[0].Cost > 1.01 {
+		t.Errorf("cost = %v, want ~1.00: only the savings figure may go negative", rows[0].Cost)
+	}
+}
+
+// Token usage is what the usage-based strategy balances on, so it has to be the
+// fleet's view rather than one replica's: an instance that only saw its own
+// traffic would send every request to whichever deployment it personally had
+// used least.
+func TestTokensUsedSharedAcrossInstances(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	a, b := newStore(t, prefix), newStore(t, prefix)
+
+	if err := a.AddTokens(ctx, "dep-1", 900); err != nil {
+		t.Fatalf("AddTokens: %v", err)
+	}
+	if err := b.AddTokens(ctx, "dep-1", 100); err != nil {
+		t.Fatalf("AddTokens: %v", err)
+	}
+
+	got, err := b.TokensUsed(ctx, "dep-1")
+	if err != nil {
+		t.Fatalf("TokensUsed: %v", err)
+	}
+	if got != 1000 {
+		t.Errorf("TokensUsed = %d, want 1000: the second instance is not seeing the first's traffic", got)
+	}
+	if idle, err := a.TokensUsed(ctx, "dep-2"); err != nil || idle != 0 {
+		t.Errorf("TokensUsed on an unused deployment = %d, %v; want 0, nil", idle, err)
+	}
+}
+
+// Flushing the shared ledger persists the local mirror, which is what a restart
+// with Redis down falls back to.
+func TestSharedLedgerFlushPersistsTheLocalMirror(t *testing.T) {
+	prefix := uniquePrefix(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "spend.json")
+
+	local, err := spend.NewFileLedger(path)
+	if err != nil {
+		t.Fatalf("NewFileLedger: %v", err)
+	}
+	l := NewLedger(newStore(t, prefix), local, prefix, discard(), 2*time.Second)
+	if err := l.Record(ctx, spend.Entry{
+		KeyHash: "k1", DeploymentID: "dep-1",
+		Usage: core.Usage{InputTokens: 10, OutputTokens: 5}, Cost: 0.5, Billable: true,
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := l.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	reopened, err := spend.NewFileLedger(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	spent, err := reopened.KeySpend(ctx, "k1", 0)
+	if err != nil {
+		t.Fatalf("KeySpend: %v", err)
+	}
+	if spent < 0.49 || spent > 0.51 {
+		t.Errorf("spend after restart = %v, want 0.5", spent)
+	}
+}
+
+// With Redis unreachable the /spend endpoints still answer, from the local
+// mirror every instance keeps. Reporting an error there would take the operator
+// their cost view at exactly the moment they most want it.
+func TestSpendSummariesFallBackToLocalWhenRedisIsDown(t *testing.T) {
+	ctx := context.Background()
+	s := New(Options{
+		Addr:      "127.0.0.1:1", // nothing listening
+		KeyPrefix: "test", Timeout: 100 * time.Millisecond,
+	}, router.NewMemState(), discard())
+	defer s.Close()
+
+	l := NewLedger(s, spend.New(), "test", discard(), 100*time.Millisecond)
+	if err := l.Record(ctx, spend.Entry{
+		KeyHash: "k1", KeyAlias: "dev", DeploymentID: "dep-1",
+		Usage:        core.Usage{InputTokens: 10, OutputTokens: 5, CacheReadTokens: 40},
+		Cost:         0.5,
+		CacheSavings: 0.1,
+		Billable:     true,
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	keys, err := l.Keys(ctx)
+	if err != nil {
+		t.Fatalf("Keys: %v", err)
+	}
+	if len(keys) != 1 || keys[0].Cost != 0.5 {
+		t.Fatalf("keys = %+v, want one row costing 0.5 from the local mirror", keys)
+	}
+	deployments, err := l.Deployments(ctx)
+	if err != nil {
+		t.Fatalf("Deployments: %v", err)
+	}
+	if len(deployments) != 1 || deployments[0].Subject != "dep-1" {
+		t.Errorf("deployments = %+v, want one row for dep-1", deployments)
+	}
+	// Budgets are still enforced, from the same mirror.
+	spent, err := l.KeySpend(ctx, "k1", time.Hour)
+	if err != nil {
+		t.Fatalf("KeySpend: %v", err)
+	}
+	if spent != 0.5 {
+		t.Errorf("KeySpend = %v, want 0.5", spent)
 	}
 }
