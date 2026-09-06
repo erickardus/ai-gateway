@@ -106,6 +106,14 @@ type harnessOpts struct {
 	// streamUsage overrides observability.stream_usage, which decides whether a
 	// streamed OpenAI-compatible request is asked to report any usage at all.
 	streamUsage *bool
+	// supportsCacheControl declares that the upstream reads a cache breakpoint
+	// while speaking the OpenAI wire format, which is what an operator says
+	// about a Qwen deployment.
+	supportsCacheControl bool
+	// extraSupportsCacheControl declares the capability on the extra deployments
+	// only, which builds a fleet mixing an upstream that reads a breakpoint with
+	// one that does not — the case that proves the flag is what decides.
+	extraSupportsCacheControl bool
 	// extraAuthMode gives the extra deployments a different auth mode from the
 	// first. It is what builds a mixed fleet — subscription traffic beside API
 	// traffic in one group — which is the arrangement a per-deployment body
@@ -134,8 +142,9 @@ func (o harnessOpts) defaultPricing() core.Pricing {
 		return *o.pricing
 	}
 	if o.format == core.FormatOpenAI {
-		// OpenAI-compatible providers cache automatically and charge nothing to
-		// write, so there is no write price to configure.
+		// Most OpenAI-compatible providers cache automatically and charge
+		// nothing to write, so the default names no write price. The ones that
+		// do charge — Qwen, MiniMax — are covered by tests passing their own.
 		return core.Pricing{InputPer1M: 1.25, OutputPer1M: 10, CacheReadPer1M: 0.125}
 	}
 	return core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}
@@ -173,10 +182,11 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		format = core.FormatAnthropic
 	}
 	params := config.DeploymentParams{
-		Format:   format,
-		APIBase:  upstream.URL,
-		Model:    opts.modelGroup(),
-		AuthMode: core.AuthMode(mode),
+		Format:               format,
+		APIBase:              upstream.URL,
+		Model:                opts.modelGroup(),
+		AuthMode:             core.AuthMode(mode),
+		SupportsCacheControl: opts.supportsCacheControl,
 	}
 	if mode == "api_key" {
 		params.AuthHeader = "x-api-key"
@@ -194,6 +204,9 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		t.Cleanup(extra.Close)
 		extraParams := params
 		extraParams.APIBase = extra.URL
+		if opts.extraSupportsCacheControl {
+			extraParams.SupportsCacheControl = true
+		}
 		if opts.extraAuthMode != "" {
 			extraParams.AuthMode = opts.extraAuthMode
 			if opts.extraAuthMode == core.AuthModePassthrough {

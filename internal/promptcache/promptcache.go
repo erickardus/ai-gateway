@@ -335,13 +335,19 @@ func markable(tool []byte) bool {
 	return err == nil && ok
 }
 
-// markSystem places a breakpoint on the system prompt in either of the two
-// shapes the Messages API accepts.
+// markSystem places a breakpoint on a system prompt, in either of the two shapes
+// it may arrive in: a bare string, or an array of typed content blocks.
 //
 // The string form has nowhere to attach one, so it is promoted to the single
 // text block it is defined to be equivalent to. The original string's bytes are
 // reused verbatim rather than decoded and re-encoded, so the text an upstream
 // tokenizes is unchanged.
+//
+// Both formats need this and the two shapes are identical, so it serves both:
+// Anthropic's top-level system field, and the content of the leading system
+// message of an OpenAI-format conversation. Alibaba's documentation for the
+// latter says the same thing in its own words — "for a system message, you must
+// change the content field to an array and add the cache_control field".
 func markSystem(system []byte) ([]byte, bool, error) {
 	if len(system) == 0 {
 		return nil, false, nil
@@ -416,4 +422,115 @@ func alreadyMarked(body []byte) (bool, error) {
 		return false, nil
 	}
 	return jsonx.ContainsObjectKey(body, controlKey)
+}
+
+// InjectOpenAI marks the cacheable prefix of a request in the OpenAI wire format,
+// for a provider whose explicit cache reads Anthropic's cache_control marker.
+//
+// Most of the OpenAI-compatible ecosystem has nothing to mark: OpenAI, Kimi, GLM
+// and DeepSeek all cache automatically, above a minimum prefix length, and a
+// marker would be ignored or refused. Alibaba's Qwen is the exception. It caches
+// implicitly too, but its *explicit* cache — the one with the higher hit ratio —
+// is entered by marking a content block, and without a marker a caller only ever
+// gets the implicit one.
+//
+// So this is not the Anthropic injection with a different gate on it. It marks
+// one place rather than three, because an OpenAI-format body has only one of
+// them:
+//
+//   - There is no top-level system field. The system prompt is the leading
+//     message, and its content is what carries the marker.
+//   - There is no top-level cache_control field, which is Anthropic's automatic
+//     caching and an Anthropic construct. Nothing here walks a breakpoint
+//     forward as the conversation grows, so a long history is re-read at full
+//     price behind the prefix marker — the limitation roadmap.md records.
+//   - The tools are not marked. An OpenAI tool declares no input_schema, so the
+//     shape check that makes marking one safe under Anthropic does not apply,
+//     and the provider documents the cache block as running from the start of
+//     the messages array rather than from the tools.
+//
+// It stands down where the conversation does not open with a system or developer
+// message. A marker on the first user turn would cache a prefix that changes
+// with every conversation, which buys a write and no read.
+//
+// minBytes is measured over the messages and the tools together, and the
+// provider's own minimum is 1024 tokens.
+func InjectOpenAI(body []byte, minBytes int) ([]byte, bool, error) {
+	if marked, err := alreadyMarked(body); err != nil {
+		return body, false, err
+	} else if marked {
+		return body, false, nil
+	}
+
+	values, err := jsonx.RawTopLevel(body, "messages", "tools")
+	if err != nil {
+		return body, false, err
+	}
+	messages, tools := values[0], values[1]
+	if len(messages)+len(tools) < minBytes {
+		return body, false, nil
+	}
+
+	spans, err := jsonx.Elements(messages)
+	if err != nil || len(spans) == 0 {
+		// A value in an unexpected shape is forwarded as it arrived, without
+		// the optimization, rather than failing the request.
+		return body, false, nil
+	}
+	lead := messages[spans[0][0]:spans[0][1]]
+	if !opensWithSystemPrompt(lead) {
+		return body, false, nil
+	}
+
+	marked, ok, err := markMessageContent(lead)
+	if err != nil || !ok {
+		return body, false, err
+	}
+
+	edited := make([]byte, 0, len(messages)-len(lead)+len(marked))
+	edited = append(edited, messages[:spans[0][0]]...)
+	edited = append(edited, marked...)
+	edited = append(edited, messages[spans[0][1]:]...)
+
+	out, err := jsonx.SetTopLevelValues(body, map[string][]byte{"messages": edited})
+	if err != nil {
+		return body, false, err
+	}
+	return out, true, nil
+}
+
+// opensWithSystemPrompt reports whether a message is the system or developer turn
+// an OpenAI-format conversation opens with, which is the part of it that stays
+// fixed as the conversation grows.
+func opensWithSystemPrompt(message []byte) bool {
+	if len(message) == 0 || message[0] != '{' {
+		return false
+	}
+	values, err := jsonx.RawTopLevel(message, "role")
+	if err != nil || len(values[0]) == 0 {
+		return false
+	}
+	var role string
+	if json.Unmarshal(values[0], &role) != nil {
+		return false
+	}
+	return role == roleSystem || role == roleDeveloper
+}
+
+// markMessageContent places a breakpoint on a message's content, promoting a
+// bare string to the single text block it is equivalent to where it has to.
+func markMessageContent(message []byte) ([]byte, bool, error) {
+	values, err := jsonx.RawTopLevel(message, "content")
+	if err != nil {
+		return nil, false, err
+	}
+	marked, ok, err := markSystem(values[0])
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	out, err := jsonx.SetTopLevelValues(message, map[string][]byte{"content": marked})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
 }

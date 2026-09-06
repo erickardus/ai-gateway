@@ -13,6 +13,28 @@ import (
 // why it is only ever added to one that asked to stream.
 var streamUsageOptions = []byte(`{"include_usage":true}`)
 
+// annotationLevel is how much of what the gateway would add a deployment has
+// been shown to accept. A deployment starts at annotateFull and is demoted one
+// step each time it refuses, so a wrong guess costs the cheapest thing first.
+//
+// The order is by what losing each annotation costs. A cache breakpoint is an
+// optimization: losing it means paying full price for a prefix that repeats.
+// The streamed usage option is not an optimization at all — without it an
+// OpenAI-compatible reply carries no usage anywhere, so the request is billed as
+// nothing and charges nothing against a budget. Answering one refused breakpoint
+// by also dropping the accounting would trade a smaller failure for a larger
+// silent one.
+type annotationLevel int
+
+const (
+	// annotateNone sends every deployment the request as it arrived.
+	annotateNone annotationLevel = iota
+	// annotateEssential adds only what billing depends on.
+	annotateEssential
+	// annotateFull adds everything the deployment's format allows.
+	annotateFull
+)
+
 // annotator decides what each deployment receives of the annotations the gateway
 // adds for its own benefit: a cache breakpoint, so an Anthropic upstream has
 // something to cache, and a usage option, so a streamed OpenAI-compatible reply
@@ -54,7 +76,16 @@ func (s *Server) annotatorFor(format core.Format, stream, markConversation bool,
 	if format == core.FormatAnthropic {
 		wantsUsage = false
 	}
-	if !wantsUsage && !s.cfg.PromptCache.Inject {
+	// Injection needs somewhere to land. An anthropic deployment always reads a
+	// breakpoint, so the global switch is the whole question there; an openai
+	// one reads it only where its operator said so, and a fleet where none did
+	// would otherwise allocate an annotator per request to decide it has nothing
+	// to add.
+	marksPrefix := s.cfg.PromptCache.Inject
+	if format == core.FormatOpenAI {
+		marksPrefix = marksPrefix && s.marksOpenAIPrefix
+	}
+	if !wantsUsage && !marksPrefix {
 		return nil
 	}
 	return &annotator{srv: s, stream: stream, markConversation: markConversation, requestID: requestID}
@@ -62,20 +93,6 @@ func (s *Server) annotatorFor(format core.Format, stream, markConversation bool,
 
 // Annotate implements provider.Annotator.
 func (a *annotator) Annotate(dep *config.Deployment, base []byte) ([]byte, bool) {
-	if !a.appliesTo(dep) {
-		return base, false
-	}
-	switch dep.Params.Format {
-	case core.FormatOpenAI:
-		return a.askForStreamedUsage(base)
-	case core.FormatAnthropic:
-		return a.markCacheablePrefix(base)
-	}
-	return base, false
-}
-
-// appliesTo reports whether this deployment may be sent an annotated body at all.
-func (a *annotator) appliesTo(dep *config.Deployment) bool {
 	// A passthrough deployment forwards the caller's own credential to an
 	// upstream that bills their subscription, and its body must arrive as they
 	// sent it: Anthropic's gateway rules require it, and the endpoint strips
@@ -84,14 +101,45 @@ func (a *annotator) appliesTo(dep *config.Deployment) bool {
 	// load is what lets one gateway front both subscription and API traffic and
 	// still annotate the half that benefits.
 	if dep.Params.AuthMode == core.AuthModePassthrough {
-		return false
+		return base, false
 	}
-	// An upstream that has already refused an annotation is not offered another.
-	// The round trip that established it is worth paying once; paying it on
-	// every request, which is what a purely per-request decision costs, is what
-	// makes a wrong guess expensive rather than merely wasteful.
-	_, refused := a.srv.refusesAnnotation.Load(dep.ID())
-	return !refused
+	level := a.srv.levelFor(dep.ID())
+	if level == annotateNone {
+		return base, false
+	}
+
+	switch dep.Params.Format {
+	case core.FormatOpenAI:
+		// The usage option first: it is what billing depends on, so it is the
+		// part that survives a demotion.
+		body, changed := a.askForStreamedUsage(base)
+		// A breakpoint only where the operator has named an upstream that reads
+		// one. Most of this ecosystem caches automatically and would ignore or
+		// refuse the marker, and the gateway cannot ask an arbitrary
+		// OpenAI-compatible base URL which kind it is.
+		if level >= annotateFull && dep.Params.SupportsCacheControl {
+			if marked, ok := a.markOpenAIPrefix(body); ok {
+				body, changed = marked, true
+			}
+		}
+		return body, changed
+	case core.FormatAnthropic:
+		if level < annotateFull {
+			return base, false
+		}
+		return a.markCacheablePrefix(base)
+	}
+	return base, false
+}
+
+// levelFor reports how much this deployment has been shown to accept. A
+// deployment nothing is known about accepts everything, which is what makes the
+// first refusal the thing that teaches the gateway otherwise.
+func (s *Server) levelFor(id string) annotationLevel {
+	if v, ok := s.annotationLevel.Load(id); ok {
+		return v.(annotationLevel)
+	}
+	return annotateFull
 }
 
 // askForStreamedUsage adds stream_options.include_usage to a streamed
@@ -116,6 +164,20 @@ func (a *annotator) askForStreamedUsage(base []byte) ([]byte, bool) {
 		return base, false
 	}
 	return asked, true
+}
+
+// markOpenAIPrefix marks the leading system message of an OpenAI-format request,
+// for an upstream whose explicit cache reads the marker.
+func (a *annotator) markOpenAIPrefix(base []byte) ([]byte, bool) {
+	if !a.srv.cfg.PromptCache.Inject {
+		return base, false
+	}
+	injected, changed, err := promptcache.InjectOpenAI(base, a.srv.cfg.PromptCache.InjectMinBytes)
+	if err != nil {
+		a.srv.log.Warn("prompt cache injection skipped", "error", err, "request_id", a.requestID)
+		return base, false
+	}
+	return injected, changed
 }
 
 // markCacheablePrefix marks the stable prefix of an Anthropic request, where the
@@ -148,10 +210,31 @@ func (a *annotator) markCacheablePrefix(base []byte) ([]byte, bool) {
 // change with a release in either direction, and a restart is the cheapest way
 // to re-ask: it costs one round trip on one request.
 func (a *annotator) Refused(dep *config.Deployment) {
-	if _, seen := a.srv.refusesAnnotation.LoadOrStore(dep.ID(), true); seen {
+	a.srv.annotationMu.Lock()
+	current := a.srv.levelFor(dep.ID())
+	if current == annotateNone {
+		a.srv.annotationMu.Unlock()
 		return
 	}
-	a.srv.log.Warn("upstream rejected an annotated request, so this deployment will not be annotated again",
+	next := current - 1
+	a.srv.annotationLevel.Store(dep.ID(), next)
+	a.srv.annotationMu.Unlock()
+
+	a.srv.log.Warn("upstream rejected an annotated request, so less will be added to this deployment's requests from now on",
 		"deployment", dep.ID(),
-		"cost", "one round trip, paid once per deployment per process")
+		"now_adds", next.describe(),
+		"cost", "one round trip per step, paid once per deployment per process")
+}
+
+// describe names a level in terms of what it still adds, so the log line an
+// operator reads says what the gateway will do rather than which enum it holds.
+func (l annotationLevel) describe() string {
+	switch l {
+	case annotateEssential:
+		return "only what billing depends on: stream_options.include_usage"
+	case annotateFull:
+		return "everything"
+	default:
+		return "nothing; requests are forwarded exactly as they arrive"
+	}
 }

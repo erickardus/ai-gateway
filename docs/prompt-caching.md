@@ -224,16 +224,37 @@ does with it, and what it says afterwards.
 
 | | Anthropic | OpenAI-compatible |
 |---|---|---|
-| How a prefix is cached | explicitly, at a `cache_control` breakpoint | automatically, above a minimum prefix length |
-| What a write costs | a premium over input | nothing |
+| How a prefix is cached | explicitly, at a `cache_control` breakpoint | usually automatically, above a minimum prefix length |
+| What a write costs | a premium over input | usually nothing |
 | Where the discount shows up | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens` |
 | Whether input includes it | no | **yes** |
 
 That last row is the one that costs money. Anthropic reports an `input_tokens`
-that already excludes both cache counters, so the three figures are simply added
-up at their own prices. An OpenAI-compatible response reports a `prompt_tokens`
-that **includes** its cached tokens, and names how many of them were cached
-separately.
+that already excludes every cache counter, so the figures are simply added up at
+their own prices. An OpenAI-compatible response reports a `prompt_tokens` that
+**includes** them, and breaks them out beside it.
+
+The two "usually" qualifiers are the second thing that costs money, and they are
+why the counters are read from more than one place:
+
+| Provider | Cached how | A read is reported as | A write |
+|---|---|---|---|
+| OpenAI | automatically | `prompt_tokens_details.cached_tokens` | free, unreported |
+| Kimi (Moonshot) | automatically | the same | free, unreported |
+| GLM (Z.ai) | automatically | the same | free, unreported |
+| DeepSeek | automatically | `prompt_cache_hit_tokens`, top level | free, unreported |
+| **Qwen (Alibaba)** | **explicitly, at a `cache_control` breakpoint** | the same | **charged**, nested in `prompt_tokens_details` |
+| **MiniMax** | automatically | the same, and again as `cache_read_input_tokens` | **charged**, nested in `prompt_tokens_details` |
+
+The last two rows are the ones a gateway gets wrong. They put their write
+counters — and, for Qwen, an Anthropic-shaped `cache_creation` TTL breakdown —
+*inside* the details object rather than at the top level of `usage` where
+Anthropic puts them. Read only the top level and those writes are invisible;
+they do not vanish, they stay inside `prompt_tokens` and are billed at the input
+rate. On a request writing 2048 tokens of a 2059-token prompt that is a fifth
+off the bill, and on a larger explicit cache it is more. It fails in the
+expensive direction: a budget that should have stopped a key keeps letting it
+spend, and `/spend` quietly disagrees with the invoice.
 
 Read with Anthropic's rule, every cached token on an OpenAI deployment is
 charged twice — once at the full input rate inside `prompt_tokens`, once at the
@@ -248,16 +269,26 @@ So the gateway normalizes at the point of parsing, under the format of the
 deployment that served the request:
 
 ```
-InputTokens = prompt_tokens - cached_tokens      # openai
-InputTokens = input_tokens                       # anthropic
+InputTokens = prompt_tokens - cached_tokens - cache_creation_tokens   # openai
+InputTokens = input_tokens                                           # anthropic
 ```
 
 The invariant is that every prompt token is counted exactly once, in whichever
-bucket the provider priced it in. It holds against the field names in use across
-OpenAI-compatible servers — `prompt_tokens_details.cached_tokens`,
-`input_tokens_details.cached_tokens`, and DeepSeek's `prompt_cache_hit_tokens` —
-and a cached count larger than the input it belongs to is clamped rather than
-allowed to mint savings out of an upstream's arithmetic error.
+bucket the provider priced it in — the three buckets partition `prompt_tokens`
+rather than overlapping it. MiniMax states the same identity from its own side,
+reporting a `non_cached_input_tokens` that equals what this arithmetic produces.
+
+Every name a counter is known by is read, in both placements, and **no two are
+ever added together**: one figure under two names is still one figure, so the
+larger is taken rather than the sum. That covers
+`prompt_tokens_details.cached_tokens`, `input_tokens_details.cached_tokens`,
+`cache_read_input_tokens`, DeepSeek's top-level `prompt_cache_hit_tokens`, and
+`cache_creation_input_tokens` at either level.
+
+Reads settle against the reported total first and writes take what is left, so a
+provider claiming more cached and written tokens than it charged input for is
+clamped rather than allowed to drive input negative or mint savings out of an
+upstream's arithmetic error.
 
 ### Streamed replies report nothing unless asked
 
@@ -305,11 +336,68 @@ streamed reply reported no usage, so it is billed as nothing
 It is a log line rather than an error because the response itself is fine. Only
 the accounting is missing, and nothing else would ever mention it.
 
-**Breakpoint injection does not apply.** `cache_control` is an Anthropic
-construct, caching on an OpenAI-compatible provider is automatic, and there is
-nothing for the gateway to mark. An `openai` deployment is simply never sent a
-breakpoint, whatever `inject` says; configuration refuses the setting only where
-*no* deployment in the fleet could carry one.
+### Breakpoints on an OpenAI-format upstream
+
+For most of this ecosystem there is nothing to mark: OpenAI, Kimi, GLM and
+DeepSeek cache automatically and a marker would be ignored or refused. Alibaba's
+Qwen is the exception. It caches implicitly too, but its **explicit** cache — the
+one with the higher hit ratio and lower latency — is entered by marking a content
+block, so without a marker a caller only ever gets the implicit one.
+
+```yaml
+model_list:
+  - model_name: qwen
+    params:
+      format: openai
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      supports_cache_control: true      # this upstream reads the marker
+prompt_cache:
+  inject: true                          # and the gateway may place one
+```
+
+Both keys are required, and they say different things. `inject` is the operator
+allowing the gateway to edit a body at all; `supports_cache_control` is the
+operator naming an upstream that reads what it places. It is opt-in per
+deployment for two reasons: the gateway cannot ask an arbitrary
+OpenAI-compatible base URL which kind it is, and the explicit cache **charges for
+writes** the implicit one does not — so turning it on for traffic that does not
+reuse its prefix costs money rather than saving it.
+
+What it marks is not the Anthropic injection with a different gate. An
+OpenAI-format body has one markable place where an Anthropic one has three:
+
+| | Anthropic | OpenAI-format |
+|---|---|---|
+| The system prompt | top-level `system` field | the content of the leading `system` message |
+| The conversation | top-level `cache_control` field | nothing — that field is an Anthropic construct |
+| The tools | last tool, where it declares an `input_schema` | nothing — an OpenAI tool has no shape to check |
+
+A string `content` is promoted to the single text block that can hold a marker,
+which is what Alibaba's own documentation says to do. The marker goes *inside*
+the block, beside `type` and `text`, not on the message.
+
+Because there is no equivalent of Anthropic's automatic caching, a growing
+conversation is re-read at full price behind the prefix marker.
+[roadmap.md](roadmap.md) records that.
+
+Injection stands down where the conversation does not open with a `system` or
+`developer` message: a marker on the first user turn would cache a prefix that
+differs per conversation, buying a write and no read.
+
+**A wrong guess costs the optimization, never the accounting.** An upstream that
+refuses the marker is retried without it, as any annotation is — but a refusal
+now *demotes* rather than switching everything off, because the annotations are
+not equally important:
+
+```
+everything  →  only what billing depends on  →  nothing
+```
+
+`stream_options.include_usage` is in the second tier. Without it an
+OpenAI-compatible reply carries no usage anywhere, so the request is billed as
+nothing — and answering one refused breakpoint by dropping that too would trade a
+lost optimization for a silent lost bill. So the deployment loses its breakpoint
+and keeps its accounting, and only a second refusal stops annotation entirely.
 
 What the gateway does not yet do is pass OpenAI's `prompt_cache_key`, which
 biases that provider's own cache routing for callers sending the same prefix at
@@ -605,9 +693,15 @@ rather than served.
 
 The gateway reads Anthropic's `cache_read_input_tokens` and
 `cache_creation_input_tokens` from the response, including from the
-`message_start` event of a streamed reply, and the OpenAI-compatible
-`prompt_tokens_details.cached_tokens` under the rule
+`message_start` event of a streamed reply, and every OpenAI-compatible spelling
+of the same counters — at the top level and nested inside
+`prompt_tokens_details` — under the rule
 [above](#openai-compatible-deployments).
+
+`cache_write_per_1m` is optional on an `openai` deployment, since most of that
+ecosystem writes for free. Where it is unset it falls back to `input_per_1m`
+rather than to nothing, so a provider that does charge is approximated rather
+than billed at zero, and the deployment is named once in the log.
 
 ### The two write tiers
 
@@ -682,6 +776,7 @@ than on mechanism:
 | `TestAConversationPaysForItsPrefixOnce` | a ten-turn conversation through a balanced group, billed against a hand-computed figure. Each fake upstream holds its own cache, so a scattered conversation pays real cache writes |
 | `TestScatteringAConversationCostsRealMoney` | the same workload with affinity off, proving the guarantee above is doing something rather than describing a group that never balanced |
 | `TestOpenAICachedPrefixIsBilledOnce` | the double-billing bug, end to end, plus the invariant that input and cache-read tokens sum to what the provider reported |
+| `TestAnExplicitCacheWriteIsBilledAtItsOwnRate` | an explicit-cache provider's writes billed at the input rate because it nests them, which understates the bill and lets a budget overrun |
 | `TestUsageIsReadUnderTheFormatThatProducedIt` | every provider usage shape in use, read under both formats, against expected counters |
 | `FuzzUsageAccounting` | a hostile or broken upstream producing negative counts, negative cost, or savings nobody made |
 | `TestInjectionAddsBreakpointsAndNothingElse`, `FuzzInject` | a rewritten body that differs from the original by anything other than its breakpoints — which would change the very prefix bytes the cache keys on |
@@ -694,6 +789,10 @@ than on mechanism:
 | `TestCostAndSavingsReconstructTheUncachedBill`, `FuzzUsageAccounting` | savings that are not the difference between the bill and the one the same tokens would have run up uncached |
 | `TestInjectionCachesTheConversationToo` | a growing conversation re-read at full price behind a breakpoint that only covers tools and system |
 | `TestInjectionOnlyMarksAToolItUnderstands` | a breakpoint hung on a server tool or an MCP toolset, whose accepted shape the gateway cannot check |
+| `TestInjectOpenAIMarksTheLeadingSystemMessage`, `TestInjectOpenAIStandsDown` | a Qwen deployment left on the implicit cache, or a marker placed where it caches a prefix that never repeats |
+| `TestInjectOpenAIMarksNothingButTheSystemMessage` | an Anthropic-only field or an unmarkable tool shape sent to an OpenAI-format upstream on every request |
+| `TestOnlyTheDeclaredUpstreamIsMarked` | a fleet marking every OpenAI-format upstream rather than the one that reads a marker |
+| `TestARefusedBreakpointKeepsTheUsageOption` | a refused optimization taking the deployment's accounting with it, billing its streamed traffic at nothing |
 | `TestAnUpstreamThatRefusesAnAnnotationStillServesTheRequest` | a caller losing a request over an optimization it never asked for |
 | `TestInjectionMarksOnlyTheDeploymentsThatCanTakeIt` | a subscription body rewritten, or an API caller left uncached, because one fleet holds both |
 | `TestARefusedAnnotationIsNotAskedForAgain` | an upstream's refusal rediscovered on every request, doubling its call count for as long as it is configured |

@@ -131,13 +131,38 @@ func (c *Config) Validate() error {
 		injectable := 0
 		for i := range c.ModelList {
 			d := &c.ModelList[i]
-			if d.Params.Format == core.FormatAnthropic && d.Params.AuthMode != core.AuthModePassthrough {
+			if d.Params.AuthMode == core.AuthModePassthrough {
+				continue
+			}
+			// An anthropic deployment always reads the marker; an openai one
+			// only where the operator has said its upstream does.
+			if d.Params.Format == core.FormatAnthropic || d.Params.SupportsCacheControl {
 				injectable++
 			}
 		}
 		if injectable == 0 {
 			errs = append(errs, errors.New(
-				"prompt_cache.inject: no deployment can carry a cache breakpoint, so this does nothing; breakpoints are placed only on an anthropic deployment that is not a passthrough one, since a passthrough deployment must forward the caller's body unchanged"))
+				"prompt_cache.inject: no deployment can carry a cache breakpoint, so this does nothing; a breakpoint is placed only on an anthropic deployment, or on an openai one whose params.supports_cache_control says its upstream reads the marker, and never on a passthrough deployment, which must forward the caller's body unchanged"))
+		}
+	}
+
+	// A capability that can never apply is a setting that says one thing and
+	// does nothing, which is refused here for the reason prompt_cache.inject on
+	// an unmarkable fleet is.
+	for i := range c.ModelList {
+		d := &c.ModelList[i]
+		if !d.Params.SupportsCacheControl {
+			continue
+		}
+		switch {
+		case d.Params.Format != core.FormatOpenAI:
+			errs = append(errs, fmt.Errorf(
+				"model_list[%d].params.supports_cache_control: only meaningful on an openai deployment; an %s one always reads the marker",
+				i, d.Params.Format))
+		case d.Params.AuthMode == core.AuthModePassthrough:
+			errs = append(errs, fmt.Errorf(
+				"model_list[%d].params.supports_cache_control: a passthrough deployment forwards the caller's body unchanged, so it is never annotated",
+				i))
 		}
 	}
 

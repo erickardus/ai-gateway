@@ -43,6 +43,10 @@ type Server struct {
 	// anything to decide. Fingerprinting is skipped for a group where it does
 	// not: hashing the prefix of every request would buy nothing.
 	pinnable map[string]bool
+	// marksOpenAIPrefix reports whether any deployment reads a cache breakpoint
+	// while speaking the OpenAI wire format, so a request in that format is not
+	// given an annotator for a capability no upstream declares.
+	marksOpenAIPrefix bool
 	// mispriced records the deployments already warned about for reporting a
 	// token counter their cost model does not price. The warning belongs in a
 	// log once per deployment, not once per request.
@@ -51,12 +55,20 @@ type Server struct {
 	// streamed request with no usage at all. Like mispriced, it is a fact about
 	// the deployment rather than the request, so it is worth one log line.
 	unmeasured sync.Map
-	// refusesAnnotation records the deployments that have refused a body the
-	// gateway annotated, proved by the same request being served once the
-	// annotation was removed. They are not annotated again: what an upstream
-	// accepts is a fact about that upstream, so the round trip that establishes
-	// it is worth paying once rather than on every request.
-	refusesAnnotation sync.Map
+	// annotationLevel records how much of what the gateway would add each
+	// deployment has been shown to accept, for the deployments that have refused
+	// something. Absent means everything, which is where a deployment starts.
+	//
+	// It is a level rather than a flag because the annotations are not equally
+	// important. A cache breakpoint is an optimization; the streamed usage
+	// option is the difference between a bill and a zero. Switching both off on
+	// one refusal would answer a lost optimization by losing the accounting too,
+	// so a refusal drops the optional part first and the essential part only if
+	// that is refused as well.
+	annotationLevel sync.Map
+	// annotationMu serializes demotion, which happens at most twice per
+	// deployment per process. Reads stay lock-free through the sync.Map.
+	annotationMu sync.Mutex
 }
 
 // deploymentPricing is what one deployment costs the operator.
@@ -78,6 +90,14 @@ func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr
 			billable: d.Params.AuthMode != core.AuthModePassthrough,
 		}
 	}
+	marksOpenAIPrefix := false
+	for i := range cfg.ModelList {
+		d := &cfg.ModelList[i]
+		if d.Params.Format == core.FormatOpenAI && d.Params.SupportsCacheControl {
+			marksOpenAIPrefix = true
+			break
+		}
+	}
 	groups := cfg.Groups()
 	pinnable := make(map[string]bool, len(groups))
 	for name, group := range groups {
@@ -86,7 +106,8 @@ func New(cfg *config.Config, authn *auth.Authenticator, store auth.KeyStore, rtr
 	return &Server{
 		cfg: cfg, auth: authn, store: store, router: rtr, log: log,
 		ledger: ledger, metrics: reg, pricing: pricing, shared: shared, cache: responses,
-		pinnable: pinnable,
+		pinnable:          pinnable,
+		marksOpenAIPrefix: marksOpenAIPrefix,
 	}
 }
 

@@ -1102,3 +1102,122 @@ func TestAnUnpricedLongWriteInTheLongContextTierIsReported(t *testing.T) {
 	want := float64(long)*7.5/1e6 + 10*6/1e6 + 20*22.5/1e6
 	assertLedgerCost(t, h, want)
 }
+
+// TestAnExplicitCacheWriteIsBilledAtItsOwnRate covers the OpenAI-compatible
+// providers that charge for a cache write.
+//
+// Most of that ecosystem caches automatically and writes for free, which is the
+// assumption the gateway's OpenAI accounting was built on. Alibaba's Qwen and
+// MiniMax do not: they have an explicit cache, they charge for the write, and
+// they report it nested inside prompt_tokens_details rather than at the top
+// level where Anthropic puts it.
+//
+// Read only the top level and those tokens are invisible as writes. They do not
+// vanish — they fall into the input bucket and are billed at the input rate,
+// which on this workload is a bill roughly 40% under what the provider charged.
+// That is the direction that matters: a budget that should have stopped a key
+// keeps letting it spend, and /spend disagrees with the invoice.
+func TestAnExplicitCacheWriteIsBilledAtItsOwnRate(t *testing.T) {
+	const (
+		promptTokens = 10_000
+		cachedTokens = 2_000
+		writtenToks  = 6_000
+		outputToks   = 100
+	)
+	// A write price is the whole point here, so it is configured rather than
+	// left to the automatic-cache default.
+	price := core.Pricing{InputPer1M: 1.25, OutputPer1M: 10, CacheReadPer1M: 0.125, CacheWritePer1M: 2.5}
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true,
+		format: core.FormatOpenAI, pricing: &price,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			// Qwen's documented shape, its redundant text_tokens included. One
+			// line, as a real body is: the usage sniffer reads the relayed
+			// stream line by line so it never delays a token.
+			fmt.Fprintf(w, `{"id":"c1","object":"chat.completion","choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"prompt_tokens_details":{"cached_tokens":%d,"text_tokens":%d,"cache_type":"ephemeral","cache_creation_input_tokens":%d,"cache_creation":{"ephemeral_5m_input_tokens":%d}}}}`,
+				promptTokens, outputToks, cachedTokens, promptTokens, writtenToks, writtenToks)
+		},
+	})
+
+	rec := h.do(t, claudeCodeRequest("/v1/chat/completions", conversationBody("openai-gpt", "hello")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	// Every prompt token billed once, in the bucket the provider priced it in.
+	const uncached = promptTokens - cachedTokens - writtenToks
+	want := float64(uncached)*price.InputPer1M/1e6 +
+		float64(cachedTokens)*price.CacheReadPer1M/1e6 +
+		float64(writtenToks)*price.CacheWritePer1M/1e6 +
+		float64(outputToks)*price.OutputPer1M/1e6
+	assertLedgerCost(t, h, want)
+
+	totals := deploymentTotals(t, h)
+	if totals.CacheWriteTokens != writtenToks {
+		t.Errorf("cache writes recorded = %d, want %d: a nested write counter read as zero bills the provider's dearest prompt tokens at its cheapest rate",
+			totals.CacheWriteTokens, writtenToks)
+	}
+	if got := totals.InputTokens + totals.CacheReadTokens + totals.CacheWriteTokens; got != promptTokens {
+		t.Errorf("prompt tokens recorded = %d, want %d: the three buckets must partition prompt_tokens, not overlap it",
+			got, promptTokens)
+	}
+}
+
+// TestAnUnpricedCacheWriteFallsBackToInput guards the edge the fix above
+// created.
+//
+// cost.cache_write_per_1m is optional on an `openai` deployment, because most of
+// that ecosystem writes for free. Now that a nested write counter is actually
+// read, an operator running Qwen or MiniMax without that optional price has
+// tokens in the write bucket and no rate for it — and billing them at zero would
+// be further from the invoice than the input rate they were charged at before
+// the counter was read at all. A missing price means the provider names no
+// separate one, not that the write was free.
+func TestAnUnpricedCacheWriteFallsBackToInput(t *testing.T) {
+	const (
+		promptTokens = 8_000
+		writtenToks  = 5_000
+		outputToks   = 50
+	)
+	// The harness default for an openai deployment, which names no write price.
+	price := harnessOpts{format: core.FormatOpenAI}.defaultPricing()
+	if price.CacheWritePer1M != 0 {
+		t.Fatalf("this test is about an unpriced write; the default now names one at %v", price.CacheWritePer1M)
+	}
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, format: core.FormatOpenAI,
+		upstream: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"id":"c1","object":"chat.completion","choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"prompt_tokens_details":{"cached_tokens":0,"cache_creation_input_tokens":%d}}}`,
+				promptTokens, outputToks, writtenToks)
+		},
+	})
+
+	rec := h.do(t, claudeCodeRequest("/v1/chat/completions", conversationBody("openai-gpt", "hello")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	// Every prompt token at the input rate: the write bucket has no rate of its
+	// own, so it costs exactly what it would have as ordinary input.
+	want := float64(promptTokens)*price.InputPer1M/1e6 +
+		float64(outputToks)*price.OutputPer1M/1e6
+	assertLedgerCost(t, h, want)
+
+	// And an unpriced write is neither a saving nor a premium, so the identity
+	// between cost and savings still holds.
+	rows, err := h.ledger.Deployments(t.Context())
+	if err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	for _, row := range rows {
+		if !nearly(row.Totals.CacheSavings, 0) {
+			t.Errorf("cache savings = %v, want 0: a write billed at the input rate neither saved nor cost extra", row.Totals.CacheSavings)
+		}
+	}
+
+	if logs := h.logBuf.String(); !strings.Contains(logs, "cost.cache_write_per_1m") {
+		t.Errorf("nothing tells the operator their provider charges for a write they have not priced:\n%s", logs)
+	}
+}

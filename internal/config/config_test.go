@@ -239,6 +239,63 @@ model_list:
 	}
 }
 
+// An openai deployment whose upstream reads a cache breakpoint — Alibaba's Qwen
+// is the one that does — makes injection meaningful on a fleet holding no
+// anthropic deployment at all.
+func TestInjectionIsAllowedOnAnOpenAIUpstreamThatReadsTheMarker(t *testing.T) {
+	const qwen = `
+prompt_cache:
+  inject: true
+model_list:
+  - model_name: qwen
+    params:
+      format: openai
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      model: qwen-max
+      auth_mode: api_key
+      auth_header: authorization
+      auth_scheme: Bearer
+      api_key: k
+      supports_cache_control: true
+`
+	if _, err := Parse([]byte(qwen)); err != nil {
+		t.Fatalf("an explicit-cache openai fleet was refused, so its callers only ever get the implicit cache: %v", err)
+	}
+
+	// Without the declaration the same fleet marks nothing, which is a setting
+	// that says one thing and does nothing.
+	if _, err := Parse([]byte(strings.Replace(qwen, "      supports_cache_control: true\n", "", 1))); err == nil {
+		t.Error("injection was accepted on a fleet where no deployment reads a breakpoint")
+	}
+}
+
+// The capability is only meaningful where a body is both OpenAI-format and
+// annotated at all.
+func TestCacheControlCapabilityIsRefusedWhereItCannotApply(t *testing.T) {
+	for _, tc := range []struct{ name, yaml, want string }{
+		{
+			name: "on an anthropic deployment, which always reads it",
+			yaml: "model_list:\n  - model_name: m\n    params:\n      format: anthropic\n      api_base: https://api.anthropic.com\n      auth_mode: api_key\n      auth_header: x-api-key\n      api_key: k\n      supports_cache_control: true\n",
+			want: "only meaningful on an openai deployment",
+		},
+		{
+			name: "on a passthrough deployment, which is never annotated",
+			yaml: "virtual_keys:\n  allowed_upstream_hosts: [api.openai.com]\nmodel_list:\n  - model_name: m\n    params:\n      format: openai\n      api_base: https://api.openai.com\n      auth_mode: passthrough\n      supports_cache_control: true\n",
+			want: "forwards the caller's body unchanged",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected a validation error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // Validation reports every problem at once, not just the first.
 func TestValidationAggregatesErrors(t *testing.T) {
 	_, err := Parse([]byte("router:\n  strategy: bogus\n  num_retries: -1\nmodel_list:\n  - model_name: m\n    params:\n      format: klingon\n      api_base: https://api.anthropic.com\n      auth_mode: api_key\n"))

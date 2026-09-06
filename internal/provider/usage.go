@@ -15,9 +15,8 @@ import (
 //
 //   - Anthropic reports input_tokens *excluding* both cache counters, alongside
 //     cache_read_input_tokens and cache_creation_input_tokens.
-//   - An OpenAI-compatible response reports prompt_tokens *including* its cached
-//     tokens, with prompt_tokens_details.cached_tokens saying how many of them
-//     were cached.
+//   - An OpenAI-compatible response reports prompt_tokens *including* every
+//     cache counter, and breaks them out beside it.
 //
 // Read an OpenAI response with Anthropic's rule and every cached token is
 // charged twice — once at the input rate inside prompt_tokens, once at the
@@ -25,6 +24,22 @@ import (
 // Ignore the field entirely, which is what a gateway does by default, and an
 // OpenAI-compatible deployment simply has no prompt-cache accounting at all: its
 // cheapest tokens are billed as its most expensive, and no metric says so.
+//
+// Where those counters sit is not consistent across the OpenAI-compatible
+// ecosystem, and the difference is money rather than tidiness:
+//
+//   - OpenAI, Kimi and GLM cache automatically and report a read as
+//     prompt_tokens_details.cached_tokens. Writes are free and unreported.
+//   - DeepSeek reports the same read as a top-level prompt_cache_hit_tokens.
+//   - Qwen and MiniMax have an explicit cache and **charge for a write**, which
+//     they report *nested inside* the details object rather than at the top
+//     level where Anthropic puts it. Qwen nests the TTL breakdown there too.
+//
+// Reading only the top level costs money on exactly the two that charge: their
+// write tokens fall into the input bucket and are billed at the input rate,
+// which understates the bill and leaves a budget unspent that the invoice says
+// was spent. So both placements are read, and neither is ever added to the
+// other — one figure under two names is still one figure.
 //
 // So the format decides the arithmetic. It is the format of the deployment the
 // request was routed to, which the gateway always knows, rather than something
@@ -66,16 +81,12 @@ type usageFields struct {
 	} `json:"iterations"`
 
 	// OpenAI Chat Completions.
-	PromptTokens        *int `json:"prompt_tokens"`
-	CompletionTokens    *int `json:"completion_tokens"`
-	PromptTokensDetails *struct {
-		CachedTokens int `json:"cached_tokens"`
-	} `json:"prompt_tokens_details"`
-	// InputTokensDetails is the same counter under the Responses API's naming,
+	PromptTokens        *int                 `json:"prompt_tokens"`
+	CompletionTokens    *int                 `json:"completion_tokens"`
+	PromptTokensDetails *promptTokensDetails `json:"prompt_tokens_details"`
+	// InputTokensDetails is the same object under the Responses API's naming,
 	// which several OpenAI-compatible servers have adopted.
-	InputTokensDetails *struct {
-		CachedTokens int `json:"cached_tokens"`
-	} `json:"input_tokens_details"`
+	InputTokensDetails *promptTokensDetails `json:"input_tokens_details"`
 	// DeepSeek and the servers that copied it report the hit/miss split at the
 	// top level instead. Miss is not read: it is prompt_tokens minus hit, which
 	// is what the subtraction below already computes.
@@ -97,26 +108,46 @@ func (f *usageFields) normalize(format core.Format) core.Usage {
 	u.OutputTokens = nonNegative(firstPresent(f.OutputTokens, f.CompletionTokens))
 
 	if format == core.FormatOpenAI {
-		// prompt_tokens is the whole input, cached part included, so the cached
-		// count is carved out of it rather than added to it. input_tokens is the
-		// same figure under the Responses API's naming — again one number under
-		// two names, not two numbers.
+		// prompt_tokens is the whole input — the cached part and anything
+		// written to a cache included — so both are carved out of it rather
+		// than added beside it. input_tokens is the same figure under the
+		// Responses API's naming: one number under two names, not two numbers.
 		total := nonNegative(firstPresent(f.PromptTokens, f.InputTokens))
 		cached := nonNegative(max(
-			openAICached(f.PromptTokensDetails),
-			openAICached(f.InputTokensDetails),
+			f.PromptTokensDetails.cacheRead(),
+			f.InputTokensDetails.cacheRead(),
 			f.PromptCacheHitTokens,
 		))
+		// Several providers with an explicit cache — Alibaba's Qwen and MiniMax
+		// among them — report what a request wrote *nested inside* the details
+		// object rather than at the top level, where Anthropic puts it. Read
+		// only the top level and their writes are invisible: the tokens fall
+		// into the input bucket and are billed at the input rate, which
+		// understates a bill on the two providers here that charge for a write.
+		written := nonNegative(max(
+			f.CacheCreationInputTokens,
+			f.PromptTokensDetails.cacheWritten(),
+			f.InputTokensDetails.cacheWritten(),
+		))
+		var long int
+		if breakdown := f.writeBreakdown(); breakdown != nil {
+			short, hour := nonNegative(breakdown.Ephemeral5m), nonNegative(breakdown.Ephemeral1h)
+			written, long = max(written, short+hour), hour
+		}
+		// Clamp against the total the provider itself reported, so an upstream's
+		// arithmetic error cannot mint savings or drive input negative. Reads
+		// are settled first and writes take what is left, which keeps every
+		// prompt token counted exactly once.
 		if cached > total {
 			cached = total
 		}
+		if written > total-cached {
+			written = total - cached
+		}
 		u.CacheReadTokens = cached
-		u.InputTokens = total - cached
-		// No mainstream OpenAI-compatible provider charges for a cache write —
-		// caching is automatic and the write is free — so there is nothing to
-		// count here. A provider that starts reporting one in Anthropic's field
-		// names is still read, since doing so cannot overstate the bill.
-		u.CacheWriteTokens = nonNegative(f.CacheCreationInputTokens)
+		u.CacheWriteTokens = written
+		u.CacheWrite1hTokens = min(long, written)
+		u.InputTokens = total - cached - written
 		return u
 	}
 
@@ -156,6 +187,14 @@ func (f *usageFields) writeBreakdown() *cacheCreation {
 	if f.CacheCreation != nil {
 		return f.CacheCreation
 	}
+	// An explicit-cache provider in the OpenAI format nests the same split
+	// inside its details object.
+	if nested := f.PromptTokensDetails.writeTiers(); nested != nil {
+		return nested
+	}
+	if nested := f.InputTokensDetails.writeTiers(); nested != nil {
+		return nested
+	}
 	var sum cacheCreation
 	found := false
 	for _, it := range f.Iterations {
@@ -178,14 +217,47 @@ func (f *usageFields) writeBreakdown() *cacheCreation {
 	return &sum
 }
 
-// openAICached reads a cached-token count out of either details object.
-func openAICached(details *struct {
+// promptTokensDetails is the object an OpenAI-compatible response breaks its
+// prompt tokens down in, under either of the two names the ecosystem uses.
+//
+// It carries more than the one counter OpenAI itself reports, because the
+// providers with an explicit cache put their write counters here rather than at
+// the top level of usage: Alibaba's Qwen reports cache_creation_input_tokens and
+// an Anthropic-shaped cache_creation breakdown nested in this object, and
+// MiniMax reports cache_read_input_tokens and cache_creation_input_tokens
+// alongside cached_tokens. Every field is a subset of prompt_tokens.
+type promptTokensDetails struct {
 	CachedTokens int `json:"cached_tokens"`
-}) int {
-	if details == nil {
+	// CacheReadInputTokens is the same figure as CachedTokens under Anthropic's
+	// name, which MiniMax reports beside it. Never their sum.
+	CacheReadInputTokens     int            `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int            `json:"cache_creation_input_tokens"`
+	CacheCreation            *cacheCreation `json:"cache_creation"`
+}
+
+// cacheRead returns the tokens this response served from a cache, under
+// whichever of the two names the provider used.
+func (d *promptTokensDetails) cacheRead() int {
+	if d == nil {
 		return 0
 	}
-	return details.CachedTokens
+	return max(d.CachedTokens, d.CacheReadInputTokens)
+}
+
+// cacheWritten returns the tokens this response wrote into a cache.
+func (d *promptTokensDetails) cacheWritten() int {
+	if d == nil {
+		return 0
+	}
+	return d.CacheCreationInputTokens
+}
+
+// writeTiers returns the nested split of a write total across cache lifetimes.
+func (d *promptTokensDetails) writeTiers() *cacheCreation {
+	if d == nil {
+		return nil
+	}
+	return d.CacheCreation
 }
 
 // firstPresent returns the first counter a response actually reported, so two

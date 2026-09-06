@@ -194,6 +194,25 @@ type DeploymentParams struct {
 	// when they match the body is forwarded with no modification at all.
 	Model string `yaml:"model"`
 
+	// SupportsCacheControl declares that this upstream reads Anthropic's
+	// cache_control marker even though it speaks the OpenAI wire format.
+	//
+	// Most of that ecosystem does not: OpenAI, Kimi, GLM and DeepSeek cache
+	// automatically, and a marker is at best ignored. Alibaba's Qwen is the
+	// exception — it has an explicit cache entered by marking a content block,
+	// with a higher hit ratio than the implicit one it falls back to.
+	//
+	// It is opt-in per deployment because it is a trade rather than a free win:
+	// the explicit cache charges for writes where the implicit one does not, so
+	// turning it on for traffic that does not reuse its prefix costs money. It
+	// is also unverifiable from here — the gateway cannot ask an arbitrary
+	// OpenAI-compatible base URL what it accepts — so an operator naming the
+	// upstream is the only sound source of the answer.
+	//
+	// Meaningless on an anthropic deployment, which always reads the marker, and
+	// on a passthrough one, whose body is never annotated.
+	SupportsCacheControl bool `yaml:"supports_cache_control"`
+
 	AuthMode core.AuthMode `yaml:"auth_mode"`
 	// AuthHeader names the header carrying the credential in api_key mode,
 	// typically "x-api-key" for Anthropic or "authorization" for OpenAI.

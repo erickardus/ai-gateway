@@ -277,12 +277,28 @@ type rates struct {
 // refuses that at load; the fallback is what keeps a config loaded by an older
 // binary from mispricing rather than crashing.
 func (p Pricing) rates(u Usage) rates {
+	// An unset cache-write price falls back to the input rate, not to nothing.
+	// A free cache write does not exist: an omitted price means the provider
+	// names no separate one, and the tokens are then charged as ordinary input.
+	//
+	// It matters because the price is optional on an `openai` deployment, where
+	// most providers cache automatically and write for free — but Alibaba's Qwen
+	// and MiniMax do charge, and report what they wrote nested inside
+	// prompt_tokens_details. Those tokens are counted as writes wherever a
+	// provider reports them, so without this fallback an operator who left the
+	// optional price unset would see them billed at zero, which is further from
+	// the invoice than the input rate they were charged at before the counter
+	// was read at all.
+	//
+	// It never fires on an `anthropic` deployment: validation requires a write
+	// price there, and requires it above input.
+	writeRate := orRate(p.CacheWritePer1M, p.InputPer1M)
 	base := rates{
 		input:        p.InputPer1M,
 		output:       p.OutputPer1M,
 		cacheRead:    p.CacheReadPer1M,
-		cacheWrite:   p.CacheWritePer1M,
-		cacheWrite1h: orRate(p.CacheWrite1hPer1M, p.CacheWritePer1M),
+		cacheWrite:   writeRate,
+		cacheWrite1h: orRate(p.CacheWrite1hPer1M, writeRate),
 	}
 	long := p.TierFor(u)
 	if long == nil {
