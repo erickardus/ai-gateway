@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"slices"
 	"strings"
@@ -64,6 +65,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	errs = append(errs, validateOTLP(c.Observability.OTLP)...)
+	errs = append(errs, validateSSO(c)...)
 
 	// A group must speak one wire format: the gateway does not translate, so a
 	// mixed group would route some requests to an upstream expecting a
@@ -594,4 +596,137 @@ func validateOTLP(o OTLPConfig) []error {
 			o.Timeout, o.Interval))
 	}
 	return errs
+}
+
+// validateSSO checks the SSO block. Everything here is refused at load rather
+// than at first login, because a login is the one moment a developer is
+// watching and the worst time to discover the gateway was misconfigured.
+func validateSSO(c *Config) []error {
+	o := c.SSO
+	if !o.Enabled() {
+		// A block written out but missing the issuer turns nothing on. That is
+		// far likelier to be an oversight than a deliberate staging area, and
+		// the endpoints would be absent with no explanation.
+		if o.ClientID != "" || o.ClientSecret != "" || o.RedirectURL != "" || len(o.Roles) > 0 {
+			return []error{errors.New(
+				"sso: configured without an issuer, so no SSO endpoints are served; set sso.issuer")}
+		}
+		return nil
+	}
+
+	var errs []error
+
+	u, err := url.Parse(o.Issuer)
+	switch {
+	case err != nil:
+		errs = append(errs, fmt.Errorf("sso.issuer: not a valid URL: %v", err))
+	case u.Host == "":
+		errs = append(errs, fmt.Errorf("sso.issuer: no host in %q", o.Issuer))
+	case u.Scheme == "http" && !isLoopbackHost(u.Hostname()):
+		// An ID token is only as trustworthy as the transport that delivered
+		// the keys it was verified against. Loopback is exempt so a fake
+		// provider can be run in a test or on a laptop.
+		errs = append(errs, fmt.Errorf(
+			"sso.issuer: must be https, got %q; the discovery document and JWKS are fetched over it, so plain HTTP would let anything on the path mint identities", o.Issuer))
+	case u.Scheme != "http" && u.Scheme != "https":
+		errs = append(errs, fmt.Errorf("sso.issuer: scheme must be https, got %q", u.Scheme))
+	}
+
+	if o.ClientID == "" {
+		errs = append(errs, errors.New("sso.client_id: required when sso.issuer is set"))
+	}
+	if o.RedirectURL == "" {
+		errs = append(errs, errors.New(
+			"sso.redirect_url: required; it is the gateway's own /sso/callback address, and must be the URI registered at the provider"))
+	} else if ru, err := url.Parse(o.RedirectURL); err != nil || ru.Scheme == "" || ru.Host == "" {
+		errs = append(errs, fmt.Errorf("sso.redirect_url: must be an absolute URL, got %q", o.RedirectURL))
+	}
+
+	if o.KeyDuration <= 0 {
+		errs = append(errs, fmt.Errorf("sso.key_duration: must be positive, got %s", o.KeyDuration))
+	}
+	if o.RenewWithin <= 0 {
+		errs = append(errs, fmt.Errorf("sso.renew_within: must be positive, got %s", o.RenewWithin))
+	}
+	// A renewal window at or beyond the key's life means every check renews,
+	// which turns a rare round trip into one per session start.
+	if o.KeyDuration > 0 && o.RenewWithin >= o.KeyDuration {
+		errs = append(errs, fmt.Errorf(
+			"sso.renew_within: must be below sso.key_duration (got %s against %s), or every session start renews", o.RenewWithin, o.KeyDuration))
+	}
+
+	if o.RoleClaim == "" {
+		errs = append(errs, errors.New("sso.role_claim: must name a claim"))
+	}
+
+	groups := c.Groups()
+	if len(o.Roles) == 0 {
+		errs = append(errs, errors.New(
+			"sso.roles: at least one role is required; an authenticated identity with no role is refused, so SSO with no roles admits nobody"))
+	}
+	seen := make(map[string]int, len(o.Roles))
+	for i, r := range o.Roles {
+		path := fmt.Sprintf("sso.roles[%d]", i)
+		if r.Match == "" {
+			errs = append(errs, fmt.Errorf("%s.match: required", path))
+		} else if prev, dup := seen[r.Match]; dup {
+			errs = append(errs, fmt.Errorf(
+				"%s.match: %q already matched by sso.roles[%d]; the first match wins, so the second can never apply", path, r.Match, prev))
+		} else {
+			seen[r.Match] = i
+		}
+		if r.RPMLimit < 0 {
+			errs = append(errs, fmt.Errorf("%s.rpm_limit: must be >= 0, got %d", path, r.RPMLimit))
+		}
+		if r.TPMLimit < 0 {
+			errs = append(errs, fmt.Errorf("%s.tpm_limit: must be >= 0, got %d", path, r.TPMLimit))
+		}
+		if r.MaxBudget < 0 {
+			errs = append(errs, fmt.Errorf("%s.max_budget: must be >= 0, got %v", path, r.MaxBudget))
+		}
+		// The same reasoning as /key/generate: a window with no cap limits
+		// nothing while looking as though it does.
+		if r.BudgetDuration > 0 && r.MaxBudget == 0 {
+			errs = append(errs, fmt.Errorf(
+				"%s.budget_duration: requires max_budget; a window with no cap limits nothing", path))
+		}
+		for _, m := range r.Models {
+			if m == "*" || strings.HasSuffix(m, "*") {
+				continue
+			}
+			if _, ok := groups[m]; !ok {
+				errs = append(errs, fmt.Errorf(
+					"%s.models: no deployment serves %q, so this role could call nothing", path, m))
+			}
+		}
+	}
+
+	// Without a model name the client cannot be configured at all, and the
+	// failure would surface as Claude Code asking for a model the gateway does
+	// not route rather than as anything naming SSO.
+	if o.Model == "" {
+		errs = append(errs, errors.New(
+			"sso.model: required when more than one model group is configured; it is handed to clients as ANTHROPIC_MODEL, which Claude Code needs because it skips model discovery when its only credential is a custom header"))
+	} else if _, ok := groups[o.Model]; !ok {
+		errs = append(errs, fmt.Errorf("sso.model: no deployment serves %q", o.Model))
+	}
+
+	if o.BaseURL == "" {
+		errs = append(errs, errors.New(
+			"sso.base_url: required when sso.redirect_url is not an absolute URL; it is handed to clients as ANTHROPIC_BASE_URL"))
+	}
+
+	return errs
+}
+
+// isLoopbackHost reports whether a hostname names this machine. It is the same
+// question the SSO callback asks of a client's redirect URI, and the answer has
+// to be exact in both places: a host that merely looks loopback, such as
+// "127.0.0.1.example.com", is somebody else's.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }

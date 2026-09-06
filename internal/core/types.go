@@ -92,6 +92,32 @@ type Key struct {
 	// BudgetDuration is the window MaxBudget applies over; zero means the key's
 	// whole lifetime.
 	BudgetDuration time.Duration `json:"budget_duration,omitempty"`
+	// Subject is the identity provider's stable identifier for the person this
+	// key was issued to, set when the key came from an SSO login and empty for
+	// a key declared in configuration or minted through /key/generate.
+	//
+	// It is what makes offboarding an operation on a person rather than on a
+	// hash an operator has to remember the owner of.
+	Subject string `json:"subject,omitempty"`
+	// Device distinguishes one person's machines. A developer signing in from a
+	// second laptop gets a second key rather than invalidating the first, so
+	// re-issuing on one machine cannot silently sign them out of another.
+	Device string `json:"device,omitempty"`
+}
+
+// SpendSubject is the identity a key's spend and budget accumulate under.
+//
+// For an ordinary key that is the key itself: one credential, one ledger entry,
+// one budget. For a key issued by an SSO login it is the person, because such a
+// key is reissued — on a renewal, on a second laptop, on a re-login after the
+// developer wiped their settings — and accounting per credential would let
+// anyone reset their own budget window by signing in again. A cap the holder
+// can clear is not a cap.
+func (k *Key) SpendSubject() string {
+	if k.Subject != "" {
+		return "sso:" + k.Subject
+	}
+	return k.Hash
 }
 
 // Expired reports whether the key's expiry has passed as of now.

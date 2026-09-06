@@ -340,3 +340,54 @@ observability:
   # for an upstream strict enough to reject the field. Anthropic is unaffected:
   # it reports usage on message_start whether asked or not.
   stream_usage: true
+
+# ---------------------------------------------------------------------------
+# SSO — a key per developer, with nothing to paste.
+#
+# With this configured, a developer runs "gateway login", authenticates against
+# your identity provider in a browser, and their Claude Code settings are
+# written for them. They never see the key. See docs/sso.md.
+#
+# The key still travels in ANTHROPIC_CUSTOM_HEADERS, which is the only channel
+# that does not displace a claude.ai subscription login — so this is the SSO
+# story that keeps the subscription, where distributing an apiKeyHelper would
+# quietly move everyone onto per-token billing.
+# ---------------------------------------------------------------------------
+# sso:
+#   issuer: https://example.okta.com
+#   client_id: ${SSO_CLIENT_ID}
+#   client_secret: ${SSO_CLIENT_SECRET}
+#   # The gateway's own callback, and the only URI registered at the provider.
+#   redirect_url: https://llm-gateway.example.com/sso/callback
+#
+#   # A key lives 30 days; the client renews inside the last 7. Renewing ahead
+#   # of expiry is what keeps it invisible — the value a running session already
+#   # read stays valid while the file is rewritten under it.
+#   key_duration: 720h
+#   renew_within: 168h
+#
+#   # Handed to clients. ANTHROPIC_MODEL is not optional: Claude Code skips
+#   # model discovery when its only credential is a custom header.
+#   base_url: https://llm-gateway.example.com
+#   model: anthropic-claude
+#
+#   # Entitlements are declared here and never read from the token. A claim that
+#   # could grant a model or raise a budget would make any claim-mapping mistake
+#   # at the provider a privilege escalation here.
+#   role_claim: groups
+#   roles:
+#     - match: platform-eng
+#       models: ["anthropic-claude", "anthropic-claude-haiku"]
+#       allow_passthrough: true      # required to reach the passthrough deployment
+#       rpm_limit: 120
+#       max_budget: 200
+#       budget_duration: 720h
+#
+#     - match: contractors
+#       models: ["anthropic-claude-haiku"]
+#       max_budget: 25
+#       budget_duration: 720h
+#
+#   # There is deliberately no "*" catch-all: an identity matching no role is
+#   # refused, and a provider covering the whole company authenticates the whole
+#   # company. Add one last only if that is what you mean.

@@ -50,6 +50,13 @@ curl -sX POST localhost:4000/key/generate \
   -d '{"alias":"laptop","models":["anthropic-claude"],"allow_passthrough":true}'
 ```
 
+Or let developers issue their own through your identity provider, so nobody
+copies a key anywhere — see **[docs/sso.md](docs/sso.md)**:
+
+```bash
+gateway login --gateway http://localhost:4000
+```
+
 Then point Claude Code at it:
 
 ```bash
@@ -70,6 +77,7 @@ claude    # /login → "Claude account with subscription"
 | `HEAD /api/hello` | Connection-warming probe. |
 | `GET /health` | Per-deployment status and the active strategy. Requires a key: it discloses upstream hosts. |
 | `GET /health/liveliness`, `/health/readiness` | Probes, unauthenticated. |
+| `GET /sso/login`, `GET /sso/callback`, `POST /sso/exchange`, `POST /sso/renew` | SSO login, when `sso.issuer` is configured. Issues a virtual key from an OpenID Connect identity. |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | Key management, master-key only. |
 | `GET /spend/keys`, `GET /spend/deployments` | Usage and cost reports, master-key only. |
 | `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. The same metrics push to an OpenTelemetry collector when `observability.otlp.endpoint` is set. |
@@ -90,6 +98,7 @@ interface waiting for it.
 | Cooldowns with automatic recovery | ✅ |
 | Rate limits — per deployment and per key | ✅ |
 | Virtual keys — issue, revoke, model allowlists | ✅ |
+| SSO — OIDC login issues a key and configures Claude Code | ✅ |
 | Credential isolation + subscription passthrough | ✅ |
 | Streaming (SSE) | ✅ |
 | Health checks, timeouts | ✅ |
@@ -113,6 +122,7 @@ unchanged, and translation is the opposite of that.
 
 - **[docs/architecture.md](docs/architecture.md)** — how it works and why
 - **[docs/claude-code.md](docs/claude-code.md)** — subscription passthrough setup
+- **[docs/sso.md](docs/sso.md)** — one command to sign a developer in and configure Claude Code
 - **[docs/configuration.md](docs/configuration.md)** — every config key, endpoint and status code
 - **[docs/routing.md](docs/routing.md)** — strategies, retries, cooldowns, fallbacks
 - **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics, response caching

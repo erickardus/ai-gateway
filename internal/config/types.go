@@ -23,6 +23,7 @@ type Config struct {
 	Redis         RedisConfig         `yaml:"redis"`
 	Cache         CacheConfig         `yaml:"cache"`
 	PromptCache   PromptCacheConfig   `yaml:"prompt_cache"`
+	SSO           SSOConfig           `yaml:"sso"`
 }
 
 // PromptCacheConfig controls how the gateway treats the provider's own prompt
@@ -338,6 +339,81 @@ type KeySpec struct {
 	// BudgetDuration is the window MaxBudget applies over. Zero means the key's
 	// whole lifetime.
 	BudgetDuration time.Duration `yaml:"budget_duration"`
+}
+
+// SSOConfig provisions virtual keys from an OpenID Connect identity provider.
+//
+// It exists because the alternative is an operator running /key/generate,
+// copying a plaintext key out of the response and sending it to a developer to
+// paste into their Claude Code settings. That is manual at both ends, puts a
+// long-lived credential through a chat window, and ties the key to nothing, so
+// offboarding depends on someone remembering which hash belonged to whom.
+//
+// The key an SSO login issues is an ordinary virtual key. It travels in the same
+// custom header as every other one, which is the whole reason this can exist at
+// all: Claude Code's only credential channel that does not displace a claude.ai
+// subscription is ANTHROPIC_CUSTOM_HEADERS. Every mechanism it offers for
+// fetching a credential dynamically — apiKeyHelper above all — writes
+// Authorization and x-api-key instead, and would bill the developer per token.
+type SSOConfig struct {
+	// Issuer is the provider's base URL, from which the OpenID Connect
+	// discovery document is read. Empty disables SSO and its endpoints.
+	Issuer string `yaml:"issuer"`
+	// ClientID and ClientSecret identify the gateway to the provider. The
+	// gateway is the only OIDC client: the CLI holds no provider configuration,
+	// so the identity team registers one redirect URI rather than one per tool.
+	ClientID     string `yaml:"client_id"`
+	ClientSecret string `yaml:"client_secret"`
+	// Scopes requested at authorization. offline_access is included by default
+	// because without a refresh token the gateway cannot re-check an identity
+	// at renewal, and renewal would then outlive the account it belongs to.
+	Scopes []string `yaml:"scopes"`
+	// RedirectURL is the gateway's own callback, and must be the URI registered
+	// at the provider.
+	RedirectURL string `yaml:"redirect_url"`
+	// KeyDuration is how long an issued key lives.
+	KeyDuration time.Duration `yaml:"key_duration"`
+	// RenewWithin is how far ahead of expiry the client renews. Renewing early
+	// is what keeps renewal invisible: the value a running session already read
+	// stays valid, and the rewritten one applies at the next launch.
+	RenewWithin time.Duration `yaml:"renew_within"`
+	// RoleClaim names the ID-token claim whose values are matched against
+	// Roles. It may hold a single string or a list of them.
+	RoleClaim string `yaml:"role_claim"`
+	// Roles map an identity to what it may do. Entitlements are declared here
+	// and never read from the token: a claim that could grant a model or raise
+	// a budget would make any mapping mistake at the provider a privilege
+	// escalation here.
+	Roles []SSORole `yaml:"roles"`
+	// BaseURL is the gateway address handed to clients as ANTHROPIC_BASE_URL.
+	// It defaults to the origin of RedirectURL, which is already the address
+	// the provider redirects a browser to.
+	BaseURL string `yaml:"base_url"`
+	// Model is handed to clients as ANTHROPIC_MODEL. It is not optional in
+	// practice: Claude Code skips model discovery when its only credential
+	// arrives in a custom header, which is exactly this arrangement. With one
+	// model group configured it defaults to that group.
+	Model string `yaml:"model"`
+}
+
+// Enabled reports whether SSO is configured. The endpoints are not registered
+// when it is not, so an unconfigured gateway serves no OIDC surface at all.
+func (s SSOConfig) Enabled() bool { return s.Issuer != "" }
+
+// SSORole is what an identity gets. The fields mirror KeySpec, so the
+// entitlements an SSO key carries are described the same way as those of a key
+// declared in configuration.
+type SSORole struct {
+	// Match is compared against the values of RoleClaim. The first role that
+	// matches wins, and "*" matches anything, so ordering is meaningful and a
+	// catch-all belongs last.
+	Match            string        `yaml:"match"`
+	Models           []string      `yaml:"models"`
+	RPMLimit         int           `yaml:"rpm_limit"`
+	TPMLimit         int           `yaml:"tpm_limit"`
+	AllowPassthrough bool          `yaml:"allow_passthrough"`
+	MaxBudget        float64       `yaml:"max_budget"`
+	BudgetDuration   time.Duration `yaml:"budget_duration"`
 }
 
 // ObservabilityConfig controls logging, metrics and spend persistence.

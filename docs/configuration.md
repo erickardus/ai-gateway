@@ -161,6 +161,31 @@ group of a different wire format.
 | `keys[].budget_duration` | lifetime | Window the budget applies over. |
 | `keys[].blocked`, `expires_at` | — | |
 
+## `sso`
+
+Issues virtual keys from an OpenID Connect login, so a developer runs
+`gateway login` instead of an operator minting a key by hand. Absent disables
+the `/sso/*` endpoints entirely. See **[sso.md](sso.md)**.
+
+| Key | Default | Notes |
+|---|---|---|
+| `issuer` | — | Provider base URL. Setting it enables SSO. Must be `https` unless it is loopback. |
+| `client_id` | required | The gateway is the only OIDC client; the CLI registers nothing. |
+| `client_secret` | — | Omit for a public client. |
+| `scopes` | `[openid, email, profile, groups, offline_access]` | `offline_access` is what buys the refresh token renewal re-checks the identity with. |
+| `redirect_url` | required | The gateway's own `/sso/callback`, registered at the provider. |
+| `key_duration` | `720h` | How long an issued key lives. |
+| `renew_within` | `168h` | How far ahead of expiry the client renews. Must be below `key_duration`. |
+| `role_claim` | `groups` | Claim matched against `roles[].match`. A string or a list of them. |
+| `roles[].match` | required | First match wins; `*` matches anything, so a catch-all belongs last. No match is refused. |
+| `roles[].models`, `rpm_limit`, `tpm_limit`, `allow_passthrough`, `max_budget`, `budget_duration` | — | The same fields as `virtual_keys.keys[]`. |
+| `base_url` | origin of `redirect_url` | Handed to clients as `ANTHROPIC_BASE_URL`. |
+| `model` | the only group, if there is one | Handed to clients as `ANTHROPIC_MODEL`. Required when several groups exist. |
+
+Entitlements are read from this file and never from the token. A claim that
+could grant a model or raise a budget would make any claim-mapping mistake at
+the provider a privilege escalation here.
+
 ## `redis`
 
 Absent means every replica keeps its own counters. See
@@ -264,6 +289,9 @@ configures this too.
 | `GET /health/liveliness`, `/health/readiness` | none |
 | `HEAD /api/hello` | none |
 | `GET /metrics` | none |
+| `GET /sso/login`, `GET /sso/callback` | none — the identity provider, plus a single-use state. Registered only when `sso.issuer` is set |
+| `POST /sso/exchange` | none — a single-use code and the client's PKCE verifier |
+| `POST /sso/renew` | the provider's refresh token |
 | `POST /key/generate`, `GET /key/info`, `GET /key/list`, `POST /key/delete` | master key |
 | `GET /spend/keys`, `GET /spend/deployments` | master key |
 | `POST /cache/purge` | master key |

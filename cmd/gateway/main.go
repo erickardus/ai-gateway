@@ -26,16 +26,36 @@ import (
 	"github.com/erickardus/ai-gateway/internal/rstate"
 	"github.com/erickardus/ai-gateway/internal/server"
 	"github.com/erickardus/ai-gateway/internal/spend"
+	"github.com/erickardus/ai-gateway/internal/sso"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
 func main() {
-	if err := run(); err != nil {
+	// Subcommands are dispatched before the server's own flags are parsed, so
+	// "gateway -config ..." keeps working exactly as it did. The login
+	// subcommand ships in this binary rather than a second one because a
+	// developer already has to obtain it, and because the settings it writes
+	// have to agree with what the gateway serves.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "login":
+			exit(runLogin(os.Args[2:]))
+		case "logout":
+			exit(runLogout(os.Args[2:]))
+		}
+	}
+	exit(run())
+}
+
+// exit reports an error the way a command-line tool should and stops.
+func exit(err error) {
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: %v\n", err)
 		os.Exit(1)
 	}
+	os.Exit(0)
 }
 
 func run() error {
@@ -174,7 +194,23 @@ func run() error {
 		}()
 	}
 
-	srv := server.New(cfg, authn, store, rtr, log, ledger, reg, shared, responses).HTTPServer()
+	gw := server.New(cfg, authn, store, rtr, log, ledger, reg, shared, responses)
+
+	// SSO, when an identity provider is configured. Pending logins go to Redis
+	// wherever it is available: a login leaves for the provider and comes back
+	// as a separate request, which behind a load balancer may reach a different
+	// instance than the one that started it.
+	if cfg.SSO.Enabled() {
+		var pending sso.Store = sso.NewMemStore()
+		if shared != nil {
+			pending = shared.SSOStore()
+		}
+		gw.UseSSO(sso.New(cfg.SSO, log), pending)
+		log.Info("sso enabled", "issuer", cfg.SSO.Issuer, "roles", len(cfg.SSO.Roles),
+			"key_duration", cfg.SSO.KeyDuration, "shared_state", shared != nil)
+	}
+
+	srv := gw.HTTPServer()
 
 	// Persist the ledger periodically and once more on the way out, so a
 	// restart does not hand every key a fresh budget.

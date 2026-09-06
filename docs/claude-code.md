@@ -69,6 +69,10 @@ virtual_keys:
 
 ### 2. Point Claude Code at the gateway
 
+If your gateway has an identity provider configured, skip the rest of this
+section: `gateway login` writes all of it, and the developer never handles a
+key. See **[sso.md](sso.md)**. The manual form follows.
+
 In `~/.claude/settings.json`:
 
 ```json
@@ -117,6 +121,13 @@ billed per token to whoever owns the credential:
 | `ANTHROPIC_API_KEY` | Sent as `x-api-key`. Used *instead of* your Pro/Max/Team subscription even while logged in. |
 | `ANTHROPIC_AUTH_TOKEN` | Overwrites `Authorization`, destroying the OAuth token. |
 | `apiKeyHelper` | Same effect as above. |
+
+Note that `apiKeyHelper` is the one Anthropic's own gateway documentation
+suggests when the credential "rotates or comes from a vault or SSO command" —
+its value is sent in **both** `Authorization` and `x-api-key`, so following that
+advice here would end the subscription. [sso.md](sso.md) is the version of that
+idea that works: the credential still comes from an SSO command, but the command
+writes `ANTHROPIC_CUSTOM_HEADERS` rather than being read as a credential.
 
 For the subscription path, set **only** `ANTHROPIC_BASE_URL`,
 `ANTHROPIC_MODEL` and `ANTHROPIC_CUSTOM_HEADERS`. If a subscription login

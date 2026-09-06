@@ -60,7 +60,9 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		s.fail(w, r, err)
 		return
 	}
-	obs.keyHash, obs.keyAlias = authCtx.Key.Hash, authCtx.Key.Alias
+	// SpendSubject rather than Hash: an SSO key is reissued over its owner's
+	// life, and billing each reissue separately would reset their budget.
+	obs.keyHash, obs.keyAlias = authCtx.Key.SpendSubject(), authCtx.Key.Alias
 
 	body, err := s.readBody(r)
 	if err != nil {

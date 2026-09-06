@@ -20,6 +20,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/router"
 	"github.com/erickardus/ai-gateway/internal/rstate"
 	"github.com/erickardus/ai-gateway/internal/spend"
+	"github.com/erickardus/ai-gateway/internal/sso"
 )
 
 // Server wires the gateway's dependencies to its HTTP handlers.
@@ -36,6 +37,10 @@ type Server struct {
 	shared *rstate.Store
 	// cache is nil when response caching is disabled.
 	cache cache.Cache
+	// sso and ssoState are nil unless SSO is configured; see UseSSO. Their
+	// absence is what leaves the /sso/* routes unregistered.
+	sso      *sso.Provider
+	ssoState sso.Store
 	// pricing maps a deployment ID to its price and whether the operator pays
 	// it, resolved once at construction rather than searched per request.
 	pricing map[string]deploymentPricing
@@ -178,6 +183,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /health/liveliness", s.handleLiveliness)
 	mux.HandleFunc("GET /health/liveness", s.handleLiveliness)
 	mux.HandleFunc("GET /health/readiness", s.handleReadiness)
+
+	// SSO, when an identity provider is configured. These are the only routes
+	// a browser reaches, and the only ones no gateway credential guards: the
+	// whole point is to issue the credential a caller does not yet have. What
+	// stands in for one is the provider's own authentication, the single-use
+	// state and code, and the client's PKCE verifier.
+	if s.sso != nil {
+		mux.HandleFunc("GET /sso/login", s.handleSSOLogin)
+		mux.HandleFunc("GET /sso/callback", s.handleSSOCallback)
+		mux.HandleFunc("POST /sso/exchange", s.handleSSOExchange)
+		mux.HandleFunc("POST /sso/renew", s.handleSSORenew)
+	}
 
 	// Key management, master-key only.
 	mux.HandleFunc("POST /key/generate", s.handleKeyGenerate)

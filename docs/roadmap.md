@@ -331,6 +331,60 @@ compose; rewriting ones need a deliberate exception.
 Keys are flat. No team-level budgets, no inherited limits, no hierarchy.
 `core.Key` would gain a parent reference and budget checks would walk it.
 
+`sso.roles` is close to the shape a team would want and is deliberately not one:
+it maps an identity to entitlements, but every identity matching a role gets its
+own independent budget, so a role is not a pool. A team budget means a cap the
+members share, which is a second subject in the ledger above
+`core.Key.SpendSubject` — the seam SSO already created for exactly this kind of
+question.
+
+### 🟡 SSO covers a browser on the same machine, and nothing else
+
+`gateway login` runs an authorization-code flow with a loopback redirect, which
+needs a browser on the machine the CLI is on. A developer on a headless box or
+over SSH has no way to complete it and falls back to a key from
+`/key/generate`.
+
+The fix is the device-authorization flow: the CLI prints a short code, the
+developer completes it in a browser anywhere, and the CLI polls. It is an extra
+endpoint pair and a polling loop against the provider's device endpoint, and it
+reuses everything else — the role mapping, the key issuing, the settings
+writer. It was left out because the stated audience was laptops.
+
+### 🟡 The SSO endpoints are not rate limited
+
+`/sso/login` takes no credential — it cannot, since issuing one is the point.
+The pending-login map is capped at 10,000 entries so it cannot grow without
+bound, and a one-time code is 256 bits and single-use, so guessing is not the
+exposure. What remains is that a caller can occupy that cap, and make the
+gateway generate tokens and read a cached discovery document, at whatever rate
+they like.
+
+The gateway has no rate limiting on unauthenticated endpoints generally, so this
+is not a gap peculiar to SSO — but it is the only unauthenticated endpoint that
+allocates. A per-IP limiter in front, or the reverse proxy most deployments
+already have, covers it.
+
+### 🟡 The refresh token is a file, not a keychain entry
+
+`~/.claude/.gateway-sso.json` holds the provider's refresh token at `0600`.
+Whoever can read it can obtain a gateway key for that identity until the
+provider revokes it.
+
+It sits beside the virtual key it renews, at the same permissions, in the same
+directory — so it is not a new class of secret on the machine, and an attacker
+who can read one can read the other. But a key that must be re-obtained is
+weaker than one already in hand, and the OS keychain is where it belongs. That
+means three platform paths (Keychain, libsecret, DPAPI), which is why it is not
+here yet.
+
+### ⚪ No SAML
+
+OIDC only. SAML would mean verifying XML digital signatures, which is a large
+hand-rolled surface and the classic source of authentication bypasses, or a
+dependency this project does not otherwise need. An organisation with only SAML
+provisioned can usually front it with an OIDC-speaking broker.
+
 ### 🔴 Persistent key store
 
 `memory` and `file` only. `file` is single-node: two instances with the same path
@@ -338,7 +392,10 @@ will clobber each other. `auth.KeyStore` is ready for Postgres.
 
 ### 🔴 Admin UI
 
-Everything is config plus the `/key/*` and `/spend/*` endpoints.
+Everything is config plus the `/key/*` and `/spend/*` endpoints. SSO removes the
+usual reason to want one — a developer no longer needs a page to mint a key
+from — but not the operator's reason: there is still no way to see who is
+signed in, or to revoke someone, without curl.
 
 ### 🔴 MCP gateway, batches, embeddings, audio
 
