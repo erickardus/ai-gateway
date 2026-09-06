@@ -76,10 +76,16 @@ func (s *Server) annotatorFor(format core.Format, stream, markConversation bool,
 	if format == core.FormatAnthropic {
 		wantsUsage = false
 	}
-	// An openai deployment declaring the capability is a reason to build one
-	// even where nothing else about the request would be annotated.
-	marksOpenAI := format == core.FormatOpenAI && s.marksOpenAIPrefix && s.cfg.PromptCache.Inject
-	if !wantsUsage && !marksOpenAI && !s.cfg.PromptCache.Inject {
+	// Injection needs somewhere to land. An anthropic deployment always reads a
+	// breakpoint, so the global switch is the whole question there; an openai
+	// one reads it only where its operator said so, and a fleet where none did
+	// would otherwise allocate an annotator per request to decide it has nothing
+	// to add.
+	marksPrefix := s.cfg.PromptCache.Inject
+	if format == core.FormatOpenAI {
+		marksPrefix = marksPrefix && s.marksOpenAIPrefix
+	}
+	if !wantsUsage && !marksPrefix {
 		return nil
 	}
 	return &annotator{srv: s, stream: stream, markConversation: markConversation, requestID: requestID}
