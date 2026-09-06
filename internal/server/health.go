@@ -69,13 +69,33 @@ func (s *Server) handleLiveliness(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
 }
 
+// storePinger is a key store that can be asked whether it is reachable without
+// being asked for its contents. A network-backed store implements it; the
+// in-process ones do not need to.
+type storePinger interface {
+	Ping(ctx context.Context) error
+}
+
+// probeKeyStore answers "is the store reachable" as cheaply as the store
+// allows. List is the fallback because every KeyStore has one, but it is the
+// wrong question to ask a database: an orchestrator probes every replica every
+// few seconds, and against Postgres each of those probes would be a full scan
+// of the key table to establish something a round trip already establishes.
+func (s *Server) probeKeyStore(ctx context.Context) error {
+	if p, ok := s.store.(storePinger); ok {
+		return p.Ping(ctx)
+	}
+	_, err := s.store.List(ctx)
+	return err
+}
+
 // handleReadiness answers whether the gateway can serve traffic, which here
 // means the key store is reachable.
 func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	status := map[string]any{"status": "ready", "key_store": "ok"}
 	code := http.StatusOK
 
-	if _, err := s.store.List(r.Context()); err != nil {
+	if err := s.probeKeyStore(r.Context()); err != nil {
 		status["status"] = "not_ready"
 		status["key_store"] = "unavailable"
 		code = http.StatusServiceUnavailable
