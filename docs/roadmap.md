@@ -46,6 +46,172 @@ Until this is done, treat "functional" as *correct against a faithful fake*.
 
 ---
 
+## Confirmed defects
+
+Found by a production-readiness review of every core capability, each
+demonstrated against the code rather than suspected. Ordered by fix priority:
+the first is a one-line change that returns wrong answers today, the last is a
+manual check that gates everything.
+
+### 🔴 The response cache serves a token count as a completion
+
+`cacheKeyFor` in `internal/server/caching.go` hashes scope, format, model and
+body. It does not hash the upstream path, and `/v1/messages` and
+`/v1/messages/count_tokens` share a format. A count_tokens call followed by an
+inference call with the identical body — Claude Code's ordinary sequence on a
+turn — is answered from the cache with `{"input_tokens": …}`, marked
+`x-gateway-cache: hit`. Reproduced with a two-request test.
+
+Same store, second gap: an SSE stream that returns 200 and then emits an
+`event: error` is stored for the full TTL, because `Relay` reports success at
+EOF regardless of what the events said and `serveInference` stores on
+`relayErr == nil`.
+
+Fix: include the upstream path in `cache.Key`, and have the relay (or the
+tee) refuse to store a stream whose last event was an error. One test each.
+
+### 🔴 A per-attempt timeout is never retried, never cools, and returns 500
+
+`attempt` in `internal/router/router.go` enforces `timeout` and
+`stream_timeout` with `time.AfterFunc(deadline, cancel)` on a plain
+`context.WithCancel`. When the timer fires the error wraps `context.Canceled`,
+which `retryable` refuses — it cannot tell the gateway's own timer from a client
+that went away — and `coolable` ignores, because it is not an `UpstreamError`.
+The server has no status mapping for it, so the caller gets `500 api_error`.
+
+So a deployment that accepts connections and never answers costs every caller
+the full deadline with no retry on the healthy peer, and is never ejected: it
+keeps its weighted share of traffic indefinitely. `TestStreamTimeoutStillBoundsTimeToFirstChunk`
+runs with one deployment and `num_retries: 0`, so it cannot see this.
+[routing.md](routing.md#retries) says transport timeouts are retried; today
+they are not.
+
+Related: the timeout is per attempt, not per request. With the defaults, retries,
+`x-litellm-num-retries` and fallback hops, one client request can hold a
+handler for many multiples of `timeout`, and nothing checks `ctx.Err()`
+between attempts. And a client whose context has already expired still burns
+one attempt and one reservation on every peer before `sleep` notices.
+
+Fix: `context.WithCancelCause` with a gateway sentinel; treat the sentinel as
+retryable and coolable; map it to 504. Then a router-level test with two
+deployments, one black-holed, asserting the second is tried.
+
+### 🔴 A caller can grow `/metrics` without bound
+
+`serveInference` sets `obs.model` from the request body before the model is
+authorized or looked up, and the rejections for `model_forbidden` and
+`model_unknown` are observed under that label. Every distinct string a valid
+key sends creates a new `gateway_requests_total` series, a
+`gateway_rejections_total` series and a sixteen-bucket latency histogram, on an
+endpoint that is unauthenticated by design and never prunes.
+[observability.md](observability.md#metrics) says labels come from
+configuration; for rejections they come from the caller.
+
+Fix: label those two rejections with a fixed value (`unknown`), or defer
+setting `obs.model` until `HasGroup` has passed.
+
+Same registry, smaller: a client that cancels mid-request is recorded as
+`gateway_error` (before headers) or `upstream_error` (after), logged at Error,
+and answered 500. Every Escape in Claude Code is a 5xx in the dashboard.
+
+### 🔴 A compressed upstream body is billed at zero
+
+`BuildUpstreamHeaders` forwards `Accept-Encoding`, and Claude Code's fetch
+sends `gzip, deflate, br`. Go's transport disables transparent decompression
+whenever the caller supplied that header, so a provider that compresses the
+response hands the relay gzip bytes. The client is fine — the bytes and
+`Content-Encoding` are relayed verbatim — but the usage sniffer sees no
+`"usage"` and the fallback classifier sees no `context_length_exceeded`.
+Result: no cost, no budget charge, no TPM accounting, no context-window fallback,
+silently, for exactly the responses large enough to be worth compressing.
+
+Whether a given provider compresses a given response type is not known from
+here, which is the point: the gateway has no defence either way. Fix: strip
+`Accept-Encoding` upstream (the transport then negotiates and decompresses
+itself), or set `DisableCompression` and decompress in the relay.
+
+### 🔴 The file key store can lose or resurrect a key
+
+`MemStore.Put` and `Delete` take a snapshot under `mu`, release it, and persist
+under a separate `writeMu`. Two concurrent writes can persist in the opposite
+order to the one they were applied in, so the file ends up holding the older
+snapshot: a key the caller was just handed is not on disk, or a key just
+revoked is. The store heals on the next write; across a restart it does not.
+
+Second gap in the same store: `NewAuthenticator` `Put`s every
+`virtual_keys.keys` entry, and with `store.kind: file` that persists them.
+`load` reads every hash back, so a key removed from `gateway.yaml` stays valid
+until `/key/delete` or `blocked: true`. [configuration.md](configuration.md)
+does not say so.
+
+Fix: take the snapshot inside `writeMu`, and either keep config-seeded keys out
+of the file or reconcile against the config on load.
+
+### 🔴 Per-key rate limits are per instance even with Redis
+
+`Authenticator.Admit` reserves against a process-local `limiter.Limiter`; the
+Redis store shares deployment windows, cooldowns, pins and spend, and never
+sees a key's `rpm_limit` or `tpm_limit`. A key limit is therefore multiplied by
+the replica count — the exact failure the table in
+[observability.md](observability.md#what-is-shared-and-what-is-not) says Redis
+exists to prevent. Deployment limits are shared as documented.
+
+Fix: route the key limiter through `rstate` the way deployment limits already
+are, or say in the docs that key limits are per instance.
+
+Same store, smaller: `Ledger.Record` runs three Redis calls under one
+`timeout`, so a slow server can land the key record and not the deployment
+record; and spend recorded locally while Redis was unreachable is never
+reconciled once it returns, so budgets are under-enforced by whatever was spent
+during the outage.
+
+### 🔴 Readiness can never fail, and nothing drains
+
+`/health/readiness` checks `store.List`, and both key stores are in-memory
+maps, so the probe is equivalent to liveness. On SIGTERM the listener closes at
+once and `Shutdown` waits; readiness never reports draining first, so a rolling
+deploy behind a load balancer has a connection-refused window equal to the
+balancer's probe interval. A stream that has received headers has no stall
+guard at all — `stream_timeout` bounds only time to first chunk — so a
+deployment that goes silent mid-response holds the handler until the client
+gives up.
+
+Fix: a `draining` flag set on the shutdown signal that turns readiness to 503
+before `Shutdown` is called, held for one probe interval; and an idle deadline
+between chunks on the relay.
+
+### 🔴 Budgets are advisory under concurrency, and a broken stream is under-billed
+
+`CheckBudget` reads the ledger; `record` writes it after the relay. There is no
+reservation between the two, so N concurrent requests on one key all pass while
+`spent < max_budget`, and the overrun is bounded only by `rpm_limit` times the
+per-request cost. The Redis ledger has the same shape.
+
+A relay that fails mid-stream — upstream reset, client disconnect — still
+records whatever usage the sniffer had seen. On Anthropic that is the
+`message_start` input figure with no output tokens; on OpenAI usage arrives in
+the final chunk, so the whole request is billed at zero. The provider charges
+for what it generated either way.
+
+Fix: reserve an estimate at `CheckBudget` and settle at `record`; and on the
+OpenAI path, treat a stream that ended without a usage chunk as `unmeasured`
+the way a non-streaming reply with no usage already is.
+
+### 🔴 Fallbacks are chosen by the first error and fire on the caller's own 400
+
+`routeGroup` keeps the first error; `fallbacksFor` classifies that one. A 503
+on attempt one followed by a context-window 400 on attempt two stops the
+retries but selects the generic list, not `context_window_fallbacks`, and
+relays the 503. And `fallbacksFor` falls through to the generic list for any
+error at all, so a malformed request or a passthrough key's expired token is
+served by another group, where [routing.md](routing.md#retries) says a 400
+fails immediately — true for retries, not for fallbacks.
+
+Fix: classify on the most specific error seen, and exclude plain 400/401/403
+from generic fallback.
+
+---
+
 ## Correctness gaps
 
 ### 🟡 In-flight and latency are per-instance
@@ -329,6 +495,17 @@ by the first request to fail on it.
 ---
 
 ## Operational
+
+### 🔴 The shipped container cannot write its own data directory
+
+The default config writes `./data/keys.json` and `./data/spend.json` relative
+to the working directory, which in the image is `/`, and the process runs as
+`nonroot`. `MkdirAll("/data")` fails, so the first `/key/generate` returns 500
+and the ledger flush warns every interval. The `Dockerfile` comment says the
+default CMD works out of the box; it needs a writable `/data` volume and the
+four environment variables the example config expands.
+
+CI never builds the image, so nothing would notice if it stopped building.
 
 ### 🔴 No Helm chart or compose file
 
