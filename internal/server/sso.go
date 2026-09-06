@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -356,7 +355,7 @@ func (s *Server) issueSSOKey(r *http.Request, action string, id *sso.Identity, r
 		s.recordAuditFailure(r, ev, err)
 		return "", nil, err
 	}
-	s.retireSSOKeys(ctx, id.Subject, device, hash)
+	s.retireSSOKeys(r, id, device, hash)
 
 	s.log.Info("sso key issued",
 		"identity", id.Display(), "subject", id.Subject, "device", device,
@@ -370,22 +369,45 @@ func (s *Server) issueSSOKey(r *http.Request, action string, id *sso.Identity, r
 // person rather than the credential — see core.Key.SpendSubject — so dropping
 // it here would hand every developer a way to clear their own budget by
 // signing in again.
-func (s *Server) retireSSOKeys(ctx context.Context, subject, device, keep string) {
+func (s *Server) retireSSOKeys(r *http.Request, id *sso.Identity, device, keep string) {
+	ctx := r.Context()
 	keys, err := s.store.List(ctx)
 	if err != nil {
-		s.log.Warn("sso: could not list keys to retire the previous one", "error", err, "subject", subject)
+		s.log.Warn("sso: could not list keys to retire the previous one", "error", err, "subject", id.Subject)
 		return
 	}
 	for _, k := range keys {
-		if k.Subject != subject || k.Device != device || k.Hash == keep {
+		if k.Subject != id.Subject || k.Device != device || k.Hash == keep {
+			continue
+		}
+		// A retirement is a key.delete like any other, and is recorded as one.
+		// Without this a reader sees credentials granted and never sees them
+		// destroyed: the chain would name a key that is missing from
+		// /key/list with nothing saying where it went, which is exactly the
+		// question an auditor reconciling the two would ask.
+		//
+		// Write-ahead, so a record that cannot be written leaves the superseded
+		// key in place rather than destroying one unrecorded. That is the same
+		// choice the loop already makes when the delete itself fails, and it
+		// errs the same way: a second live key for one person and device, which
+		// the next sign-in retires.
+		ev := s.ssoEvent(r, audit.ActionKeyDelete, id, audit.Event{
+			TargetKind: audit.TargetKey,
+			Target:     k.Hash,
+			Detail:     detail("device", device, "reason", "superseded"),
+		})
+		if auditErr := s.recordAuditErr(r, ev); auditErr != nil {
+			s.log.Warn("sso: could not record retiring a superseded key, so it was left in place",
+				"error", auditErr, "hash", k.Hash)
 			continue
 		}
 		if err := s.store.Delete(ctx, k.Hash); err != nil {
+			s.recordAuditFailure(r, ev, err)
 			s.log.Warn("sso: could not retire a superseded key", "error", err, "hash", k.Hash)
 			continue
 		}
 		s.auth.ForgetKey(ctx, k.Hash)
-		s.log.Info("sso key retired", "hash", k.Hash, "subject", subject, "device", device)
+		s.log.Info("sso key retired", "hash", k.Hash, "subject", id.Subject, "device", device)
 	}
 }
 

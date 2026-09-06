@@ -85,7 +85,7 @@ func Verify(r io.Reader) (Summary, error) {
 			summary.FirstSeq = rec.Seq
 		case rec.Seq != summary.LastSeq+1:
 			return summary, &BreakError{Line: line, Seq: rec.Seq,
-				Reason: fmt.Sprintf("sequence jumped from %d, so %d record(s) were removed", summary.LastSeq, rec.Seq-summary.LastSeq-1)}
+				Reason: sequenceBreak(summary.LastSeq, rec.Seq)}
 		case rec.Prev != summary.LastHash:
 			return summary, &BreakError{Line: line, Seq: rec.Seq,
 				Reason: "this record does not follow the one before it"}
@@ -111,8 +111,13 @@ func Verify(r io.Reader) (Summary, error) {
 	// checked at the end rather than on the first record so that the report
 	// says how much of the file did verify.
 	if summary.Records > 0 && summary.FirstSeq != 1 {
-		return summary, &BreakError{Line: 1, Seq: summary.FirstSeq,
-			Reason: fmt.Sprintf("the chain starts at sequence %d, so the first %d record(s) were removed", summary.FirstSeq, summary.FirstSeq-1)}
+		// Sequences start at 1, so a zero here is not a chain missing its
+		// beginning but a record no version of this gateway ever wrote.
+		reason := fmt.Sprintf("the chain starts at sequence %d, so the first %d record(s) were removed", summary.FirstSeq, summary.FirstSeq-1)
+		if summary.FirstSeq == 0 {
+			reason = "the chain starts at sequence 0, which no record this gateway writes ever carries"
+		}
+		return summary, &BreakError{Line: 1, Seq: summary.FirstSeq, Reason: reason}
 	}
 	return summary, nil
 }
@@ -131,4 +136,18 @@ func VerifyFile(path string) (Summary, error) {
 		return summary, fmt.Errorf("%s: %w", path, err)
 	}
 	return summary, nil
+}
+
+// sequenceBreak describes a sequence that did not increment by one.
+//
+// A jump forward means records were removed, and saying how many is the useful
+// report. Anything else — a repeat, a step backwards — means the file was
+// rewritten rather than trimmed, and there is no removal count to give. The
+// distinction is not only editorial: these are unsigned, so subtracting the
+// wrong way round would report a removal of nine quintillion records.
+func sequenceBreak(last, got uint64) string {
+	if got > last+1 {
+		return fmt.Sprintf("sequence jumped from %d, so %d record(s) were removed", last, got-last-1)
+	}
+	return fmt.Sprintf("sequence went from %d to %d rather than forward by one, so records were repeated, reordered or rewritten", last, got)
 }

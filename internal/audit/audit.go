@@ -72,6 +72,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -281,6 +282,57 @@ type chain struct {
 // is the failure this package exists to make impossible.
 var errClosed = fmt.Errorf("audit sink is closed")
 
+// maxFieldBytes bounds each free-text field a record carries.
+//
+// Several of them arrive from outside and have no length the gateway chose: a
+// User-Agent header, a reason that may quote what a caller sent, a display name
+// minted by an identity provider. A record is sealed whatever its size, but
+// Verify reads the file back with a bounded scanner, so an oversized line
+// written today is a chain that cannot be read tomorrow — and OpenFile refuses
+// to start on a chain it cannot verify. Without this, a caller who can reach any
+// audited endpoint can choose a header that stops the gateway from ever booting
+// again.
+//
+// Clipping happens before the hash is taken, so a clipped record verifies
+// exactly as any other does.
+const maxFieldBytes = 1024
+
+// clip shortens s to at most n bytes, marking that it did.
+//
+// The result is valid UTF-8 even when the cut lands inside a rune, so a record
+// reads the same way in a terminal as it does through jq — and so that two
+// readers computing the hash of the same bytes cannot disagree about what those
+// bytes say.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return strings.ToValidUTF8(s, "")
+	}
+	const ellipsis = "\u2026"
+	return strings.ToValidUTF8(s[:n-len(ellipsis)], "") + ellipsis
+}
+
+// clipDetail bounds every value in a detail map. The keys are the gateway's
+// own and need no bounding; the values are not always.
+func clipDetail(d map[string]string) map[string]string {
+	if d == nil {
+		return nil
+	}
+	out := make(map[string]string, len(d))
+	for k, v := range d {
+		out[k] = clip(v, maxFieldBytes)
+	}
+	return out
+}
+
+// clipActor bounds the two actor fields an identity provider supplies. A
+// subject claim and a display name are as much outside input as a header is;
+// they simply arrive vouched for.
+func clipActor(a Actor) Actor {
+	a.ID = clip(a.ID, maxFieldBytes)
+	a.Display = clip(a.Display, maxFieldBytes)
+	return a
+}
+
 func (c *chain) record(e Event) (Record, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -293,15 +345,15 @@ func (c *chain) record(e Event) (Record, error) {
 		At:         c.now().UTC(),
 		Prev:       c.prev,
 		Action:     e.Action,
-		Actor:      e.Actor,
+		Actor:      clipActor(e.Actor),
 		TargetKind: e.TargetKind,
-		Target:     e.Target,
+		Target:     clip(e.Target, maxFieldBytes),
 		Outcome:    e.Outcome,
-		Reason:     e.Reason,
+		Reason:     clip(e.Reason, maxFieldBytes),
 		SourceIP:   e.SourceIP,
 		RequestID:  e.RequestID,
-		UserAgent:  e.UserAgent,
-		Detail:     e.Detail,
+		UserAgent:  clip(e.UserAgent, maxFieldBytes),
+		Detail:     clipDetail(e.Detail),
 	}
 	line, err := seal(&rec)
 	if err != nil {

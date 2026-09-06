@@ -185,6 +185,11 @@ virtual_keys:
   #          is no separate migration step.
   store:
     # memory | file | postgres
+    #
+    # Switching to postgres means replacing both lines below, not just the
+    # first: a path left behind under kind: postgres is refused at load, the
+    # same way a dsn left behind under kind: file is. Either way the config
+    # would name a place the keys are not.
     kind: file
     path: ./data/keys.json
 

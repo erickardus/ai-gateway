@@ -75,11 +75,45 @@ func (s *FileSink) Record(_ context.Context, e Event) (Record, error) {
 // actions are rare — see the package comment on what is deliberately not
 // audited.
 func (s *FileSink) append(line []byte) error {
+	// Where the file ends before this record, so that a write which does not
+	// complete can be undone.
+	//
+	// The chain advances its sequence only once this returns nil, so bytes left
+	// behind by a failed write would put the file and the chain permanently out
+	// of step: the next record would carry a sequence the file has already
+	// used, and a chain with a repeated sequence never verifies again. Because
+	// OpenFile refuses a chain that does not verify, that is a gateway which can
+	// no longer be started — so a transient ENOSPC, or an fsync that fails after
+	// the write reached the page cache, would take the gateway down for good
+	// rather than failing one administrative action. Rolling back is what keeps
+	// the file holding exactly the records the chain counted.
+	before, err := s.f.Stat()
+	if err != nil {
+		return fmt.Errorf("size the audit log: %w", err)
+	}
 	if _, err := s.f.Write(line); err != nil {
-		return fmt.Errorf("write audit record: %w", err)
+		return errors.Join(fmt.Errorf("write audit record: %w", err), s.rollback(before.Size()))
 	}
 	if err := s.f.Sync(); err != nil {
-		return fmt.Errorf("sync audit log: %w", err)
+		return errors.Join(fmt.Errorf("sync audit log: %w", err), s.rollback(before.Size()))
+	}
+	return nil
+}
+
+// rollback discards a record that was not written whole.
+//
+// Its own failure is joined to the write's rather than replacing it: the
+// mutation is being refused either way, and the operator needs to know both
+// that the record could not be written and that the log may now need a hand.
+func (s *FileSink) rollback(to int64) error {
+	if err := s.f.Truncate(to); err != nil {
+		return fmt.Errorf("roll back the incomplete audit record, so the log may hold a partial line after byte %d: %w", to, err)
+	}
+	// Made durable for the same reason the record was: a truncation still in
+	// the page cache is a partial line that survives a power loss, which is the
+	// state this function exists to prevent.
+	if err := s.f.Sync(); err != nil {
+		return fmt.Errorf("sync the rolled-back audit log: %w", err)
 	}
 	return nil
 }

@@ -481,13 +481,15 @@ every valid key and read, from outside, as a fleet-wide credential problem — a
 one lost later fails requests while `/health/readiness` reports the instance
 unready, which is what takes it out of the load balancer.
 
-Two residual gaps. `/health/readiness` still probes the store with `List`, which
-is a full table scan on every poll rather than the `Ping` that now exists beside
-it; harmless at the scale a key table has, wrong in shape. And keys are read
-from the database on every request, with no cache: correct, and the reason a
-revocation takes effect immediately, but it makes a key lookup a network round
-trip on the request path. A short TTL cache would want an invalidation channel
-— Redis is already there — before it is worth the staleness.
+One residual gap: keys are read from the database on every request, with no
+cache. That is correct, and the reason a revocation takes effect immediately,
+but it makes a key lookup a network round trip on the request path. A short TTL
+cache would want an invalidation channel — Redis is already there — before it is
+worth the staleness.
+
+`/health/readiness` no longer answers by listing every key. `server.storePinger`
+asks a store that can answer cheaply, and `List` remains the fallback for the
+in-process stores that have nothing to ping.
 
 ### ✅ Admin UI
 
@@ -547,6 +549,16 @@ entropy, so this is not a guessing risk; it is an unbounded log-writing and
 hashing endpoint reachable by anyone who can open a socket, which is the same
 gap [the SSO endpoints](#-the-sso-endpoints-are-not-rate-limited) have and wants
 the same fix.
+
+It now costs an audit record too — or rather, it deliberately does not. A
+refused sign-in is exactly the record an auditor wants, and it was written until
+the arithmetic was followed through: an audit write fsyncs, a full disk fails
+every audit write, and a failed audit write refuses the action it was recording,
+so an unthrottled endpoint that writes one record per attempt hands a stranger a
+way to make the gateway unadministerable. The record is held back until the
+throttle exists, and [audit.md](audit.md#failure-posture) says so rather than
+leaving it to look like an oversight. Throttling this endpoint therefore buys
+two things, not one.
 
 ### 🔴 MCP gateway, batches, embeddings, audio
 

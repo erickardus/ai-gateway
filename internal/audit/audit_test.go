@@ -360,3 +360,165 @@ func TestRecordCarriesNoBodyOrCredentialField(t *testing.T) {
 		}
 	}
 }
+
+// A hostile User-Agent must not be able to write a record that the chain can
+// never read back.
+//
+// Verify reads with a bounded scanner and OpenFile refuses a chain it cannot
+// verify, so before the fields were clipped a caller who could reach any
+// audited endpoint could choose a header long enough to stop the gateway
+// booting again — permanently, since the record it left behind is durable.
+func TestAnOversizedFieldCannotBreakTheChain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+
+	sink, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	// Comfortably past maxLine, and past it again once JSON escaping is done:
+	// an ampersand becomes six bytes as &.
+	hostile := strings.Repeat("&", 4<<20)
+	if _, err := sink.Record(context.Background(), Event{
+		Action:    ActionConsoleSignIn,
+		Actor:     Unauthenticated(),
+		Outcome:   OutcomeRefused,
+		UserAgent: hostile,
+		Reason:    hostile,
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	summary, err := VerifyFile(path)
+	if err != nil {
+		t.Fatalf("a record with an oversized field broke the chain: %v", err)
+	}
+	if summary.Records != 1 {
+		t.Fatalf("records = %d, want 1", summary.Records)
+	}
+	// And the gateway can still open it, which is the property that actually
+	// matters: a chain that does not verify is a gateway that will not start.
+	reopened, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("reopening the chain: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+}
+
+// A record that was not written whole must leave the file as it found it.
+//
+// The chain advances its sequence only on a successful write, so bytes left
+// behind by a failed one would make the next record reuse a sequence the file
+// has already used — and a chain with a repeated sequence never verifies again,
+// which turns a transient disk error into a gateway that cannot be started.
+func TestAnIncompleteWriteIsRolledBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+
+	sink, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	if _, err := sink.Record(context.Background(), Event{
+		Action: ActionKeyGenerate, Actor: MasterKeyActor(),
+		TargetKind: TargetKey, Target: "abc123", Outcome: OutcomeSuccess,
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	// Stand in for a write that reached the file and then failed: half a line,
+	// exactly what an ENOSPC leaves behind.
+	if _, err := sink.f.Write([]byte(`{"seq":2,"action":"key.del`)); err != nil {
+		t.Fatalf("partial write: %v", err)
+	}
+	if err := sink.rollback(int64(len(good))); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after rollback: %v", err)
+	}
+	if string(after) != string(good) {
+		t.Fatalf("rollback left the file changed:\n got %q\nwant %q", after, good)
+	}
+
+	// The next record takes the sequence the failed one did not, and the chain
+	// still verifies — the whole point of rolling back.
+	if _, err := sink.Record(context.Background(), Event{
+		Action: ActionKeyDelete, Actor: MasterKeyActor(),
+		TargetKind: TargetKey, Target: "abc123", Outcome: OutcomeSuccess,
+	}); err != nil {
+		t.Fatalf("Record after rollback: %v", err)
+	}
+	summary, err := VerifyFile(path)
+	if err != nil {
+		t.Fatalf("chain broken after a rolled-back write: %v", err)
+	}
+	if summary.Records != 2 || summary.LastSeq != 2 {
+		t.Fatalf("records = %d, last seq = %d; want 2 and 2", summary.Records, summary.LastSeq)
+	}
+}
+
+// A sequence that repeats or goes backwards is a rewritten file, not a trimmed
+// one, and the report must not subtract its way into an unsigned wraparound.
+func TestASequenceThatDoesNotAdvanceReportsNoAbsurdCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+
+	sink, err := OpenFile(path)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := sink.Record(context.Background(), Event{
+			Action: ActionKeyGenerate, Actor: MasterKeyActor(),
+			TargetKind: TargetKey, Target: "abc123", Outcome: OutcomeSuccess,
+		}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Duplicate the second line, which is what a rolled-back write used to
+	// leave behind.
+	lines := strings.Split(strings.TrimRight(readFile(t, path), "\n"), "\n")
+	replayed := strings.Join(append(lines, lines[1]), "\n") + "\n"
+	if err := os.WriteFile(path, []byte(replayed), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, err = VerifyFile(path)
+	if err == nil {
+		t.Fatal("a repeated sequence verified")
+	}
+	var broken *BreakError
+	if !errors.As(err, &broken) {
+		t.Fatalf("error is %T, want *BreakError: %v", err, err)
+	}
+	// 18446744073709551615 is what uint64(2)-uint64(2)-1 reports.
+	if strings.Contains(broken.Reason, "18446744073709551615") {
+		t.Errorf("the break reason underflowed: %s", broken.Reason)
+	}
+	if !strings.Contains(broken.Reason, "repeated") {
+		t.Errorf("reason = %q, want it to name a repeat rather than a removal", broken.Reason)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}

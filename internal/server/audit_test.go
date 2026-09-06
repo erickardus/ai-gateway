@@ -249,9 +249,17 @@ func TestASinkFailureRefusesASignIn(t *testing.T) {
 	}
 }
 
-// Sign-in, refusal and sign-out are the console's own lifecycle, and a refused
-// sign-in is the one of the three an auditor asks about first.
-func TestConsoleSessionsAreAudited(t *testing.T) {
+// A refused sign-in is deliberately not recorded, and this pins that rather
+// than leaving it to be read as an oversight.
+//
+// /ui/api/session takes no credential — presenting one is the endpoint — and
+// every record is an fsync, so auditing refusals would let anyone who can reach
+// the console fill the operator's disk one request at a time. A full disk fails
+// every audit write, and a failed audit write refuses the action it was
+// recording, so the gateway would become unadministerable by exactly the person
+// under attack. The access log carries the refusal instead. When sign-in is
+// throttled, this record should come back and this test should invert.
+func TestARefusedSignInIsNotAudited(t *testing.T) {
 	h, sink := auditHarness(t)
 
 	refused := h.do(t, httptest.NewRequest(http.MethodPost, "/ui/api/session",
@@ -259,13 +267,18 @@ func TestConsoleSessionsAreAudited(t *testing.T) {
 	if refused.Code != http.StatusUnauthorized {
 		t.Fatalf("status %d, want 401", refused.Code)
 	}
-	rec := sink.find(t, audit.ActionConsoleSignIn)
-	if rec.Outcome != audit.OutcomeRefused {
-		t.Errorf("outcome = %q, want %q", rec.Outcome, audit.OutcomeRefused)
+	for _, r := range sink.records(t) {
+		if r.Action == audit.ActionConsoleSignIn {
+			t.Fatalf("a refused sign-in wrote an audit record: %+v", r)
+		}
 	}
-	if rec.Actor.Kind != audit.ActorUnauthenticated {
-		t.Errorf("actor kind = %q, want %q — nothing authenticated", rec.Actor.Kind, audit.ActorUnauthenticated)
-	}
+}
+
+// Sign-in and sign-out are the console's own lifecycle, and both are recorded:
+// the session stands in for the master key, so everything it goes on to do is
+// attributed to it.
+func TestConsoleSessionsAreAudited(t *testing.T) {
+	h, sink := auditHarness(t)
 
 	cookie := h.signIn(t)
 	out := h.uiPost(t, "/ui/api/session/delete", "", cookie)
@@ -280,7 +293,6 @@ func TestConsoleSessionsAreAudited(t *testing.T) {
 		}
 	}
 	want := []string{
-		audit.ActionConsoleSignIn + "/" + audit.OutcomeRefused,
 		audit.ActionConsoleSignIn + "/" + audit.OutcomeSuccess,
 		audit.ActionConsoleSignOut + "/" + audit.OutcomeSuccess,
 	}
@@ -430,6 +442,67 @@ func TestSSOGrantIsAuditedAgainstTheIdentity(t *testing.T) {
 	}
 	if refresh, _ := grant["refresh_token"].(string); refresh != "" && strings.Contains(written, refresh) {
 		t.Error("the audit log contains the grant's refresh token")
+	}
+}
+
+// Signing in twice from one machine destroys the first key, and that deletion
+// is a key.delete like any other.
+//
+// Without it the chain names credentials that were granted, shows them missing
+// from /key/list, and says nothing about where they went — which is the first
+// discrepancy anyone reconciling the two would find, and the hardest to explain
+// afterwards.
+func TestRetiringASupersededSSOKeyIsAudited(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	sink := newRecordingSink()
+	h.srv.UseAudit(sink)
+
+	first, _ := sso.NewToken()
+	_, one := h.login(t, first)
+	if got := one["_status"]; got != float64(http.StatusOK) {
+		t.Fatalf("first exchange status = %v", got)
+	}
+	second, _ := sso.NewToken()
+	_, two := h.login(t, second)
+	if got := two["_status"]; got != float64(http.StatusOK) {
+		t.Fatalf("second exchange status = %v", got)
+	}
+
+	var deletes []audit.Record
+	for _, r := range sink.records(t) {
+		if r.Action == audit.ActionKeyDelete {
+			deletes = append(deletes, r)
+		}
+	}
+	if len(deletes) != 1 {
+		t.Fatalf("key.delete records = %d, want 1 for the superseded key", len(deletes))
+	}
+	rec := deletes[0]
+	if rec.Actor.Kind != audit.ActorSSOSubject {
+		t.Errorf("actor kind = %q, want %q — the retirement belongs to the identity that caused it",
+			rec.Actor.Kind, audit.ActorSSOSubject)
+	}
+	if rec.TargetKind != audit.TargetKey || rec.Target == "" {
+		t.Errorf("target = %q/%q, want the hash of the retired key", rec.TargetKind, rec.Target)
+	}
+	if rec.Detail["reason"] != "superseded" {
+		t.Errorf("detail reason = %q, want superseded", rec.Detail["reason"])
+	}
+	// It must name the key that was destroyed, not the one that replaced it.
+	var granted []string
+	for _, r := range sink.records(t) {
+		if r.Action == audit.ActionSSOGrant {
+			granted = append(granted, r.Target)
+		}
+	}
+	if len(granted) != 2 {
+		t.Fatalf("sso.grant records = %d, want 2", len(granted))
+	}
+	if rec.Target != granted[0] {
+		t.Errorf("the delete names %q, want the first sign-in's key %q", rec.Target, granted[0])
+	}
+	if rec.Target == granted[1] {
+		t.Error("the delete names the key that was just issued rather than the one it replaced")
 	}
 }
 

@@ -149,21 +149,21 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.auth.IsMasterKey(core.StripScheme(strings.TrimSpace(req.MasterKey))) {
+		// Deliberately logged and not audited, for the same reason an
+		// unauthenticated refusal at /key/* is not — see keys.go. This endpoint
+		// takes no credential, because presenting one *is* the endpoint, and
+		// every audit record is an fsync. Recording refusals here would hand
+		// anyone who can reach /ui a way to fill the operator's disk one request
+		// at a time, and a full disk makes every audit write fail, which makes
+		// every administrative action fail: the gateway would become
+		// unadministerable by the person being attacked.
+		//
+		// The record is worth having and should return the moment sign-in is
+		// throttled — see the roadmap's "Sign-in is not rate limited". Until
+		// then this line is the trail, and it costs no disk the process's own
+		// logging was not already spending.
 		s.log.Warn("admin ui sign-in refused", "remote", r.RemoteAddr,
 			"request_id", RequestIDFrom(r.Context()))
-		refused := s.adminEvent(r, audit.Event{
-			Action:     audit.ActionConsoleSignIn,
-			TargetKind: audit.TargetSession,
-			Outcome:    audit.OutcomeRefused,
-			Reason:     "the presented key is not the master key",
-		})
-		// Whoever this was, the gateway did not authenticate them. The default
-		// actor for an administrative endpoint is the master key, which is
-		// exactly what this request failed to present.
-		refused.Actor = audit.Unauthenticated()
-		if !s.recordAudit(w, r, refused) {
-			return
-		}
 		writeError(w, http.StatusUnauthorized, "authentication_error", "that is not the master key")
 		return
 	}

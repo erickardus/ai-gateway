@@ -15,8 +15,8 @@ show me that the answer has not been edited since.
 |---|---|
 | `key.generate` | a virtual key is minted, from `/key/generate` or the console |
 | `key.update` | a key is edited — re-budgeted, re-scoped, blocked, unblocked |
-| `key.delete` | a key is revoked |
-| `console.sign_in` | an operator signs in to `/ui`, and when a sign-in is refused |
+| `key.delete` | a key is revoked, including the superseded key an SSO sign-in retires |
+| `console.sign_in` | an operator signs in to `/ui`. A refused sign-in is deliberately not recorded — see [failure posture](#failure-posture) |
 | `console.sign_out` | a console session is ended |
 | `sso.grant` | an identity is issued a key by a login, and when one is refused |
 | `sso.renew` | a key is reissued against the provider's refresh token, and when one is refused |
@@ -188,14 +188,17 @@ There are three deliberate exceptions.
 **Signing out** is recorded but never refused. Refusing it would leave a live
 console session behind, which is worse than an unrecorded sign-out.
 
-**Unauthenticated refusals at `/key/*`** are not recorded. Those endpoints are
-reachable by anyone who can open a socket, and an audit write fsyncs; recording
-every attempt would hand a stranger a way to fill the operator's disk with
-evidence of nothing. The access log already carries the 401 with its source and
-request ID. A refused console sign-in *is* recorded, because it is a person at a
-form and the one anybody asks about — see
-[roadmap.md](roadmap.md#-sign-in-is-not-rate-limited) for the throttle that
-endpoint still wants.
+**Unauthenticated refusals** — at `/key/*`, and at the console's sign-in — are
+not recorded. Those endpoints are reachable by anyone who can open a socket, and
+an audit write fsyncs; recording every attempt would hand a stranger a way to
+fill the operator's disk with evidence of nothing. Worse than the disk: a full
+disk fails every audit write, and a failed audit write refuses the action it was
+recording, so the gateway becomes unadministerable by exactly the person under
+attack. The access log already carries the 401 with its source and request ID.
+
+A refused sign-in is the record an auditor asks about first, and it should come
+back the moment that endpoint is throttled — see
+[roadmap.md](roadmap.md#-sign-in-is-not-rate-limited).
 
 **SSO failures before an identity is established** — a failed token exchange, an
 unverifiable ID token — are not recorded, for the same reason and because there

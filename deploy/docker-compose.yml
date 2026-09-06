@@ -36,9 +36,11 @@ services:
   # The shared key store. It is wired up but not yet used: the example config
   # ships with `store.kind: file`, which in this arrangement means each gateway
   # keeps its own keys inside its own container and neither can see the other's.
-  # Uncomment the postgres block under virtual_keys.store in your gateway.yaml —
-  # the DSN below is already in the environment — and the two instances share
-  # one set of keys. The gateway creates its own table on startup.
+  # Uncomment the postgres block under virtual_keys.store in your gateway.yaml,
+  # set kind: postgres and REMOVE the path line beside it — the DSN below is
+  # already in the environment — and the two instances share one set of keys.
+  # The gateway creates its own table on startup, and refuses to start on a
+  # config that names both a path and a database.
   postgres:
     image: postgres:16-alpine
     environment:

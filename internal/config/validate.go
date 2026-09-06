@@ -339,6 +339,14 @@ func (c *Config) Validate() error {
 	if store.Kind != "postgres" && store.DSN != "" {
 		errs = append(errs, fmt.Errorf("virtual_keys.store.dsn: set while store.kind is %q, which never connects to a database; use kind: postgres or remove the dsn", store.Kind))
 	}
+	// And the mirror of it. Switching a file store to postgres means editing
+	// the line below the path, so leaving the path behind is the likely
+	// mistake rather than an unlikely one — and it leaves a config naming a
+	// file of keys that the gateway does not read, which is the same
+	// misdirection in the other direction.
+	if store.Kind == "postgres" && store.Path != "" {
+		errs = append(errs, fmt.Errorf("virtual_keys.store.path: %q is set while store.kind is \"postgres\", which keeps no file; remove the path or use kind: file", store.Path))
+	}
 	if store.Timeout < 0 {
 		errs = append(errs, fmt.Errorf("virtual_keys.store.timeout: must not be negative, got %s", store.Timeout))
 	}
