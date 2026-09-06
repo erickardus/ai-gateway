@@ -44,7 +44,7 @@ the router load-balances across. A group must be format-homogeneous.
 | `cost.input_per_1m` | — | Per million tokens. |
 | `cost.output_per_1m` | — | |
 | `cost.cache_read_per_1m` | — | Required once `input_per_1m` is set. Not optional detail: Claude Code leans on prompt caching. |
-| `cost.cache_write_per_1m` | — | Required on an `anthropic` deployment once `input_per_1m` is set. |
+| `cost.cache_write_per_1m` | `input_per_1m` | Required on an `anthropic` deployment once `input_per_1m` is set. Optional on an `openai` one, where most providers write for free — but set it for Qwen or MiniMax, which charge. |
 | `cost.cache_write_1h_per_1m` | `cache_write_per_1m` | Anthropic's one-hour cache write, priced at 2x base input against the five-minute tier's 1.25x. |
 | `cost.long_context` | — | The higher rates a provider charges above a prompt size. Optional; see below. |
 
@@ -69,8 +69,13 @@ So the combination fails validation rather than serving traffic:
 | `cache_write_per_1m` required and above `input_per_1m`, on `anthropic` | a write is charged at a premium; pricing it at or below input makes a cache miss look free |
 | `cache_write_1h_per_1m`, if set, at least `cache_write_per_1m` | the longer-lived cache is the more expensive one to write |
 
-An `openai` deployment needs no write price: OpenAI-compatible providers cache
-automatically and charge nothing to write.
+An `openai` deployment usually needs no write price: OpenAI, Kimi, GLM and
+DeepSeek all cache automatically and charge nothing to write. Alibaba's Qwen and
+MiniMax do charge, so a deployment pointing at either wants
+`cache_write_per_1m`. Left unset it falls back to `input_per_1m` rather than to
+nothing — a free cache write does not exist, and an omitted price means the
+provider names no separate one — and the first response reporting a charged
+write on an unpriced deployment says so in the log.
 
 ### The long-context tier
 

@@ -172,6 +172,27 @@ every request — the same objection that keeps in-flight and latency local.
 `gateway_prompt_affinity_total{outcome="miss"}` alongside `gateway_in_flight`
 shows the bound firing.
 
+### 🟡 Provider cache shapes are read from docs, not from live traffic
+
+The OpenAI-compatible ecosystem does not agree on where the cache counters go.
+OpenAI, Kimi and GLM report a read as `prompt_tokens_details.cached_tokens` and
+no write; DeepSeek reports the read at the top level as
+`prompt_cache_hit_tokens`; Qwen and MiniMax charge for a write and report it
+nested inside `prompt_tokens_details`, where Qwen also nests the TTL breakdown.
+All of those are read, and the fixtures in `usage_test.go` are the shapes each
+provider's own documentation gives.
+
+None of it has been seen on the wire from this gateway. The shapes came from
+provider docs cross-checked against LiteLLM's regression fixtures, which is a
+good deal better than inference but is not the same as a response from the
+provider. It shares the caveat at the top of this file: nothing here has talked
+to a real upstream.
+
+The failure mode if a shape is wrong is quiet in the usual way. A counter under
+an unread name lands in the input bucket and is billed at the input rate, which
+is roughly right for the providers that write for free and understates the two
+that charge. Adding a provider means adding a fixture, not a code path.
+
 ### 🟡 Cache-write tiers are priced, not verified
 
 The gateway reads Anthropic's `cache_creation` breakdown and prices the
@@ -322,6 +343,8 @@ Not gaps — decisions, recorded so they are not "fixed" by accident.
 | Cache scope | per-key by default | shared-by-default leaks completions across tenants |
 | Provider prompt cache | routed for, by default | LiteLLM has the same idea behind an opt-in `optional_pre_call_checks` entry, so the default arrangement pays a cache write on every hop |
 | OpenAI cached tokens | carved out of `prompt_tokens` | they are reported *inside* the input count, so adding them beside it bills every cached token twice. LiteLLM reaches the same answer by recomputing the input figure when the parts exceed the total |
+| A nested cache-write counter | read at either level | Qwen and MiniMax nest `cache_creation_input_tokens` inside `prompt_tokens_details` and charge for it. LiteLLM reads the nesting too, after a regression that billed those tokens as input |
+| An unset cache-write price | falls back to input | a missing price means the provider names no separate one, not that the write was free. LiteLLM reaches the same conclusion for its savings figures |
 | Streamed OpenAI usage | asked for | a streamed reply reports none unless the request opted in, so the traffic is billed at zero |
 | A moving cache breakpoint | ignored when pinning | every Anthropic client walks one forward each turn, which would re-pin the conversation every time. LiteLLM's affinity key is the messages up to and including the last breakpoint, marker bytes and all, so its own injected breakpoint moves the key every turn |
 | Affinity key | prefix, tools and model group | LiteLLM hashes neither the tools nor the model, so two conversations sharing a history but not a toolset share a pin |

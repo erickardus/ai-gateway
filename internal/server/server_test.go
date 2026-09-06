@@ -134,8 +134,9 @@ func (o harnessOpts) defaultPricing() core.Pricing {
 		return *o.pricing
 	}
 	if o.format == core.FormatOpenAI {
-		// OpenAI-compatible providers cache automatically and charge nothing to
-		// write, so there is no write price to configure.
+		// Most OpenAI-compatible providers cache automatically and charge
+		// nothing to write, so the default names no write price. The ones that
+		// do charge — Qwen, MiniMax — are covered by tests passing their own.
 		return core.Pricing{InputPer1M: 1.25, OutputPer1M: 10, CacheReadPer1M: 0.125}
 	}
 	return core.Pricing{InputPer1M: 3, OutputPer1M: 15, CacheReadPer1M: 0.3, CacheWritePer1M: 3.75}

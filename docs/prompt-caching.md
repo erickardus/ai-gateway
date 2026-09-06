@@ -636,9 +636,15 @@ rather than served.
 
 The gateway reads Anthropic's `cache_read_input_tokens` and
 `cache_creation_input_tokens` from the response, including from the
-`message_start` event of a streamed reply, and the OpenAI-compatible
-`prompt_tokens_details.cached_tokens` under the rule
+`message_start` event of a streamed reply, and every OpenAI-compatible spelling
+of the same counters — at the top level and nested inside
+`prompt_tokens_details` — under the rule
 [above](#openai-compatible-deployments).
+
+`cache_write_per_1m` is optional on an `openai` deployment, since most of that
+ecosystem writes for free. Where it is unset it falls back to `input_per_1m`
+rather than to nothing, so a provider that does charge is approximated rather
+than billed at zero, and the deployment is named once in the log.
 
 ### The two write tiers
 
