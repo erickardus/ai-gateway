@@ -116,6 +116,73 @@ func TestUsageIsReadUnderTheFormatThatProducedIt(t *testing.T) {
 			want:    core.Usage{InputTokens: 0, OutputTokens: 5, CacheReadTokens: 100},
 		},
 		{
+			// Alibaba's Qwen nests its write counters inside the details object
+			// rather than at the top level where Anthropic puts them, and
+			// charges for a write. Read only the top level and the 2048 written
+			// tokens fall into the input bucket at the input rate, understating
+			// the bill by roughly a fifth. Shape from Alibaba's own docs; the
+			// redundant text_tokens it also sends counts the written tokens
+			// again and is deliberately not read.
+			name:   "qwen nests its cache write inside the details object",
+			format: core.FormatOpenAI,
+			payload: `{"usage":{"prompt_tokens":2059,"completion_tokens":201,` +
+				`"prompt_tokens_details":{"cached_tokens":0,"text_tokens":2059,"cache_type":"ephemeral",` +
+				`"cache_creation_input_tokens":2048,"cache_creation":{"ephemeral_5m_input_tokens":2048}}}}`,
+			want: core.Usage{InputTokens: 11, OutputTokens: 201, CacheWriteTokens: 2048},
+		},
+		{
+			// The same nesting with a one-hour tier, which Qwen reports in the
+			// same place. Priced at the five-minute rate it is understated again.
+			name:   "a nested write breakdown carries its own lifetime",
+			format: core.FormatOpenAI,
+			// 904 + 1000 read + 4096 written = the 6000 prompt_tokens they are
+			// subsets of.
+			payload: `{"usage":{"prompt_tokens":6000,"completion_tokens":10,` +
+				`"prompt_tokens_details":{"cached_tokens":1000,` +
+				`"cache_creation":{"ephemeral_5m_input_tokens":1024,"ephemeral_1h_input_tokens":3072}}}}`,
+			want: core.Usage{
+				InputTokens: 904, OutputTokens: 10, CacheReadTokens: 1000,
+				CacheWriteTokens: 4096, CacheWrite1hTokens: 3072,
+			},
+		},
+		{
+			// MiniMax reports the read under both names and the write nested,
+			// and charges for the write. Its own non_cached_input_tokens is 500,
+			// which is what InputTokens must come to: proof the three buckets
+			// partition prompt_tokens rather than overlapping it.
+			name:   "minimax reports a read under both names and a nested write",
+			format: core.FormatOpenAI,
+			payload: `{"usage":{"prompt_tokens":3000,"completion_tokens":100,` +
+				`"prompt_tokens_details":{"cached_tokens":500,"cache_read_input_tokens":500,` +
+				`"cache_creation_input_tokens":2000,"non_cached_input_tokens":500}}}`,
+			want: core.Usage{
+				InputTokens: 500, OutputTokens: 100,
+				CacheReadTokens: 500, CacheWriteTokens: 2000,
+			},
+		},
+		{
+			// GLM and Kimi cache automatically and report nothing but a read, so
+			// the nested write fields must not invent one for them.
+			name:   "an automatic cache still reports only a read",
+			format: core.FormatOpenAI,
+			payload: `{"usage":{"prompt_tokens":1200,"completion_tokens":300,` +
+				`"prompt_tokens_details":{"cached_tokens":800}}}`,
+			want: core.Usage{InputTokens: 400, OutputTokens: 300, CacheReadTokens: 800},
+		},
+		{
+			// A read and a write that together exceed the total they are subsets
+			// of. Reads settle first and the write takes what is left, so input
+			// never goes negative and no token is counted twice.
+			name:   "a nested write larger than the input left for it",
+			format: core.FormatOpenAI,
+			payload: `{"usage":{"prompt_tokens":1000,"completion_tokens":5,` +
+				`"prompt_tokens_details":{"cached_tokens":600,"cache_creation_input_tokens":900}}}`,
+			want: core.Usage{
+				InputTokens: 0, OutputTokens: 5,
+				CacheReadTokens: 600, CacheWriteTokens: 400,
+			},
+		},
+		{
 			name:    "negative counters are refused rather than credited",
 			format:  core.FormatAnthropic,
 			payload: `{"usage":{"input_tokens":-5,"output_tokens":10,"cache_read_input_tokens":-1}}`,
