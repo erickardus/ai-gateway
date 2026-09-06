@@ -927,3 +927,60 @@ func TestARefusedBreakpointKeepsTheUsageOption(t *testing.T) {
 		t.Error("a refused breakpoint also cost this deployment its usage option, so its streamed traffic is now billed as nothing")
 	}
 }
+
+// TestOnlyTheDeclaredUpstreamIsMarked is what makes the capability a capability
+// rather than a switch.
+//
+// One fleet can hold both kinds: a Qwen deployment whose explicit cache reads
+// the marker, beside a plain OpenAI-compatible server that caches automatically
+// and would at best ignore one. Marking both would send a field to an upstream
+// that never asked for it, on every request, to no benefit — and to a strict
+// server, a 400 and a lost round trip.
+func TestOnlyTheDeclaredUpstreamIsMarked(t *testing.T) {
+	var plainSeen, capableSeen []string
+	var mu sync.Mutex
+	collect := func(into *[]string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			*into = append(*into, string(body))
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"c1","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":5}}`)
+		}
+	}
+
+	off := false
+	h := newHarness(t, harnessOpts{
+		authMode: "api_key", allowPassthrough: true, format: core.FormatOpenAI,
+		extraDeployments: 1, extraSupportsCacheControl: true,
+		// Affinity would pin this one prompt to whichever upstream served it
+		// first and leave half the assertion unexercised.
+		promptCache: config.PromptCacheConfig{Inject: true, Affinity: &off},
+		upstreams:   []http.HandlerFunc{collect(&plainSeen), collect(&capableSeen)},
+	})
+
+	for i := 0; i < 12; i++ {
+		rec := h.do(t, claudeCodeRequest("/v1/chat/completions", openaiPromptBody(fmt.Sprintf("turn %d", i))))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, body = %s", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(plainSeen) == 0 || len(capableSeen) == 0 {
+		t.Fatalf("plain saw %d requests and capable saw %d: both must be exercised for this to mean anything",
+			len(plainSeen), len(capableSeen))
+	}
+	for i, body := range capableSeen {
+		if !strings.Contains(body, "cache_control") {
+			t.Errorf("request %d to the declared upstream carried no breakpoint, so it only gets the implicit cache: %s", i, body)
+		}
+	}
+	for i, body := range plainSeen {
+		if strings.Contains(body, "cache_control") {
+			t.Errorf("request %d marked an upstream that never said it reads one: %s", i, body)
+		}
+	}
+}

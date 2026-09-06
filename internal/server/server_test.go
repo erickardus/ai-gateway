@@ -110,6 +110,10 @@ type harnessOpts struct {
 	// while speaking the OpenAI wire format, which is what an operator says
 	// about a Qwen deployment.
 	supportsCacheControl bool
+	// extraSupportsCacheControl declares the capability on the extra deployments
+	// only, which builds a fleet mixing an upstream that reads a breakpoint with
+	// one that does not — the case that proves the flag is what decides.
+	extraSupportsCacheControl bool
 	// extraAuthMode gives the extra deployments a different auth mode from the
 	// first. It is what builds a mixed fleet — subscription traffic beside API
 	// traffic in one group — which is the arrangement a per-deployment body
@@ -200,6 +204,9 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		t.Cleanup(extra.Close)
 		extraParams := params
 		extraParams.APIBase = extra.URL
+		if opts.extraSupportsCacheControl {
+			extraParams.SupportsCacheControl = true
+		}
 		if opts.extraAuthMode != "" {
 			extraParams.AuthMode = opts.extraAuthMode
 			if opts.extraAuthMode == core.AuthModePassthrough {
