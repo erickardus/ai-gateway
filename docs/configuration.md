@@ -150,8 +150,44 @@ group of a different wire format.
 | `master_key` | — | Enables `/key/*`, `/spend/*`, `/cache/purge`. Absent disables them. |
 | `header_names` | `[x-gateway-key, x-litellm-api-key]` | Headers that may carry a key, in precedence order. |
 | `allowed_upstream_hosts` | — | Where a passthrough deployment may relay a credential. |
-| `store.kind` | `memory` | `memory` or `file`. |
+| `store.kind` | `memory` | `memory`, `file` or `postgres`. |
 | `store.path` | required for `file` | Written atomically at `0600`, hashes only. |
+| `store.dsn` | required for `postgres` | Connection string. Carries a password, so give it as `${VAR}`. Refused on any other kind. |
+| `store.timeout` | `2s` | Bounds each key-store query. Longer than `redis.timeout` because there is nothing to fall back to. |
+| `store.max_conns` | `10` | Pool size per gateway process. |
+
+### Choosing a key store
+
+`memory` keeps keys for the life of the process, which is right for a gateway
+whose keys all come from this file and wrong for anything that mints one at
+runtime.
+
+`file` persists across restarts and is **single-node**. Two instances pointed at
+the same path do not share it: each holds the whole set in memory and rewrites
+the file wholesale, so a key issued on one is erased by the next write from the
+other.
+
+`postgres` is what a fleet uses. Every replica reads and writes one table, so a
+key from `/key/generate`, an SSO login or a renewal is usable at whichever
+instance the load balancer picks next. The gateway creates and migrates its own
+`virtual_keys` table on startup — there is no separate migration step — and
+stores hashes only, exactly as the file store does.
+
+The failure posture differs from Redis on purpose. An unreachable Redis
+[degrades](observability.md#what-is-shared-and-what-is-not) the gateway to
+per-instance limits, because worse service beats none. An unreachable key store
+has no such weaker mode: nothing can be authenticated, and serving from a stale
+copy would keep honouring keys an operator had just revoked. So a gateway that
+cannot reach Postgres **refuses to start**, and one that loses it later fails
+requests and reports itself unready on `/health/readiness`, which takes it out
+of the load balancer until the database returns.
+
+```yaml
+virtual_keys:
+  store:
+    kind: postgres
+    dsn: ${KEY_STORE_DSN}   # postgres://gateway:...@db:5432/gateway?sslmode=require
+```
 | `keys[].key` | required | Hashed at load; the plaintext is not retained. |
 | `keys[].alias` | — | Appears in logs and spend reports. |
 | `keys[].models` | any | Exact names or a trailing `*`. |
@@ -446,6 +482,41 @@ make ui && make build
 
 A binary built without it serves a page saying so; the gateway proxies inference
 normally either way.
+
+## `audit`
+
+A tamper-evident record of administrative actions — key lifecycle, console
+sessions, SSO grants, cache purges, startup and shutdown. **On** by default.
+
+| Key | Default | Notes |
+|---|---|---|
+| `enabled` | `true` | Records administrative actions. |
+| `sink` | `stdout` | `stdout` or `file`. |
+| `path` | — | Required by the `file` sink, refused with any other. |
+
+On by default is the opposite of `ui` above, and deliberate: the default sink is
+stdout, so the record costs nothing and creates nothing the operator did not ask
+for. A gateway that records administration only when asked has no record on the
+one occasion anybody wants one, because that question is always asked
+afterwards.
+
+The `file` sink appends JSON Lines, verifies the existing chain at startup and
+continues it, and **refuses to start** on a chain that no longer verifies. The
+`stdout` sink cannot read back what it wrote, so its chain restarts at sequence
+1 with each process.
+
+Writes are synchronous and a failed write fails the action it was recording: a
+key that could not be audited is not minted. Inference is not audited, which is
+what makes that affordable. `gateway_audit_write_failures_total` counts the
+refusals and is worth an alert.
+
+```
+gateway -verify-audit ./data/audit.jsonl
+```
+
+verifies a chain and prints its last sequence number and hash, which is the
+anchor that makes truncation of the tail detectable. Full detail in
+**[audit.md](audit.md)**.
 
 ## Endpoints
 

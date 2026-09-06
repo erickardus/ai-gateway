@@ -171,10 +171,42 @@ virtual_keys:
   # Enables the /key/* management endpoints. Leave unset to disable them.
   master_key: ${GATEWAY_MASTER_KEY}
 
+  # Where issued keys live. Only hashes are ever stored, whichever kind you
+  # choose: the plaintext key exists once, in the response that issued it.
+  #
+  # memory   forgotten on restart. Fine when every key is declared below.
+  # file     survives a restart, and is SINGLE-NODE. Two instances pointed at
+  #          one path do not share it — each holds the whole set in memory and
+  #          rewrites the file wholesale, so a key issued on one is erased by
+  #          the next write from the other.
+  # postgres shared by every replica, which is what makes /key/generate, an SSO
+  #          login and a renewal work behind a load balancer. The gateway
+  #          creates and migrates its own virtual_keys table at startup; there
+  #          is no separate migration step.
   store:
-    # memory | file
+    # memory | file | postgres
+    #
+    # Switching to postgres means replacing both lines below, not just the
+    # first: a path left behind under kind: postgres is refused at load, the
+    # same way a dsn left behind under kind: file is. Either way the config
+    # would name a place the keys are not.
     kind: file
     path: ./data/keys.json
+
+    # The dsn carries a password, so it comes from the environment: this file is
+    # mounted read-only into containers and committed to repositories. Setting
+    # it while kind is not postgres is refused at load rather than ignored,
+    # since the keys would not be where one of the two lines says they are.
+    #
+    # Unlike redis, an unreachable key store is not degraded around: nothing can
+    # be authenticated without it, and serving from a stale copy would keep
+    # honouring keys you had just revoked. So the gateway refuses to start if
+    # Postgres is unreachable at boot, and reports itself unready on
+    # /health/readiness if it goes away later.
+    #
+    # dsn: ${KEY_STORE_DSN}   # postgres://gateway:...@db:5432/gateway?sslmode=require
+    # timeout: 2s             # per query; longer than redis.timeout, which has a fallback
+    # max_conns: 10           # pool size per gateway process
 
   # Headers that may carry a virtual key, in precedence order. These must not
   # collide with a header the client sets itself: the whole design depends on
@@ -351,6 +383,44 @@ ui:
   # the process that served the traffic, so a fleet behind a load balancer shows
   # each instance its own slice rather than the whole. 0 keeps none.
   request_log_size: 1000
+
+# The audit log: a tamper-evident record of administrative actions.
+#
+# Minting, editing and deleting a key, signing in and out of the console,
+# issuing and renewing an SSO grant, purging the cache, and this process
+# starting and stopping. Not inference — that is the access log's and the spend
+# ledger's job, and per-request auditing would put an fsync on the hot path for
+# traffic those two already describe.
+#
+# On by default, which is the opposite of `ui` above and deliberate: the default
+# sink is stdout, so having the record costs nothing and creates nothing you did
+# not ask for. A gateway that only records administration when asked is a
+# gateway with no record on the one occasion anyone wants one, because that
+# question is always asked afterwards.
+#
+# Every record carries the SHA-256 of the record before it and a sequence
+# number, so a line altered or removed from the middle is detectable:
+#
+#   gateway -verify-audit ./data/audit.jsonl
+#
+# The write is synchronous, and a write that fails fails the action it was
+# recording — a key that could not be audited is not minted. That is affordable
+# precisely because inference is not audited here. See docs/audit.md.
+audit:
+  enabled: true
+  # stdout | file
+  #
+  # stdout needs no path and introduces no failure the process's own logging
+  # does not already have, but a writer cannot read back what it wrote: the
+  # chain restarts at sequence 1 on every start, and continuity across restarts
+  # is whatever collects your logs. The file sink is the one that reads the
+  # existing chain at startup and continues it — and refuses to start on a chain
+  # that no longer verifies, rather than quietly appending to it.
+  sink: stdout
+  # Required by, and only meaningful to, the file sink. Written 0600 in a 0700
+  # directory: the log names people and the keys they hold.
+  # sink: file
+  # path: ./data/audit.jsonl
 
 observability:
   log_level: info

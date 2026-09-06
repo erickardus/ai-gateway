@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +67,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	errs = append(errs, validateUI(c)...)
+	errs = append(errs, validateAudit(c)...)
 	errs = append(errs, validateOTLP(c.Observability.OTLP)...)
 	errs = append(errs, validateSSO(c)...)
 	errs = append(errs, validateRBAC(c)...)
@@ -316,11 +318,40 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.VirtualKeys.Store.Kind != "memory" && c.VirtualKeys.Store.Kind != "file" {
-		errs = append(errs, fmt.Errorf("virtual_keys.store.kind: must be \"memory\" or \"file\", got %q", c.VirtualKeys.Store.Kind))
+	store := c.VirtualKeys.Store
+	switch store.Kind {
+	case "memory", "file", "postgres":
+	default:
+		errs = append(errs, fmt.Errorf("virtual_keys.store.kind: must be \"memory\", \"file\" or \"postgres\", got %q", store.Kind))
 	}
-	if c.VirtualKeys.Store.Kind == "file" && c.VirtualKeys.Store.Path == "" {
+	if store.Kind == "file" && store.Path == "" {
 		errs = append(errs, errors.New("virtual_keys.store.path: required when store.kind is \"file\""))
+	}
+	if store.Kind == "postgres" && store.DSN == "" {
+		errs = append(errs, errors.New("virtual_keys.store.dsn: required when store.kind is \"postgres\" (unset or empty ${ENV} reference?)"))
+	}
+	// A dsn on any other kind is refused rather than ignored. The two ways to
+	// arrive here are an operator who set the connection string and forgot the
+	// kind, and one who switched back to a file store and left the dsn behind;
+	// in both cases silence would leave keys somewhere other than where the
+	// file says, and the second case leaves a live database credential in a
+	// file that now has no use for it.
+	if store.Kind != "postgres" && store.DSN != "" {
+		errs = append(errs, fmt.Errorf("virtual_keys.store.dsn: set while store.kind is %q, which never connects to a database; use kind: postgres or remove the dsn", store.Kind))
+	}
+	// And the mirror of it. Switching a file store to postgres means editing
+	// the line below the path, so leaving the path behind is the likely
+	// mistake rather than an unlikely one — and it leaves a config naming a
+	// file of keys that the gateway does not read, which is the same
+	// misdirection in the other direction.
+	if store.Kind == "postgres" && store.Path != "" {
+		errs = append(errs, fmt.Errorf("virtual_keys.store.path: %q is set while store.kind is \"postgres\", which keeps no file; remove the path or use kind: file", store.Path))
+	}
+	if store.Timeout < 0 {
+		errs = append(errs, fmt.Errorf("virtual_keys.store.timeout: must not be negative, got %s", store.Timeout))
+	}
+	if store.MaxConns < 0 {
+		errs = append(errs, fmt.Errorf("virtual_keys.store.max_conns: must be >= 0, got %d", store.MaxConns))
 	}
 
 	return errors.Join(errs...)
@@ -867,6 +898,38 @@ func validateRBAC(c *Config) []error {
 	}
 	for i, r := range c.SSO.Roles {
 		check(fmt.Sprintf("sso.roles[%d].scope", i), r.Scope)
+	}
+	return errs
+}
+
+// validateAudit checks the audit log's configuration.
+//
+// It runs whether or not the block is enabled, unlike validateUI. A typo in a
+// sink name costs nothing to catch now and is discovered at the worst possible
+// moment otherwise: the day an operator turns auditing on, which is usually the
+// day somebody has asked them to prove it was on.
+func validateAudit(c *Config) []error {
+	a := c.Audit
+	var errs []error
+	switch a.SinkKind() {
+	case AuditSinkStdout:
+		// Reported rather than ignored: an operator who names a file and gets
+		// stdout believes they have a chain that survives restarts, and will
+		// find out they do not by going to read it.
+		if a.Path != "" {
+			errs = append(errs, fmt.Errorf(
+				"audit.path: %s is set while audit.sink is %q, which writes to stdout; set audit.sink to %q or remove the path",
+				strconv.Quote(a.Path), AuditSinkStdout, AuditSinkFile))
+		}
+	case AuditSinkFile:
+		if a.Path == "" {
+			errs = append(errs, fmt.Errorf(
+				"audit.path: required when audit.sink is %q, since a file sink has nowhere to write without one",
+				AuditSinkFile))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("audit.sink: must be %q or %q, got %q",
+			AuditSinkStdout, AuditSinkFile, a.Sink))
 	}
 	return errs
 }

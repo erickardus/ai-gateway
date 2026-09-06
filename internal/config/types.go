@@ -26,6 +26,7 @@ type Config struct {
 	SSO           SSOConfig           `yaml:"sso"`
 	RBAC          RBACConfig          `yaml:"rbac"`
 	UI            UIConfig            `yaml:"ui"`
+	Audit         AuditConfig         `yaml:"audit"`
 
 	// scopes is the flattened hierarchy, resolved once at load. Keyed by fully
 	// qualified id, with Parent pointers already wired.
@@ -322,10 +323,33 @@ type VirtualKeysConfig struct {
 }
 
 // StoreConfig selects the key persistence backend.
+//
+// The choice is a deployment decision rather than a preference: "file" is
+// single-node, so two instances pointed at one path overwrite each other's keys
+// rather than sharing them. Anything that issues keys at runtime —
+// /key/generate, an SSO login, a renewal — needs "postgres" behind a load
+// balancer.
 type StoreConfig struct {
-	// Kind is "memory" or "file".
+	// Kind is "memory", "file" or "postgres".
 	Kind string `yaml:"kind"`
 	Path string `yaml:"path"`
+	// DSN is the Postgres connection string, e.g.
+	// "postgres://gateway:secret@db:5432/gateway?sslmode=require".
+	//
+	// It carries a password, so it is expected to arrive as ${VAR}: this file is
+	// mounted read-only into containers, copied between environments and
+	// committed to repositories, and none of those is a place for a database
+	// credential.
+	DSN string `yaml:"dsn"`
+	// Timeout bounds each query against the key store. Unlike redis.timeout it
+	// is not sized to be negligible: there is no per-instance fallback for
+	// authentication, so a query abandoned here is a request refused rather
+	// than a request served with weaker limits.
+	Timeout time.Duration `yaml:"timeout"`
+	// MaxConns caps the connection pool. A key lookup is a primary-key read, so
+	// this bounds how many callers may be authenticated at once rather than any
+	// throughput the database could sustain.
+	MaxConns int32 `yaml:"max_conns"`
 }
 
 // KeySpec declares a virtual key in configuration. The plaintext is hashed at
@@ -651,4 +675,44 @@ func (u UIConfig) RequestLog() int {
 		return DefaultUIRequestLogSize
 	}
 	return *u.RequestLogSize
+}
+
+// AuditConfig controls the tamper-evident record of administrative actions.
+//
+// It is on by default, which is the opposite of how the UI and the response
+// cache are treated, and for a reason those two do not share: the default sink
+// is stdout, so an audit log costs nothing to have and creates nothing the
+// operator did not ask for. A gateway that only records administration when
+// asked to is a gateway that has no record on the one occasion anybody wants
+// one, because the question is always asked afterwards.
+//
+// The file sink is the deliberate choice, and the only one that continues a
+// chain across a restart. See docs/audit.md.
+type AuditConfig struct {
+	// Enabled is a pointer so that "on unless told otherwise" is expressible.
+	// A plain bool cannot distinguish an operator writing `enabled: false` from
+	// one who never mentioned the block, and here those must differ.
+	Enabled *bool `yaml:"enabled"`
+	// Sink is "stdout" or "file".
+	Sink string `yaml:"sink"`
+	// Path is where the file sink writes. Required by that sink and meaningless
+	// to the other, which validation says rather than silently ignoring.
+	Path string `yaml:"path"`
+}
+
+// On reports whether administrative actions are recorded, with the default
+// applied.
+func (a AuditConfig) On() bool {
+	if a.Enabled == nil {
+		return true
+	}
+	return *a.Enabled
+}
+
+// SinkKind is the configured sink, with the default applied.
+func (a AuditConfig) SinkKind() string {
+	if a.Sink == "" {
+		return AuditSinkStdout
+	}
+	return a.Sink
 }

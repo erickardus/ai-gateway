@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/audit"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/reqlog"
@@ -148,9 +149,34 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.auth.IsMasterKey(core.StripScheme(strings.TrimSpace(req.MasterKey))) {
+		// Deliberately logged and not audited, for the same reason an
+		// unauthenticated refusal at /key/* is not — see keys.go. This endpoint
+		// takes no credential, because presenting one *is* the endpoint, and
+		// every audit record is an fsync. Recording refusals here would hand
+		// anyone who can reach /ui a way to fill the operator's disk one request
+		// at a time, and a full disk makes every audit write fail, which makes
+		// every administrative action fail: the gateway would become
+		// unadministerable by the person being attacked.
+		//
+		// The record is worth having and should return the moment sign-in is
+		// throttled — see the roadmap's "Sign-in is not rate limited". Until
+		// then this line is the trail, and it costs no disk the process's own
+		// logging was not already spending.
 		s.log.Warn("admin ui sign-in refused", "remote", r.RemoteAddr,
 			"request_id", RequestIDFrom(r.Context()))
 		writeError(w, http.StatusUnauthorized, "authentication_error", "that is not the master key")
+		return
+	}
+
+	// Recorded before the session exists. A sign-in the audit log could not
+	// take is a sign-in that does not happen, for the same reason a key
+	// mutation is: the session is the master key with a shorter lifetime, and
+	// everything it goes on to do is attributed to it.
+	if !s.recordAudit(w, r, s.adminEvent(r, audit.Event{
+		Action:     audit.ActionConsoleSignIn,
+		TargetKind: audit.TargetSession,
+		Target:     uiSubjectMaster,
+	})) {
 		return
 	}
 
@@ -178,9 +204,38 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 // different thing.
 const uiSubjectMaster = "master"
 
+// handleUILogout ends a browser session.
+//
+// Two departures from the audit posture the mutating handlers follow, both
+// deliberate. Only a sign-out that had a session to end is recorded: the
+// endpoint takes no credential — it has nothing to check, since clearing a
+// cookie needs no authority — so recording every call would let a stranger fill
+// the log with sign-outs of nothing. And a failed audit write does not refuse
+// the sign-out, because refusing it would leave a live console session behind,
+// which is a worse outcome than an unrecorded one.
 func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request) {
+	if subject, ok := s.uiSessionSubject(r); ok {
+		s.recordAuditQuietly(r, s.adminEvent(r, audit.Event{
+			Action:     audit.ActionConsoleSignOut,
+			TargetKind: audit.TargetSession,
+			Target:     subject,
+		}))
+	}
 	s.clearUICookie(w, r)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "signed out"})
+}
+
+// uiSessionSubject reports the subject of a valid console session on this
+// request, if there is one.
+func (s *Server) uiSessionSubject(r *http.Request) (string, bool) {
+	if s.uiSessions == nil {
+		return "", false
+	}
+	cookie, err := r.Cookie(ui.CookieName)
+	if err != nil {
+		return "", false
+	}
+	return s.uiSessions.Validate(cookie.Value)
 }
 
 // handleUISession reports whether the caller is signed in.

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/erickardus/ai-gateway/internal/audit"
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/config"
@@ -47,6 +48,10 @@ type Server struct {
 	// always present and answers Enabled() for itself, so the recording path
 	// needs no nil check on the hot side of a request.
 	traffic *reqlog.Ring
+	// auditor is nil unless an audit sink is configured; see UseAudit. Its
+	// absence leaves the administrative handlers writing nothing, which is what
+	// a gateway with `audit.enabled: false` does.
+	auditor audit.Sink
 	// sso and ssoState are nil unless SSO is configured; see UseSSO. Their
 	// absence is what leaves the /sso/* routes unregistered.
 	sso      *sso.Provider

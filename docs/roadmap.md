@@ -454,10 +454,42 @@ hand-rolled surface and the classic source of authentication bypasses, or a
 dependency this project does not otherwise need. An organisation with only SAML
 provisioned can usually front it with an OIDC-speaking broker.
 
-### 🔴 Persistent key store
+### ✅ Persistent key store
 
-`memory` and `file` only. `file` is single-node: two instances with the same path
-will clobber each other. `auth.KeyStore` is ready for Postgres.
+Resolved. The store was `memory` or `file`, and `file` is single-node in a way
+that is easy to miss: it is not shared by two instances pointed at one path, it
+is taken turns overwriting, because each holds the whole set in memory and
+rewrites the file wholesale. A key from `/key/generate`, an SSO login or a
+renewal was therefore erased by the next write from the other replica — so the
+one arrangement Redis exists to support was the arrangement in which issuing a
+key did not work.
+
+`auth.PostgresStore` is `store.kind: postgres`, on `pgxpool`. Every field of
+`core.Key` round-trips, `budget_duration_ns` as the nanoseconds `time.Duration`
+actually is rather than an `interval` whose months and days have no fixed
+length. The gateway owns its schema: `virtual_keys` is created at startup under
+a transaction-scoped advisory lock, so replicas booting together apply it once
+between them, and the migration list is append-only because a rolling upgrade
+runs the old binary and the new one against one table.
+
+The connection posture is the opposite of `rstate`'s, deliberately. Redis going
+away degrades the gateway to per-instance limits; the key store going away
+leaves nothing to authenticate with, and a stale in-memory copy would keep
+honouring exactly the keys an operator had just revoked. So an unreachable
+Postgres at boot refuses to start — a gateway that came up anyway would 401
+every valid key and read, from outside, as a fleet-wide credential problem — and
+one lost later fails requests while `/health/readiness` reports the instance
+unready, which is what takes it out of the load balancer.
+
+One residual gap: keys are read from the database on every request, with no
+cache. That is correct, and the reason a revocation takes effect immediately,
+but it makes a key lookup a network round trip on the request path. A short TTL
+cache would want an invalidation channel — Redis is already there — before it is
+worth the staleness.
+
+`/health/readiness` no longer answers by listing every key. `server.storePinger`
+asks a store that can answer cheaply, and `List` remains the fallback for the
+in-process stores that have nothing to ping.
 
 ### ✅ Admin UI
 
@@ -518,6 +550,16 @@ hashing endpoint reachable by anyone who can open a socket, which is the same
 gap [the SSO endpoints](#-the-sso-endpoints-are-not-rate-limited) have and wants
 the same fix.
 
+It now costs an audit record too — or rather, it deliberately does not. A
+refused sign-in is exactly the record an auditor wants, and it was written until
+the arithmetic was followed through: an audit write fsyncs, a full disk fails
+every audit write, and a failed audit write refuses the action it was recording,
+so an unthrottled endpoint that writes one record per attempt hands a stranger a
+way to make the gateway unadministerable. The record is held back until the
+throttle exists, and [audit.md](audit.md#failure-posture) says so rather than
+leaving it to look like an oversight. Throttling this endpoint therefore buys
+two things, not one.
+
 ### 🔴 MCP gateway, batches, embeddings, audio
 
 `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions` and
@@ -543,14 +585,37 @@ deliberately declares no container healthcheck, because the runtime image is
 distroless and the only command available to it proves the binary runs rather
 than that it serves.
 
-### 🔴 No structured audit log
+### ✅ No structured audit log
 
-Access logs carry the key alias, model and outcome, but there is no separate
-tamper-evident audit stream. The admin console widens this: minting, blocking
-and deleting a key are now things that happen from a browser, and the only
-record is an ordinary log line saying a key changed — not who was signed in when
-it did. Every console session is the master key, so there is nobody to name yet;
-that changes the day it signs in through the identity provider.
+Resolved. Access logs carried the key alias, model and outcome, and the only
+record of a key being minted, blocked or deleted was an ordinary log line saying
+a key changed — with nothing saying who was signed in when it did, and nothing
+at all preventing that line from being edited afterwards.
+
+`internal/audit` is now a hash chain of administrative actions: key lifecycle
+from both `/key/*` and the console, console sign-in, refusal and sign-out, SSO
+grants and renewals and the refusals that follow an authenticated identity,
+cache purges, and this process starting and stopping. Each record carries the
+SHA-256 of the one before it and a sequence number, so a line altered or removed
+from the middle is detectable; `gateway -verify-audit <path>` reports where a
+chain breaks. Two sinks ship — JSONL to a file, which reads and continues its
+chain at startup and refuses to start on one that no longer verifies, and stdout
+— behind an interface a database sink slots into unchanged. Inference is
+deliberately not audited, which is what makes the writes affordable: they are
+synchronous, they fsync, and a write that fails fails the action it was
+recording. See [audit.md](audit.md).
+
+What remains is the name. The actor is modelled as a kind plus an id — master
+key, SSO subject, unauthenticated, system — and `sso.grant` already carries a
+real person. Every console action is still `master_key`, because every console
+session *is* the master key; that changes the day the console signs in through
+the identity provider, with no change to the record's shape. Two smaller gaps
+are recorded honestly rather than closed: a hash chain cannot detect truncation
+of its own tail without an anchor kept where the gateway cannot write, and the
+unauthenticated administrative endpoints are not audited on refusal because an
+fsync per attempt would be a disk-filling primitive for anyone who can open a
+socket — the same throttle
+[the sign-in form](#-sign-in-is-not-rate-limited) still wants.
 
 ### ✅ Per-key rate limits were enforced per instance
 

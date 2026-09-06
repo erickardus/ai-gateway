@@ -17,6 +17,25 @@ jobs:
         image: redis:7-alpine
         ports: ["6379:6379"]
 
+      # The Postgres key-store tests exercise ON CONFLICT replacement, array and
+      # timestamptz round-tripping and concurrent writers — all behaviour the
+      # database owns rather than this code. They skip themselves when no
+      # Postgres answers, so CI runs one for the same reason it installs redis.
+      # The credentials match the DSN the tests default to; override with
+      # GATEWAY_TEST_POSTGRES_DSN to point them elsewhere.
+      postgres:
+        image: postgres:16-alpine
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_PASSWORD: postgres
+        # Unlike redis, the container accepts connections before the database is
+        # ready to serve them, so the job would otherwise race its own service.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 

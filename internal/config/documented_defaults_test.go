@@ -59,6 +59,8 @@ model_list:
 		{"model_list[].params.model", cfg.ModelList[0].Params.Model, "m"},
 
 		{"virtual_keys.store.kind", cfg.VirtualKeys.Store.Kind, "memory"},
+		{"virtual_keys.store.timeout", cfg.VirtualKeys.Store.Timeout.String(), "2s"},
+		{"virtual_keys.store.max_conns", cfg.VirtualKeys.Store.MaxConns, int32(10)},
 
 		{"redis.key_prefix", cfg.Redis.KeyPrefix, "ai-gateway"},
 		{"redis.timeout", cfg.Redis.Timeout.String(), "250ms"},
@@ -74,6 +76,9 @@ model_list:
 		{"prompt_cache.affinity_max_in_flight_lead", cfg.PromptCache.MaxInFlightLead(), 4},
 		{"prompt_cache.inject", cfg.PromptCache.Inject, false},
 		{"prompt_cache.inject_min_bytes", cfg.PromptCache.InjectMinBytes, 4096},
+
+		{"audit.enabled", cfg.Audit.On(), true},
+		{"audit.sink", cfg.Audit.SinkKind(), "stdout"},
 
 		{"observability.log_level", cfg.Observability.LogLevel, "info"},
 		{"observability.log_format", cfg.Observability.LogFormat, "text"},

@@ -11,7 +11,13 @@
 #   docker compose -f deploy/docker-compose.yml up --build
 #
 # The gateways listen on 4000 and 4001. Send traffic to either: they share
-# limits, cooldowns, budgets and prompt-prefix pins through Redis.
+# limits, cooldowns, budgets and prompt-prefix pins through Redis, and — once
+# the key store below is switched on — the keys themselves through Postgres.
+#
+# Both halves are here because a fleet needs both, and they fail differently. A
+# gateway without shared state serves correctly with limits multiplied by the
+# replica count; a gateway without a shared key store hands a caller a key from
+# /key/generate or an SSO login that the other instance has never heard of.
 
 name: ai-gateway
 
@@ -27,6 +33,33 @@ services:
       timeout: 3s
       retries: 5
 
+  # The shared key store. It is wired up but not yet used: the example config
+  # ships with `store.kind: file`, which in this arrangement means each gateway
+  # keeps its own keys inside its own container and neither can see the other's.
+  # Uncomment the postgres block under virtual_keys.store in your gateway.yaml,
+  # set kind: postgres and REMOVE the path line beside it — the DSN below is
+  # already in the environment — and the two instances share one set of keys.
+  # The gateway creates its own table on startup, and refuses to start on a
+  # config that names both a path and a database.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    # Unlike Redis above, this data is not a counter with a TTL: it is the
+    # credentials the gateway authenticates with, so it outlives the container.
+    volumes:
+      - keys:/var/lib/postgresql/data
+    healthcheck:
+      # The container accepts connections before the database is ready to serve
+      # them, so a gateway that started on "port is open" would fail its own
+      # boot check and exit.
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   gateway-a: &gateway
     build:
       context: ..
@@ -37,6 +70,10 @@ services:
       # config file carries no secrets and the compose file passes none of its
       # own. Anything unset here is unset in the container.
       REDIS_ADDR: redis:6379
+      # sslmode=disable is right here and nowhere else: this connection never
+      # leaves the compose network. A real deployment wants require or better,
+      # since the DSN carries a password and the table carries key hashes.
+      KEY_STORE_DSN: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GATEWAY_MASTER_KEY: ${GATEWAY_MASTER_KEY:-}
@@ -50,6 +87,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     # No healthcheck here on purpose. The runtime image is distroless — no
     # shell, no curl, no wget — so the only thing a check could run is the
     # gateway binary itself, and `gateway -version` proves the binary executes
@@ -62,3 +101,6 @@ services:
   gateway-b:
     <<: *gateway
     ports: ["4001:4000"]
+
+volumes:
+  keys:

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -10,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/audit"
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
@@ -124,7 +124,7 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ticketCode, err := s.completeSSOLogin(r.Context(), login, code)
+	ticketCode, err := s.completeSSOLogin(r, login, code)
 	if err != nil {
 		s.log.Warn("sso login failed", "error", err, "request_id", RequestIDFrom(r.Context()))
 		s.metrics.RecordSSO(metrics.SSOLogin, metrics.SSOFailure)
@@ -137,7 +137,8 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 
 // completeSSOLogin exchanges the provider's code, decides what the identity may
 // do, issues the key, and leaves a ticket for the client to collect.
-func (s *Server) completeSSOLogin(ctx context.Context, login sso.Login, code string) (string, error) {
+func (s *Server) completeSSOLogin(r *http.Request, login sso.Login, code string) (string, error) {
+	ctx := r.Context()
 	tokens, err := s.sso.Exchange(ctx, code)
 	if err != nil {
 		return "", err
@@ -148,10 +149,24 @@ func (s *Server) completeSSOLogin(ctx context.Context, login sso.Login, code str
 	}
 	role, ok := s.sso.Role(id)
 	if !ok {
-		return "", fmt.Errorf("%s is not in any group this gateway grants access to", id.Display())
+		// Recorded, unlike the two failures above it. This is the refusal an
+		// auditor asks about — someone the identity provider vouched for was
+		// denied a credential by this gateway's own rules — and it has an actor
+		// to name. A failed exchange or an unverifiable token has neither: the
+		// endpoint is unauthenticated by design, nothing was established about
+		// the caller, and an audit write fsyncs, so recording them would let a
+		// stranger write to the operator's disk at will.
+		reason := fmt.Errorf("%s is not in any group this gateway grants access to", id.Display())
+		if auditErr := s.recordAuditErr(r, s.ssoEvent(r, audit.ActionSSOGrant, id, audit.Event{
+			Outcome: audit.OutcomeRefused,
+			Reason:  reason.Error(),
+		})); auditErr != nil {
+			return "", auditErr
+		}
+		return "", reason
 	}
 
-	plaintext, key, err := s.issueSSOKey(ctx, id, role, login.Device)
+	plaintext, key, err := s.issueSSOKey(r, audit.ActionSSOGrant, id, role, login.Device)
 	if err != nil {
 		return "", err
 	}
@@ -262,14 +277,22 @@ func (s *Server) handleSSORenew(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		// Entitlements are re-derived on every renewal, so someone moved out of
 		// a group loses access at their next renewal rather than at their next
-		// key expiry.
+		// key expiry. That is the moment worth recording: an identity the
+		// provider still vouches for, refused here.
 		s.metrics.RecordSSO(metrics.SSORenewal, metrics.SSOFailure)
-		writeError(w, http.StatusForbidden, "permission_error",
-			fmt.Sprintf("%s is no longer in any group this gateway grants access to", id.Display()))
+		message := fmt.Sprintf("%s is no longer in any group this gateway grants access to", id.Display())
+		if auditErr := s.recordAuditErr(r, s.ssoEvent(r, audit.ActionSSORenew, id, audit.Event{
+			Outcome: audit.OutcomeRefused,
+			Reason:  message,
+		})); auditErr != nil {
+			s.fail(w, r, auditErr)
+			return
+		}
+		writeError(w, http.StatusForbidden, "permission_error", message)
 		return
 	}
 
-	plaintext, key, err := s.issueSSOKey(r.Context(), id, role, sanitizeDevice(req.Device))
+	plaintext, key, err := s.issueSSOKey(r, audit.ActionSSORenew, id, role, sanitizeDevice(req.Device))
 	if err != nil {
 		s.metrics.RecordSSO(metrics.SSORenewal, metrics.SSOFailure)
 		s.fail(w, r, err)
@@ -298,7 +321,8 @@ func (s *Server) handleSSORenew(w http.ResponseWriter, r *http.Request) {
 // Retiring the previous key is what keeps a repeated login from accumulating
 // live credentials for one person on one laptop. It is scoped to the device so
 // that signing in on a second machine does not sign the first one out.
-func (s *Server) issueSSOKey(ctx context.Context, id *sso.Identity, role config.SSORole, device string) (string, *core.Key, error) {
+func (s *Server) issueSSOKey(r *http.Request, action string, id *sso.Identity, role config.SSORole, device string) (string, *core.Key, error) {
+	ctx := r.Context()
 	plaintext, hash, err := auth.Generate()
 	if err != nil {
 		return "", nil, err
@@ -316,10 +340,22 @@ func (s *Server) issueSSOKey(ctx context.Context, id *sso.Identity, role config.
 	key.CreatedAt = now
 	key.ExpiresAt = &expires
 	key.Device = device
+
+	// Write-ahead, as everywhere else: the grant is recorded before the key
+	// that carries it exists, so a log that cannot take the record hands the
+	// developer a failed sign-in rather than an unrecorded credential.
+	ev := s.ssoEvent(r, action, id, audit.Event{
+		Target: hash,
+		Detail: detail("role", role.Match, "device", device),
+	})
+	if auditErr := s.recordAuditErr(r, ev); auditErr != nil {
+		return "", nil, auditErr
+	}
 	if err := s.store.Put(ctx, key); err != nil {
+		s.recordAuditFailure(r, ev, err)
 		return "", nil, err
 	}
-	s.retireSSOKeys(ctx, id.Subject, device, hash)
+	s.retireSSOKeys(r, id, device, hash)
 
 	s.log.Info("sso key issued",
 		"identity", id.Display(), "subject", id.Subject, "device", device,
@@ -333,22 +369,45 @@ func (s *Server) issueSSOKey(ctx context.Context, id *sso.Identity, role config.
 // person rather than the credential — see core.Key.SpendSubject — so dropping
 // it here would hand every developer a way to clear their own budget by
 // signing in again.
-func (s *Server) retireSSOKeys(ctx context.Context, subject, device, keep string) {
+func (s *Server) retireSSOKeys(r *http.Request, id *sso.Identity, device, keep string) {
+	ctx := r.Context()
 	keys, err := s.store.List(ctx)
 	if err != nil {
-		s.log.Warn("sso: could not list keys to retire the previous one", "error", err, "subject", subject)
+		s.log.Warn("sso: could not list keys to retire the previous one", "error", err, "subject", id.Subject)
 		return
 	}
 	for _, k := range keys {
-		if k.Subject != subject || k.Device != device || k.Hash == keep {
+		if k.Subject != id.Subject || k.Device != device || k.Hash == keep {
+			continue
+		}
+		// A retirement is a key.delete like any other, and is recorded as one.
+		// Without this a reader sees credentials granted and never sees them
+		// destroyed: the chain would name a key that is missing from
+		// /key/list with nothing saying where it went, which is exactly the
+		// question an auditor reconciling the two would ask.
+		//
+		// Write-ahead, so a record that cannot be written leaves the superseded
+		// key in place rather than destroying one unrecorded. That is the same
+		// choice the loop already makes when the delete itself fails, and it
+		// errs the same way: a second live key for one person and device, which
+		// the next sign-in retires.
+		ev := s.ssoEvent(r, audit.ActionKeyDelete, id, audit.Event{
+			TargetKind: audit.TargetKey,
+			Target:     k.Hash,
+			Detail:     detail("device", device, "reason", "superseded"),
+		})
+		if auditErr := s.recordAuditErr(r, ev); auditErr != nil {
+			s.log.Warn("sso: could not record retiring a superseded key, so it was left in place",
+				"error", auditErr, "hash", k.Hash)
 			continue
 		}
 		if err := s.store.Delete(ctx, k.Hash); err != nil {
+			s.recordAuditFailure(r, ev, err)
 			s.log.Warn("sso: could not retire a superseded key", "error", err, "hash", k.Hash)
 			continue
 		}
 		s.auth.ForgetKey(ctx, k.Hash)
-		s.log.Info("sso key retired", "hash", k.Hash, "subject", subject, "device", device)
+		s.log.Info("sso key retired", "hash", k.Hash, "subject", id.Subject, "device", device)
 	}
 }
 

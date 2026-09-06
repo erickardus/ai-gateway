@@ -5,8 +5,9 @@ deployments, authenticates callers with virtual keys, and — the reason it
 exists — lets **Claude Code keep using a claude.ai subscription login while its
 traffic flows through the gateway**.
 
-Standard library only, apart from a YAML parser and — when you run more than one
-instance — a Redis client.
+Standard library only, apart from a YAML parser and, when you run more than one
+instance, a Redis client for shared limits and a Postgres driver for the shared
+key store.
 
 ## Why
 
@@ -140,6 +141,7 @@ interface waiting for it.
 | Guardrails | ⏳ |
 | Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
 | Multi-instance shared state (Redis) | ✅ |
+| Multi-instance shared key store (Postgres) | ✅ |
 | Admin UI — health, traffic, keys, spend, budgets | ✅ |
 | MCP gateway | ⏳ |
 
@@ -160,6 +162,7 @@ would take.
 - **[docs/routing.md](docs/routing.md)** — strategies, retries, cooldowns, fallbacks
 - **[docs/admin-ui.md](docs/admin-ui.md)** — the operator console, and how its session stays out of the inference plane
 - **[docs/observability.md](docs/observability.md)** — usage, cost, budgets, metrics, response caching
+- **[docs/audit.md](docs/audit.md)** — the tamper-evident record of who administered what
 - **[docs/prompt-caching.md](docs/prompt-caching.md)** — keeping the provider's prompt cache hittable behind a load balancer
 - **[docs/roadmap.md](docs/roadmap.md)** — what is not built, and what is unverified
 
@@ -175,7 +178,12 @@ cp config/gateway.example.yaml config/gateway.yaml   # then edit it
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-See [docs/observability.md](docs/observability.md#running-more-than-one-instance)
+Keys need sharing too, and separately: set `virtual_keys.store.kind: postgres` so
+every replica reads one set of keys, or a key issued on one instance is unusable
+at the next. See
+[docs/configuration.md](docs/configuration.md#choosing-a-key-store) for the store
+kinds, and
+[docs/observability.md](docs/observability.md#running-more-than-one-instance)
 for what is shared and what stays local.
 
 ## Development
