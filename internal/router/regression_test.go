@@ -36,8 +36,8 @@ func TestPassthroughCallerErrorsDoNotEjectDeployment(t *testing.T) {
 	}
 }
 
-// The gateway does not translate between wire formats, so an ingress must never
-// reach a deployment of the other format.
+// Without translation the gateway cannot carry a request between wire formats,
+// so an ingress must never reach a deployment of the other one.
 func TestFormatIsolation(t *testing.T) {
 	cfg := &config.Config{Router: config.RouterConfig{Strategy: config.StrategyWeightedShuffle}}
 	for _, f := range []core.Format{core.FormatAnthropic, core.FormatOpenAI} {
@@ -75,6 +75,83 @@ func TestFormatIsolation(t *testing.T) {
 		t.Fatalf("matching format failed to route: %v", err)
 	}
 	res.Response.Body.Close()
+}
+
+// With translation on the isolation lifts — except around a passthrough
+// deployment, where it is not an optimization but the rule that keeps a
+// developer's own subscription from being spent on a body they did not write.
+func TestTranslationOpensTheFormatBoundaryButNotForPassthrough(t *testing.T) {
+	cfg := &config.Config{Router: config.RouterConfig{
+		Strategy:    config.StrategyWeightedShuffle,
+		Translation: config.TranslationConfig{Enabled: true},
+	}}
+	cfg.VirtualKeys.AllowedUpstreamHosts = []string{"up.example.com"}
+	cfg.ModelList = []config.Deployment{
+		{
+			ModelName: "billed",
+			Params: config.DeploymentParams{
+				Format: core.FormatAnthropic, APIBase: "https://up.example.com", Model: "claude",
+				AuthMode: core.AuthModeAPIKey, AuthHeader: "x-api-key", APIKey: "k",
+			},
+		},
+		{
+			ModelName: "subscription",
+			Params: config.DeploymentParams{
+				Format: core.FormatAnthropic, APIBase: "https://up.example.com", Model: "claude-sub",
+				AuthMode: core.AuthModePassthrough,
+			},
+		},
+		{
+			ModelName: "gpt",
+			Params: config.DeploymentParams{
+				Format: core.FormatOpenAI, APIBase: "https://up.example.com", Model: "gpt-5",
+				AuthMode: core.AuthModeAPIKey, AuthHeader: "authorization", APIKey: "k",
+			},
+		},
+	}
+	if err := config.Finalize(cfg); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	exec := &fakeExec{replies: map[string]error{}}
+	r, err := New(cfg, NewMemState(), exec, discardLogger(), Options{Seed: 3})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	chat := func(model string, allowPassthrough bool) (*Result, error) {
+		return r.Route(context.Background(), model,
+			&provider.Request{Format: core.FormatOpenAI, Path: "/v1/chat/completions"},
+			Overrides{AllowPassthrough: allowPassthrough})
+	}
+
+	res, err := chat("billed", false)
+	if err != nil {
+		t.Fatalf("an openai ingress should reach a billed anthropic deployment: %v", err)
+	}
+	res.Response.Body.Close()
+
+	// Even for a key that is permitted to use passthrough: the refusal is about
+	// the body and the credential, not about the caller's permissions.
+	if _, err := chat("subscription", true); !errors.Is(err, core.ErrNoHealthyDeployment) {
+		t.Errorf("a passthrough deployment must never be translated: got %v", err)
+	}
+
+	// An Anthropic ingress reaches the OpenAI group for inference.
+	res, err = r.Route(context.Background(), "gpt",
+		&provider.Request{Format: core.FormatAnthropic, Path: "/v1/messages"}, Overrides{})
+	if err != nil {
+		t.Fatalf("an anthropic ingress should reach an openai deployment: %v", err)
+	}
+	res.Response.Body.Close()
+
+	// But not for token counting, which has no counterpart in that format.
+	// Answering anyway would have a client trimming conversations against a
+	// number nobody computed.
+	_, err = r.Route(context.Background(), "gpt",
+		&provider.Request{Format: core.FormatAnthropic, Path: "/v1/messages/count_tokens"}, Overrides{})
+	if !errors.Is(err, core.ErrNoHealthyDeployment) {
+		t.Errorf("count_tokens must not be translated: got %v", err)
+	}
 }
 
 // stream_timeout bounds time to the first chunk. Attaching it to the request

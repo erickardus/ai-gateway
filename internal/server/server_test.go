@@ -127,6 +127,13 @@ type harnessOpts struct {
 	// ui enables the admin console, which requires a master key: signing in
 	// means presenting one.
 	ui bool
+	// extraFormat gives the extra deployments a wire format of their own, which
+	// is what builds a group spanning both halves of the ecosystem — the
+	// arrangement cross-format translation exists to serve, and the one a
+	// group is refused for having without it.
+	extraFormat core.Format
+	// translation switches on cross-format routing.
+	translation bool
 	// upstreams, when set, gives each deployment its own handler — the first
 	// entry serves the primary deployment and the rest serve the extras. It is
 	// what lets a test model several independent providers, each holding its
@@ -215,12 +222,21 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		if opts.extraSupportsCacheControl {
 			extraParams.SupportsCacheControl = true
 		}
+		if opts.extraFormat != "" {
+			extraParams.Format = opts.extraFormat
+		}
 		if opts.extraAuthMode != "" {
 			extraParams.AuthMode = opts.extraAuthMode
-			if opts.extraAuthMode == core.AuthModePassthrough {
+			switch opts.extraAuthMode {
+			case core.AuthModePassthrough:
 				// A passthrough deployment relays the caller's own credential,
 				// so it must carry none of its own.
 				extraParams.AuthHeader, extraParams.AuthScheme, extraParams.APIKey = "", "", ""
+			case core.AuthModeAPIKey:
+				// And an api_key deployment must carry one, even where the
+				// primary it was copied from does not.
+				extraParams.AuthHeader = "x-api-key"
+				extraParams.APIKey = "sk-ant-api03-SERVERSIDE"
 			}
 		}
 		deployments = append(deployments, config.Deployment{
@@ -243,7 +259,10 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	cfg := &config.Config{
 		ModelList:   deployments,
 		PromptCache: opts.promptCache,
-		Router:      config.RouterConfig{Strategy: config.StrategyWeightedShuffle},
+		Router: config.RouterConfig{
+			Strategy:    config.StrategyWeightedShuffle,
+			Translation: config.TranslationConfig{Enabled: opts.translation},
+		},
 		VirtualKeys: config.VirtualKeysConfig{
 			MasterKey:            opts.masterKey,
 			HeaderNames:          []string{"x-gateway-key", "x-litellm-api-key"},
@@ -280,7 +299,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
-	client := provider.NewClient(cfg.VirtualKeys.HeaderNames, cfg.VirtualKeys.AllowedUpstreamHosts)
+	client := provider.NewClient(cfg.VirtualKeys.HeaderNames, cfg.VirtualKeys.AllowedUpstreamHosts, cfg.Router.Translation)
 	rtr, err := router.New(cfg, router.NewMemState(), client, log, router.Options{Seed: 1})
 	if err != nil {
 		t.Fatalf("router.New: %v", err)

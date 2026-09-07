@@ -12,14 +12,16 @@ Every request walks this pipeline in order:
 2. **Filter ejected deployments** (in cooldown).
 3. **Filter unauthorized deployments** — a `passthrough` deployment is only
    offered to keys with `allow_passthrough: true`.
-4. **Filter deployments already tried** on this request, so a retry makes
+4. **Filter deployments of another wire format**, unless translation is on and
+   this request is one it can carry. See [Cross-format routing](#cross-format-routing).
+5. **Filter deployments already tried** on this request, so a retry makes
    progress rather than landing back on the one that just failed.
-5. **Filter over-capacity deployments** using a non-consuming check.
-6. **Prefer the prompt-prefix pin**, if the request has one and the pinned
+6. **Filter over-capacity deployments** using a non-consuming check.
+7. **Prefer the prompt-prefix pin**, if the request has one and the pinned
    deployment is among the survivors. See
    [prompt-caching.md](prompt-caching.md#prefix-affinity).
-7. **Strategy picks** one survivor, when no pin decided it.
-8. **Reserve capacity** on the chosen deployment only. Budget is never spent on
+8. **Strategy picks** one survivor, when no pin decided it.
+9. **Reserve capacity** on the chosen deployment only. Budget is never spent on
    candidates that go unused.
 
 If nothing survives, the request fails with `503` and
@@ -104,6 +106,38 @@ set, so a cyclic configuration cannot loop. **If everything fails, the original
 error is returned**, not the last fallback's — the first failure is what
 actually describes the problem.
 
+## Cross-format routing
+
+By default the wire format is a hard boundary: an Anthropic ingress reaches only
+`anthropic` deployments, an OpenAI ingress only `openai` ones, a group must speak
+one format, and a fallback may not leave it.
+
+```yaml
+router:
+  translation:
+    enabled: true
+```
+
+With that set, all three restrictions lift. A group may hold deployments of both
+formats, a fallback may cross, and the request is rewritten for whichever
+upstream serves it — so an `anthropic-claude` group can spill to a GPT deployment
+during an Anthropic outage, which nothing else here can provide.
+
+Two deployments stay unreachable across the boundary whatever the setting:
+
+- **A `passthrough` deployment.** Its body must reach the upstream as the caller
+  wrote it, and its credential is the caller's own subscription. A mixed group
+  holding one is not an error: an ingress of the other format simply passes it
+  over and uses the rest of the group.
+- **`/v1/messages/count_tokens`.** No OpenAI endpoint measures a prompt without
+  running the model, so the route is refused rather than guessed at.
+
+A request refused for its format gets `503`, and the log line says which of the
+two things to change — the fleet, or the switch that would let it be reached.
+Translation is lossy; what it drops is enumerated in
+[architecture.md](architecture.md#cross-format-translation-is-opt-in-and-says-what-it-costs)
+and logged once at startup for the pairs your own fleet can produce.
+
 ## Error classification
 
 Context-window overflows and content-policy refusals are signalled only in the
@@ -165,6 +199,7 @@ A `"disable_fallbacks": true` field in the request body skips fallbacks entirely
 | `x-gateway-attempted-fallbacks` | Fallback hops taken. |
 | `x-gateway-request-id` | Correlates with the access log. |
 | `x-gateway-prompt-affinity` | `hit`, `miss`, or `new` when a prompt-prefix pin was consulted; absent otherwise. |
+| `x-gateway-translated` | The format pair a translated request crossed, as `openai->anthropic`; absent otherwise. |
 
 ## Differences from LiteLLM
 
@@ -180,7 +215,7 @@ behaviour and actual behaviour diverge, these follow neither blindly:
 | Backoff with a healthy peer | Skipped | Skipped — this one is right |
 | Rate-limit window | Wall-clock `HH-MM`, wraps daily | Monotonic |
 | In-flight counter | Can go negative | Clamped; released exactly once, on a context detached from the client's so an aborted request still decrements |
-| Wire format | Not a routing dimension | Enforced: an ingress reaches only deployments of its own format, groups must be homogeneous, and fallbacks may not cross formats |
+| Wire format | Not a routing dimension | Enforced by default: an ingress reaches only deployments of its own format, groups must be homogeneous, and fallbacks may not cross formats. `router.translation.enabled` lifts all three and rewrites the request instead — never for a passthrough deployment, and never for token counting |
 | Duplicate deployments | Undetectable, because the ID includes a per-group ordinal | Rejected at load: a duplicate would double that upstream's traffic share and rate limit |
 | Provider prompt cache | An opt-in pre-call check, keyed on the messages up to and including the last `cache_control` marker — which its own injection walks forward every turn | On by default. Conversations are pinned to the upstream holding their warm prefix, on a fingerprint taken with the markers stripped, so a client walking one forward keeps its pin |
 | Rate-limit charging | At authentication, so rejected requests spend budget | After the model is resolved and authorized |

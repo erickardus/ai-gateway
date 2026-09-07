@@ -92,9 +92,12 @@ model_list:
       cache_read_per_1m: 0.10
       cache_write_per_1m: 1.25
 
-  # An OpenAI-format deployment, reachable at /v1/chat/completions. There is no
-  # cross-format translation: an Anthropic ingress routes only to anthropic
-  # deployments, and an OpenAI ingress only to openai ones.
+  # An OpenAI-format deployment, reachable at /v1/chat/completions — and, once
+  # router.translation.enabled is set below, at /v1/messages as well, which is
+  # what lets Claude Code reach it. Off by default: an Anthropic ingress then
+  # routes only to anthropic deployments and an OpenAI ingress only to openai
+  # ones. See the translation block under router:.
+  #
   # An OpenAI-format upstream whose cache is explicit rather than automatic.
   # Alibaba's Qwen is the one that is: it reads Anthropic's cache_control marker
   # and caches the prefix up to it, with a higher hit ratio than the implicit
@@ -122,6 +125,13 @@ model_list:
       auth_header: authorization
       auth_scheme: Bearer
       api_key: ${OPENAI_API_KEY}
+      # Only read on a translated request, and only because the
+      # OpenAI-compatible ecosystem disagrees with itself: OpenAI's reasoning
+      # models refuse the older max_tokens spelling outright, while much of the
+      # compatible ecosystem has never implemented max_completion_tokens. There
+      # is no value that works everywhere, so the operator names their upstream
+      # rather than the gateway guessing.
+      max_completion_tokens: true
     weight: 1
     # An OpenAI-compatible provider caches automatically and charges nothing to
     # write, so there is no write price here — but cache_read_per_1m is still
@@ -166,6 +176,45 @@ router:
   # Used by latency-based routing: widens the candidate set to every deployment
   # within this fraction of the best observed latency.
   lowest_latency_buffer: 0.2
+
+  # Cross-format translation: accept a request in one provider's wire format,
+  # rewrite it for an upstream that speaks the other, and rewrite the reply
+  # back.
+  #
+  # Off by default, and deliberately. Everywhere else this gateway edits a body
+  # it splices one value and leaves every other byte identical; translation
+  # parses the whole document and rebuilds it, which means owning the fidelity
+  # of every field forever — including the fields that do not map. What is
+  # dropped is enumerated in docs/architecture.md, and the gateway logs the
+  # losses that apply to THIS fleet, once, at startup.
+  #
+  # What it buys is the reason to have it: a client speaks one format for its
+  # whole life. Claude Code speaks the Anthropic Messages API and nothing else,
+  # so with this off it can reach the anthropic deployments above and no more —
+  # switching to the gpt group mid-session is not a configuration away, it is
+  # impossible. With it on, one endpoint and one set of virtual keys serve both
+  # halves, a model group may hold deployments of both formats, and a fallback
+  # may cross them, so an Anthropic outage finally has an escape hatch.
+  #
+  # Two things it never does, whatever this says:
+  #
+  #   - Translate for a passthrough deployment. Its body must reach the upstream
+  #     exactly as the caller wrote it, and its credential is the caller's own
+  #     subscription — so a rewritten body sent there would spend a person's
+  #     personal quota on a document they never wrote. A passthrough member of a
+  #     mixed group is simply passed over by an ingress of the other format,
+  #     which is a restriction rather than a hole: the rest of the group serves.
+  #   - Translate /v1/messages/count_tokens. No OpenAI endpoint measures a
+  #     prompt without running the model, and a guess here would have Claude
+  #     Code trimming conversations against a number nobody computed.
+  translation:
+    enabled: false
+    # The output cap given to a translated request that named none. The
+    # Messages API requires max_tokens and Chat Completions does not, so an
+    # OpenAI request reaching an anthropic upstream has to be given one or
+    # refused — and refusing a request every OpenAI server would have accepted
+    # is the worse answer.
+    default_max_tokens: 8192
 
 virtual_keys:
   # Enables the /key/* management endpoints. Leave unset to disable them.

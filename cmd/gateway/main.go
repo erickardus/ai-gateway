@@ -21,6 +21,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/auth"
 	"github.com/erickardus/ai-gateway/internal/cache"
 	"github.com/erickardus/ai-gateway/internal/config"
+	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/otlp"
 	"github.com/erickardus/ai-gateway/internal/provider"
@@ -29,6 +30,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/server"
 	"github.com/erickardus/ai-gateway/internal/spend"
 	"github.com/erickardus/ai-gateway/internal/sso"
+	"github.com/erickardus/ai-gateway/internal/translate"
 	"github.com/erickardus/ai-gateway/internal/ui"
 )
 
@@ -131,6 +133,7 @@ func run() error {
 		log.Info("rbac hierarchy loaded", "scopes", len(cfg.Scopes()),
 			"organizations", len(cfg.RBAC.Organizations))
 	}
+	logTranslation(cfg, log)
 
 	local := router.NewMemState()
 	ids := make([]string, 0, len(cfg.ModelList))
@@ -442,7 +445,7 @@ func newKeyStore(ctx context.Context, cfg config.VirtualKeysConfig, log *slog.Lo
 
 // newUpstreamClient builds the HTTP client used for every upstream call.
 func newUpstreamClient(cfg *config.Config) *provider.Client {
-	return provider.NewClient(cfg.VirtualKeys.HeaderNames, cfg.VirtualKeys.AllowedUpstreamHosts)
+	return provider.NewClient(cfg.VirtualKeys.HeaderNames, cfg.VirtualKeys.AllowedUpstreamHosts, cfg.Router.Translation)
 }
 
 // newLogger builds the process logger. Credentials are never logged, so no
@@ -461,4 +464,56 @@ func newLogger(cfg config.ObservabilityConfig) *slog.Logger {
 		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
 	return slog.New(handler)
+}
+
+// logTranslation announces what cross-format translation will do to this
+// fleet's traffic, once, at startup.
+//
+// It is logged rather than documented because the failures of translation are
+// silent ones. A dropped top_k changes sampling and nothing says so; a request
+// whose extended thinking could not be carried simply comes back shallower; a
+// structured-output schema that had nowhere to go returns prose. None of that
+// surfaces as an error, so the only honest place to put it is in front of the
+// operator before any traffic is on it — and only for the format pairs their
+// own configuration actually creates, so the warning describes their fleet
+// rather than the feature in general.
+func logTranslation(cfg *config.Config, log *slog.Logger) {
+	if !cfg.Router.Translation.Enabled {
+		return
+	}
+
+	formats := map[core.Format]bool{}
+	passthrough := map[core.Format]bool{}
+	for i := range cfg.ModelList {
+		p := cfg.ModelList[i].Params
+		formats[p.Format] = true
+		if p.AuthMode == core.AuthModePassthrough {
+			passthrough[p.Format] = true
+		}
+	}
+
+	log.Info("cross-format translation enabled",
+		"note", "a translated request is rebuilt rather than relayed, so this gateway now owns the fidelity of every field it carries",
+		"never_translated", "passthrough deployments, whose body must reach the upstream as the caller wrote it and whose credential is the caller's own subscription",
+		"not_translatable", "/v1/messages/count_tokens, which has no counterpart in the OpenAI format")
+
+	for _, from := range []core.Format{core.FormatAnthropic, core.FormatOpenAI} {
+		for _, to := range []core.Format{core.FormatAnthropic, core.FormatOpenAI} {
+			// Only the pairs this fleet can actually produce: an ingress is
+			// reachable whatever is configured, but a route exists only where
+			// there is a deployment of the target format to reach.
+			if from == to || !formats[to] {
+				continue
+			}
+			for _, loss := range translate.Loss(from, to) {
+				log.Warn("translation drops a request field",
+					"from", string(from), "to", string(to), "detail", loss)
+			}
+			if passthrough[to] {
+				log.Info("some deployments are unreachable across formats",
+					"from", string(from), "to", string(to),
+					"reason", "a passthrough deployment is never translated, so requests arriving as "+string(from)+" will skip it and use the rest of its group")
+			}
+		}
+	}
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/jsonx"
+	"github.com/erickardus/ai-gateway/internal/translate"
 )
 
 // maxErrorBodyBytes bounds how much of an upstream error body is buffered for
@@ -83,6 +84,12 @@ type Response struct {
 	Header     http.Header
 	Body       io.ReadCloser
 	Deployment string
+	// Format is the wire format the bytes in Body are written in, which is the
+	// serving deployment's rather than the caller's whenever the request was
+	// translated on the way out. The caller needs it to know whether the reply
+	// has to be translated back, and to read the reply's usage counters under
+	// the right convention.
+	Format core.Format
 }
 
 // Client executes upstream requests.
@@ -90,6 +97,7 @@ type Client struct {
 	http           *http.Client
 	keyHeaderNames []string
 	allowedHosts   map[string]bool
+	translation    config.TranslationConfig
 }
 
 // NewClient builds a Client. allowedHosts bounds where a passthrough deployment
@@ -98,7 +106,7 @@ type Client struct {
 // There is deliberately no timeout parameter: a client-level timeout would apply
 // to the whole exchange including a streaming body, so deadlines are carried on
 // the per-attempt request context instead.
-func NewClient(keyHeaderNames, allowedHosts []string) *Client {
+func NewClient(keyHeaderNames, allowedHosts []string, translation config.TranslationConfig) *Client {
 	allowed := make(map[string]bool, len(allowedHosts))
 	for _, h := range allowedHosts {
 		allowed[config.NormalizeHost(h)] = true
@@ -122,6 +130,7 @@ func NewClient(keyHeaderNames, allowedHosts []string) *Client {
 		},
 		keyHeaderNames: keyHeaderNames,
 		allowedHosts:   allowed,
+		translation:    translation,
 	}
 }
 
@@ -141,12 +150,23 @@ func (c *Client) Do(ctx context.Context, dep *config.Deployment, req *Request) (
 		}
 	}
 
-	body, annotated := req.Body, false
-	if req.Annotate != nil {
-		body, annotated = req.Annotate.Annotate(dep, req.Body)
+	// Translation comes first, where this deployment speaks another format, so
+	// that everything after it works on the body the upstream will actually
+	// receive. Annotating before translating would add a member in the caller's
+	// format and then throw it away rebuilding the document — which is how a
+	// translated streamed reply ends up with no usage on it at all, and so
+	// costs nothing, charges nothing, and shows up in no budget.
+	base, path, err := c.prepare(dep, req)
+	if err != nil {
+		return nil, err
 	}
 
-	resp, err := c.dispatch(ctx, dep, req, body)
+	body, annotated := base, false
+	if req.Annotate != nil {
+		body, annotated = req.Annotate.Annotate(dep, base)
+	}
+
+	resp, err := c.dispatch(ctx, dep, req, body, path)
 	if err == nil || !annotated || !refusedAsBadRequest(err) {
 		return resp, err
 	}
@@ -162,7 +182,7 @@ func (c *Client) Do(ctx context.Context, dep *config.Deployment, req *Request) (
 	// fails both bodies, and reading that as "this upstream will not take an
 	// annotation" would let one malformed request switch the optimization off
 	// for every other caller of the deployment.
-	plain, plainErr := c.dispatch(ctx, dep, req, req.Body)
+	plain, plainErr := c.dispatch(ctx, dep, req, base, path)
 	if plainErr != nil {
 		return nil, plainErr
 	}
@@ -177,10 +197,47 @@ func refusedAsBadRequest(err error) bool {
 	return errors.As(err, &upstream) && upstream.StatusCode == http.StatusBadRequest
 }
 
+// prepare returns the body and upstream path for one deployment, rewriting the
+// request where that deployment speaks a wire format other than the one it
+// arrived in.
+//
+// A passthrough deployment is refused rather than translated. Its body has to
+// reach the upstream exactly as the caller wrote it, and its credential is the
+// caller's own subscription, so a rewritten body sent there would spend a
+// person's personal quota on a document they never wrote. The router already
+// declines to select one for a cross-format request; this is the second lock,
+// on the path that actually puts bytes on the wire.
+func (c *Client) prepare(dep *config.Deployment, req *Request) ([]byte, string, error) {
+	if req.Format == "" || dep.Params.Format == req.Format {
+		return req.Body, req.Path, nil
+	}
+	if dep.Params.AuthMode == core.AuthModePassthrough {
+		return nil, "", fmt.Errorf("deployment %s speaks %s and the request is %s, and a passthrough deployment is never translated: %w",
+			dep.ID(), dep.Params.Format, req.Format, core.ErrNoHealthyDeployment)
+	}
+	path, ok := translate.UpstreamPath(req.Path, dep.Params.Format)
+	if !ok {
+		return nil, "", fmt.Errorf("deployment %s: %s has no counterpart in the %s format: %w",
+			dep.ID(), req.Path, dep.Params.Format, translate.ErrUnsupported)
+	}
+	body, err := translate.Request(req.Format, dep.Params.Format, req.Body, translate.Options{
+		MaxCompletionTokens: dep.Params.MaxCompletionTokens,
+		// The marker is carried only to an upstream whose operator said its
+		// cache reads one. Everywhere else it is an unknown member, and an
+		// unknown member is a 400 on the whole request.
+		KeepCacheControl: dep.Params.SupportsCacheControl,
+		DefaultMaxTokens: c.translation.DefaultMaxTokens,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("translate request for deployment %s: %w", dep.ID(), err)
+	}
+	return body, path, nil
+}
+
 // dispatch sends one body to one deployment. It is separate from Do because the
 // same attempt may send two: the annotated body, and — where that is refused —
 // the request as it arrived.
-func (c *Client) dispatch(ctx context.Context, dep *config.Deployment, req *Request, body []byte) (*Response, error) {
+func (c *Client) dispatch(ctx context.Context, dep *config.Deployment, req *Request, body []byte, path string) (*Response, error) {
 	params := dep.Params
 	// Rewrite the model only when the upstream's identifier differs from the one
 	// the body actually carries. Comparing against dep.ModelName instead would
@@ -200,7 +257,7 @@ func (c *Client) dispatch(ctx context.Context, dep *config.Deployment, req *Requ
 		}
 	}
 
-	target, err := buildURL(params.APIBase, req.Path, req.Query)
+	target, err := buildURL(params.APIBase, path, req.Query)
 	if err != nil {
 		return nil, fmt.Errorf("deployment %s: %w", dep.ID(), err)
 	}
@@ -231,6 +288,11 @@ func (c *Client) dispatch(ctx context.Context, dep *config.Deployment, req *Requ
 			Body:       errBody,
 			Header:     resp.Header.Clone(),
 			Deployment: dep.ID(),
+			// The format the error envelope is written in, which is the
+			// deployment's rather than the caller's on a translated request.
+			// A client handed an error envelope it cannot parse reads it as a
+			// corrupt reply rather than as the refusal it is.
+			Format: params.Format,
 		}
 	}
 
@@ -239,6 +301,7 @@ func (c *Client) dispatch(ctx context.Context, dep *config.Deployment, req *Requ
 		Header:     resp.Header,
 		Body:       resp.Body,
 		Deployment: dep.ID(),
+		Format:     params.Format,
 	}, nil
 }
 

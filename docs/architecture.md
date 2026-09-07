@@ -121,45 +121,103 @@ every request. Refusal is recorded only on that succeeding branch, so a `400` th
 caller earned, which fails both bodies, cannot switch the optimization off for
 everyone else.
 
-### There is no cross-format translation
+### Cross-format translation is opt-in, and says what it costs
 
-An Anthropic ingress reaches only `anthropic` deployments, an OpenAI ingress only
-`openai` ones. A model group may not mix formats, and a fallback may not cross
-them. Enforced in `router.candidates` and twice in `config.validate`.
+By default an Anthropic ingress reaches only `anthropic` deployments and an
+OpenAI ingress only `openai` ones. A model group may not mix formats and a
+fallback may not cross them. Set `router.translation.enabled` and all three
+restrictions lift: a request is rewritten for whichever upstream serves it, and
+the reply is rewritten back.
 
-Translation would mean accepting a request in one format, rewriting it into
-another upstream, and rewriting the reply back. That is the opposite operation to
-the two above. Editing a body splices one value and leaves every other byte
-identical; translating it parses the whole document, rebuilds it, and takes
-ownership of the fidelity of every field forever — including the fields that do
-not map.
+The reason to have it is that a client speaks one format for its whole life.
+Claude Code speaks the Anthropic Messages API and nothing else, so without
+translation a developer pointed at the gateway can reach the Anthropic-compatible
+half of a fleet and no more — switching to a GPT model mid-session is not a
+configuration away, it is impossible. With it, one endpoint and one set of
+virtual keys serve both halves, and the model aliases Claude Code already has
+become the switch. It also gives an operator the one thing nothing else here
+could provide: a fallback that crosses vendors, so an Anthropic outage has an
+escape hatch.
 
-Several do not. Anthropic carries tool results as blocks inside a user message
-where OpenAI carries them as separate messages with `role: "tool"`, so one
-message becomes N and the arrays no longer correspond by index. `thinking` blocks
-carry signatures Anthropic verifies on the following turn, and the OpenAI format
-has nowhere to hold them. Anthropic reports input tokens in `message_start`, at
-the top of a stream; an OpenAI-compatible upstream reports usage in its final
-chunk and only when asked — so a translated stream would have to emit a token
-count before it could know one.
+The reason it is off by default is that translation is the opposite operation to
+everything else on this path. Editing a body splices one value and leaves every
+other byte identical; translating it parses the whole document, rebuilds it, and
+takes ownership of the fidelity of every field forever — including the fields
+that do not map.
 
-None of those fail loudly. They produce a request that succeeds and behaves
-worse, which is the failure class the rest of this gateway is shaped to avoid.
+Several do not, and none of them fails loudly. They produce a request that
+succeeds and behaves worse, which is the failure class the rest of this gateway
+is shaped to avoid. So they are enumerated rather than discovered: `translate.Loss`
+returns them as sentences, and the gateway logs the ones this fleet's own
+configuration can actually produce, once, at startup. What is dropped, and why:
 
-The harder constraint is that Anthropic's gateway rules require forwarding
-request bodies unchanged, and the subscription passthrough path depends on that
-guarantee. Translation cannot apply to a passthrough deployment at all.
+| Not carried | Why, and what happens instead |
+|---|---|
+| `top_k` | Chat Completions has no equivalent. Dropped, so sampling differs |
+| `thinking` → | Becomes `reasoning_effort` by budget band. The returned reasoning is unsigned, so a later turn replaying it has it dropped rather than refused |
+| ← `reasoning_effort` | Becomes a thinking budget, and stands down entirely when `max_tokens` leaves no room for one — Anthropic refuses a budget below 1024 or one that crowds out the reply. Enabling it also drops `temperature` and `top_p`, which Anthropic refuses alongside thinking |
+| `cache_control` | Dropped unless the deployment sets `supports_cache_control`. Most OpenAI-compatible servers answer `400` to an unknown member |
+| `metadata`, `document` blocks | No counterpart. Dropped |
+| `n`, `seed`, penalties, `logit_bias`, `logprobs` | No counterpart in the Messages API. Dropped |
+| `response_format` | Including `json_schema`. Dropped, so a caller relying on structured output gets prose |
+| Images in a tool result | An OpenAI `tool` message takes no image parts. Reduced to its text |
 
-What an operator gives up is a fallback that crosses vendors: an
-`anthropic-claude` group cannot spill to an OpenAI-format upstream while
-Anthropic is down. That is the cost, and it is the thing that would justify
-revisiting this.
+Two structural differences are carried rather than dropped, because leaving them
+would fail the call outright. Anthropic holds tool results as blocks inside a
+user message where OpenAI holds them as separate `role: "tool"` messages, so one
+turn becomes several — and the tool messages are emitted first, because OpenAI
+requires each to answer the assistant turn that called it. And the Messages API
+refuses consecutive turns of the same role where Chat Completions permits them,
+so adjacent same-role turns are merged; a run of parallel tool results, which is
+exactly what produces them, lands in one turn.
 
-If it is revisited, the seam is a `Transformer` between ingress and `provider`,
-applied only to deployments whose format differs from the ingress and never on
-the passthrough path — the same per-deployment decision the `Annotator` already
-makes, one order of commitment up. [roadmap.md](roadmap.md#-cross-format-translation)
-sizes the work.
+Streaming is where the two grammars differ most. OpenAI emits a flat sequence of
+deltas and says nothing about where one piece of content ends and the next
+begins; Anthropic emits an explicitly bracketed structure, and a client that
+receives a delta for a block that was never opened treats the stream as corrupt.
+So the boundaries are inferred. Text and reasoning are relayed as they arrive —
+Claude Code renders tokens as they land and aborts a stream silent for 300
+seconds, so buffering a whole reply would turn every long generation into a
+timeout. Tool calls are not: their arguments are accumulated per upstream index
+and emitted as complete blocks at the end. OpenAI numbers its tool calls and is
+free to interleave their fragments, while an Anthropic block once closed cannot
+be reopened, so a translator streaming them live would have to either reopen a
+closed block or route a fragment into the wrong one — and both produce a tool
+call whose arguments are invalid JSON assembled from two different calls. The
+progressive rendering of a tool call is the price; correct arguments are what it
+buys.
+
+Two things translation never touches:
+
+**A passthrough deployment.** Its body must reach the upstream exactly as the
+caller wrote it — Anthropic's gateway rules require it, and the endpoint strips
+Claude Code's attribution block positionally — and its credential is the caller's
+own subscription, so a rewritten body sent there would spend a person's personal
+quota on a document they never wrote. Enforced in `router.candidates` and again
+in `provider.prepare`, on the path that actually puts bytes on the wire. This is
+also what lets one group hold both a subscription deployment for Claude Code and
+a translated one for everyone else: the passthrough member is simply unreachable
+from an ingress of the other format, which is a restriction rather than a hole.
+
+**`/v1/messages/count_tokens`.** There is no OpenAI endpoint that measures a
+prompt without running the model. A gateway that guessed would have Claude Code
+trimming conversations against a number nobody computed, so the route is refused
+instead.
+
+Usage is the one field that is recomputed rather than mapped. Anthropic reports
+an `input_tokens` that excludes both cache counters; an OpenAI-compatible
+response reports a `prompt_tokens` that includes them. Copying the number across
+would bill every cached token twice — once at the full input rate inside the
+total, once at the cache rate beside it — so the cached parts are carved out of
+the total on the way across, and clamped against the total the provider itself
+reported so an upstream's arithmetic error cannot mint savings. The invariant is
+checked against the gateway's own usage parser rather than a restatement of it,
+in both directions, so the two cannot drift apart.
+
+A translated reply carries `x-gateway-translated: openai->anthropic`. Nothing
+else about it is distinguishable from a native reply, which is precisely what
+makes a fidelity problem impossible to attribute from the client side without
+it.
 
 ### Headers are forwarded as an open list
 

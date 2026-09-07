@@ -27,7 +27,8 @@ nothing, and any smaller value severs streams.
 ## `model_list`
 
 One entry per deployment. Entries sharing a `model_name` form a model group that
-the router load-balances across. A group must be format-homogeneous.
+the router load-balances across. A group must be format-homogeneous unless
+[`router.translation.enabled`](#router) is set.
 
 | Key | Default | Notes |
 |---|---|---|
@@ -45,7 +46,8 @@ the router load-balances across. A group must be format-homogeneous.
 | `cost.output_per_1m` | — | |
 | `cost.cache_read_per_1m` | — | Required once `input_per_1m` is set. Not optional detail: Claude Code leans on prompt caching. |
 | `cost.cache_write_per_1m` | `input_per_1m` | Required on an `anthropic` deployment once `input_per_1m` is set. Optional on an `openai` one, where most providers write for free — but set it for Qwen or MiniMax, which charge. |
-| `params.supports_cache_control` | `false` | Declares that an `openai` upstream reads Anthropic's `cache_control` marker, which Qwen's explicit cache does and most of the ecosystem does not. Refused on an `anthropic` deployment, which always reads it, and on a passthrough one, which is never annotated. |
+| `params.supports_cache_control` | `false` | Declares that an `openai` upstream reads Anthropic's `cache_control` marker, which Qwen's explicit cache does and most of the ecosystem does not. Refused on an `anthropic` deployment, which always reads it, and on a passthrough one, which is never annotated. Also decides whether a translated request keeps its markers. |
+| `params.max_completion_tokens` | `false` | Makes a translated request spell its output cap `max_completion_tokens` rather than `max_tokens`. OpenAI's reasoning models refuse the older spelling and much of the compatible ecosystem has never implemented the newer one, so there is no value that works everywhere and none is guessed. Meaningless unless translation is on. |
 | `cost.cache_write_1h_per_1m` | `cache_write_per_1m` | Anthropic's one-hour cache write, priced at 2x base input against the five-minute tier's 1.25x. |
 | `cost.long_context` | — | The higher rates a provider charges above a prompt size. Optional; see below. |
 
@@ -136,12 +138,40 @@ cost model is:
 | `fallbacks` | — | `[{from: a, to: [b, c]}]` |
 | `context_window_fallbacks` | — | Used when the upstream reports a context overflow. |
 | `content_policy_fallbacks` | — | Used on a content refusal. |
+| `translation.enabled` | `false` | Lets an ingress in one wire format reach deployments in the other. See below. |
+| `translation.default_max_tokens` | `8192` | The output cap given to a translated request that named none. The Messages API requires `max_tokens` and Chat Completions does not. |
 
 `num_retries`, `weight`, `backoff.jitter` and `cooldown.allowed_fails` are
 pointers internally, so an explicit `0` is never mistaken for an omitted field.
 
-Fallbacks may not target the source group, a group that does not exist, or a
-group of a different wire format.
+Fallbacks may not target the source group or a group that does not exist. They
+may not cross wire formats either, unless `translation.enabled` is set.
+
+### `router.translation`
+
+Off by default. With it off, an Anthropic ingress reaches only `anthropic`
+deployments and an OpenAI ingress only `openai` ones, a group must speak one
+format, and a fallback may not leave it.
+
+With it on, a request is rewritten for whichever upstream serves it and the
+reply is rewritten back. That is what lets Claude Code — which speaks the
+Anthropic Messages API and nothing else — reach a GPT deployment through the
+same endpoint and the same virtual key, and it is what lets an `anthropic` group
+fall back to an `openai` one during an outage.
+
+Two things it never does:
+
+- **Translate for a passthrough deployment.** Its body must reach the upstream
+  as the caller wrote it and its credential is the caller's own subscription. A
+  passthrough member of a mixed group is simply unreachable from an ingress of
+  the other format; the rest of the group still serves.
+- **Translate `/v1/messages/count_tokens`.** There is no OpenAI endpoint that
+  measures a prompt without running the model, so the route is refused rather
+  than answered with a guess.
+
+Translation is lossy, and what it drops is enumerated in
+[architecture.md](architecture.md#cross-format-translation-is-opt-in-and-says-what-it-costs).
+The gateway logs the losses that apply to your own fleet, once, at startup.
 
 ## `virtual_keys`
 
@@ -606,6 +636,7 @@ capability disabled.
 | `x-gateway-attempted-fallbacks` | Fallback hops taken. |
 | `x-gateway-cache` | `hit` or `miss`, when response caching is on. |
 | `x-gateway-prompt-affinity` | `hit`, `miss`, or `new`, when a prompt-prefix pin was consulted. Absent otherwise. |
+| `x-gateway-translated` | The format pair a translated request crossed, as `openai->anthropic`. Absent when the reply was relayed in the format it arrived in. |
 
 ## Per-request overrides
 

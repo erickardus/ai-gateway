@@ -75,19 +75,37 @@ func (c *Config) Validate() error {
 	errs = append(errs, validateSSO(c)...)
 	errs = append(errs, validateRBAC(c)...)
 
-	// A group must speak one wire format: the gateway does not translate, so a
-	// mixed group would route some requests to an upstream expecting a
-	// different schema.
+	// A group must speak one wire format unless translation is switched on.
+	//
+	// With it off, a mixed group would route some requests to an upstream
+	// expecting a different schema, which fails as a 400 the caller cannot act
+	// on. With it on, a mixed group is the whole point: one public model name
+	// spanning both halves of the fleet, so a client that speaks one format
+	// reaches upstreams that speak the other.
+	//
+	// A passthrough member of a mixed group is not an error and is not a hole.
+	// It is simply unreachable from an ingress of the other format: the router
+	// never translates for one, because its body must arrive as the caller
+	// wrote it and its credential belongs to the caller's own subscription.
+	// That is enforced at selection, in router.candidates, rather than here,
+	// so one group can hold both a subscription deployment for Claude Code and
+	// a translated one for everyone else.
 	groupFormat := make(map[string]core.Format)
 	for i := range c.ModelList {
 		d := &c.ModelList[i]
 		if seen, ok := groupFormat[d.ModelName]; ok && seen != d.Params.Format {
-			errs = append(errs, fmt.Errorf(
-				"model_list[%d].params.format: model group %q mixes %q and %q; a group must speak one format because the gateway does not translate between them",
-				i, d.ModelName, seen, d.Params.Format))
+			if !c.Router.Translation.Enabled {
+				errs = append(errs, fmt.Errorf(
+					"model_list[%d].params.format: model group %q mixes %q and %q; a group must speak one format unless router.translation.enabled is set, because the gateway does not otherwise translate between them",
+					i, d.ModelName, seen, d.Params.Format))
+			}
 		} else if !ok {
 			groupFormat[d.ModelName] = d.Params.Format
 		}
+	}
+
+	if n := c.Router.Translation.DefaultMaxTokens; n < 0 {
+		errs = append(errs, fmt.Errorf("router.translation.default_max_tokens: must be >= 0, got %d", n))
 	}
 
 	if c.Cache.Enabled {
@@ -291,10 +309,10 @@ func (c *Config) Validate() error {
 				if to == r.From {
 					errs = append(errs, fmt.Errorf("%s[%d].to[%d]: model group %q cannot fall back to itself", set.name, i, j, to))
 				}
-				if from, okFrom := groupFormat[r.From]; okFrom {
+				if from, okFrom := groupFormat[r.From]; okFrom && !c.Router.Translation.Enabled {
 					if dst, okTo := groupFormat[to]; okTo && dst != from {
 						errs = append(errs, fmt.Errorf(
-							"%s[%d].to[%d]: %q speaks %q but %q speaks %q; a fallback must not cross wire formats",
+							"%s[%d].to[%d]: %q speaks %q but %q speaks %q; a fallback must not cross wire formats unless router.translation.enabled is set",
 							set.name, i, j, r.From, from, to, dst))
 					}
 				}
