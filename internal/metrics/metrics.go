@@ -105,6 +105,13 @@ const (
 	// OutcomeCacheHit marks a request served from cache, which called no
 	// upstream and cost nothing.
 	OutcomeCacheHit = "cache_hit"
+	// OutcomeClientGone marks a request the caller abandoned before it was
+	// answered. It is kept out of OutcomeGateway because the error rate is read
+	// as "how often is the gateway failing", and a client that hung up did not
+	// fail: a CLI exiting after its last answer cancels whatever it still had in
+	// flight, which is normal behaviour and would otherwise report as a fault
+	// with no cause to find.
+	OutcomeClientGone = "client_disconnected"
 )
 
 // Prompt-cache outcome labels. "read" and "write" name the provider's own two

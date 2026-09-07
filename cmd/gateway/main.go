@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -234,6 +236,7 @@ func run() error {
 		return fmt.Errorf("initialize router: %w", err)
 	}
 	registerLiveGauges(reg, cfg, rtr, store, shared, auditSink, history, version)
+	warnStaleKeyAllowlists(ctx, store, rtr, log)
 
 	// Push the same snapshot /metrics serves to an OTLP collector. The two are
 	// independent: either, both or neither may be on, and both render the same
@@ -410,6 +413,68 @@ func newSpendLedger(cfg config.ObservabilityConfig) (*spend.Ledger, error) {
 		return nil, fmt.Errorf("open spend ledger: %w", err)
 	}
 	return ledger, nil
+}
+
+// warnStaleKeyAllowlists reports stored keys whose model allowlist names a group
+// this configuration does not declare.
+//
+// A key store outlives the configuration its keys were written against. A file
+// store is a file and a postgres store is a database; neither is rewritten when
+// model_list changes, so a group can be renamed or removed while keys still
+// name it. Those keys look correct in the console and in `key list` right up
+// until a request for that model is refused, and the refusal — "no such model"
+// — points at the config rather than at the key that is actually stale.
+//
+// This warns rather than refuses. The keys remain valid for every group that
+// does exist, and a gateway that would not start because one allowlist entry
+// outlived a config edit is a gateway whose config an operator cannot edit.
+func warnStaleKeyAllowlists(ctx context.Context, store auth.KeyStore, rtr *router.Router, log *slog.Logger) {
+	keys, err := store.List(ctx)
+	if err != nil {
+		// Not fatal, and not loud: this is a diagnostic, and a store that
+		// cannot be read is already reported by everything that depends on it.
+		log.Warn("could not check virtual key allowlists against the configured model groups", "error", err)
+		return
+	}
+	groups := rtr.Groups()
+	for _, key := range keys {
+		var stale []string
+		for _, pattern := range key.Models {
+			// core.MatchModel is the matcher AllowsModel enforces with, so an
+			// entry accepted here is an entry that resolves at request time.
+			matched := false
+			for name := range groups {
+				if core.MatchModel(pattern, name) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				stale = append(stale, pattern)
+			}
+		}
+		if len(stale) == 0 {
+			continue
+		}
+		slices.Sort(stale)
+		log.Warn("virtual key allows model groups this configuration does not declare",
+			"key", keyLabel(key),
+			"models", strings.Join(stale, ","),
+			"effect", "requests naming them are refused with 404 no such model")
+	}
+}
+
+// keyLabel names a stored key in a log line without exposing it. Only the
+// storage hash is held, so a prefix of it stands in where no alias was given —
+// enough to find the key in the console, not enough to present it.
+func keyLabel(key *core.Key) string {
+	if key.Alias != "" {
+		return key.Alias
+	}
+	if len(key.Hash) > 8 {
+		return "hash:" + key.Hash[:8]
+	}
+	return "hash:" + key.Hash
 }
 
 // newKeyStore builds the configured key store.

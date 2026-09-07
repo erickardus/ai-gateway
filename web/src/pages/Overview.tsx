@@ -19,11 +19,11 @@ export type PageProps = { onUnauthorized: () => void }
 // a gateway error is this process failing and is fixed here. Painting both red
 // makes one number out of two problems with different owners.
 export const OUTCOME_COLOR: Record<string, string> = {
-  success: 'var(--ok)',
-  cache_hit: 'var(--info)',
-  rejected: 'var(--warn)',
-  upstream_error: 'var(--serious)',
-  gateway_error: 'var(--bad)',
+  success: 'var(--ok-mark)',
+  cache_hit: 'var(--info-mark)',
+  rejected: 'var(--warn-mark)',
+  upstream_error: 'var(--serious-mark)',
+  gateway_error: 'var(--bad-mark)',
 }
 
 export function outcomeTone(outcome: string): 'ok' | 'warn' | 'bad' | 'info' | 'neutral' {
@@ -170,8 +170,9 @@ export function Overview({ onUnauthorized }: PageProps) {
                 />
               ) : <p className="hint" style={{ margin: 0 }}>No timings yet.</p>}
               <p className="hint" style={{ marginTop: 12 }}>
-                Measured over requests that reached an upstream. A refusal answered in a millisecond
-                is excluded, because averaging it in makes a slow gateway look fast.
+                Measured over requests that actually called an upstream. A refusal answered in a
+                millisecond and a response served from the cache are both excluded — counting either
+                makes a slow gateway look fast.
               </p>
             </div>
           </Panel>

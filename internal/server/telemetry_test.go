@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/metrics"
 	"github.com/erickardus/ai-gateway/internal/otlp"
 	"github.com/erickardus/ai-gateway/internal/reqlog"
@@ -371,5 +373,43 @@ func TestThroughputIsNotMeasuredOnUnstreamedReplies(t *testing.T) {
 	}
 	if records[0].Usage.OutputTokens == 0 {
 		t.Fatal("the reply reported no output tokens, so this proves nothing")
+	}
+}
+
+// A caller that hangs up is not a gateway failure.
+//
+// A CLI cancels whatever it still has in flight when it exits — a session-title
+// request outliving the answer it was titling is the ordinary case — and
+// counting that as gateway_error puts a fault with no cause in the error rate
+// an operator is meant to trust, and an ERROR with no action in their log.
+func TestClientDisconnectIsNotAGatewayError(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", allowPassthrough: true})
+
+	// Cancelled before dispatch, which is what the upstream call observes when
+	// the caller's connection has already gone away.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := claudeCodeRequest("/v1/messages", `{"model":"anthropic-claude","messages":[]}`).WithContext(ctx)
+	rec := h.do(t, req)
+
+	if rec.Code != core.StatusClientClosedRequest {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, core.StatusClientClosedRequest, rec.Body.String())
+	}
+	logs := h.logBuf.String()
+	if strings.Contains(logs, "level=ERROR") {
+		t.Errorf("a caller hanging up must not be logged as an error:\n%s", logs)
+	}
+	// The access log has its own level band, and 499 sits below the one that
+	// warns: a hang-up is not a bad request either.
+	if strings.Contains(logs, "level=WARN msg=request ") {
+		t.Errorf("the access log should not warn about a disconnect:\n%s", logs)
+	}
+
+	out := scrape(t, h)
+	if got, ok := series(t, out, metrics.MRequests, `outcome="`+metrics.OutcomeClientGone+`"`); !ok || got != 1 {
+		t.Errorf("client-disconnect outcome = %v (found=%t), want 1;\n%s", got, ok, out)
+	}
+	if got, ok := series(t, out, metrics.MRequests, `outcome="`+metrics.OutcomeGateway+`"`); ok && got != 0 {
+		t.Errorf("gateway_error = %v, want none: a disconnect is not a gateway failure", got)
 	}
 }

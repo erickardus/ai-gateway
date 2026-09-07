@@ -110,14 +110,29 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		AnnotateRequest(ctx, label, fields.Model)
 	}
 
-	if err := s.auth.AuthorizeModel(authCtx, fields.Model); err != nil {
-		s.reject(r, &obs, "model_forbidden", started)
-		s.failAs(w, r, err, format)
-		return
-	}
+	// Existence is settled before permission, so a model this gateway does not
+	// serve is reported as absent rather than as forbidden.
+	//
+	// The other order is the tempting one — refuse the unauthorized caller
+	// before telling them anything about the configuration — but it answers a
+	// request for a group that exists nowhere with "this key is not permitted
+	// to call the requested model", and the obvious next step, widening the
+	// key's allowlist, changes nothing. That is the same dead end the scope
+	// refusal in classify() is worded to avoid, one level up.
+	//
+	// What it discloses is which group names exist, to a caller already holding
+	// a virtual key this operator issued. Group names are the operator's own
+	// configuration rather than a secret, and a developer sent to chase a
+	// permission problem that does not exist costs more than an authenticated
+	// caller learning that "kimi-k2.7-code" is a name.
 	if !s.router.HasGroup(fields.Model) {
 		s.reject(r, &obs, "model_unknown", started)
 		s.failAs(w, r, fmt.Errorf("model %q: %w", fields.Model, core.ErrModelNotFound), format)
+		return
+	}
+	if err := s.auth.AuthorizeModel(authCtx, fields.Model); err != nil {
+		s.reject(r, &obs, "model_forbidden", started)
+		s.failAs(w, r, err, format)
 		return
 	}
 
@@ -213,8 +228,11 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	if err != nil {
 		obs.outcome = metrics.OutcomeGateway
 		var upstream *core.UpstreamError
-		if errors.As(err, &upstream) {
+		switch {
+		case errors.As(err, &upstream):
 			obs.outcome, obs.deployment = metrics.OutcomeUpstream, upstream.Deployment
+		case errors.Is(err, context.Canceled):
+			obs.outcome = metrics.OutcomeClientGone
 		}
 		obs.latency = time.Since(started)
 		s.record(r, obs)
@@ -529,9 +547,16 @@ func (s *Server) failAs(w http.ResponseWriter, r *http.Request, err error, forma
 
 	status := core.StatusFor(err)
 	kind, message := classify(err, status)
-	if status >= 500 {
+	switch {
+	case status == core.StatusClientClosedRequest:
+		// Info, not Warn: nothing went wrong and there is nothing to fix. It is
+		// logged at all only so that a gap between requests sent and requests
+		// answered has an explanation rather than looking like lost traffic.
+		s.log.Info("caller disconnected before the reply was written",
+			"request_id", RequestIDFrom(r.Context()))
+	case status >= 500:
 		s.log.Error("request failed", "request_id", RequestIDFrom(r.Context()), "error", err)
-	} else {
+	default:
 		s.log.Warn("request rejected", "request_id", RequestIDFrom(r.Context()), "error", err)
 	}
 	writeError(w, status, kind, message)
@@ -581,6 +606,10 @@ func classify(err error, status int) (kind, message string) {
 		return "api_error", "no healthy deployment available for this model"
 	case errors.Is(err, core.ErrBodyTooLarge):
 		return "invalid_request_error", "request body too large"
+	case errors.Is(err, context.Canceled):
+		// Written into a connection that is already gone, so this reaches
+		// nobody. It exists so that a captured response is not blank about why.
+		return "api_error", "the client closed the connection before the response was written"
 	}
 	if status >= 500 {
 		return "api_error", "internal server error"

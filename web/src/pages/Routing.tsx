@@ -191,21 +191,24 @@ export function Routing({ onUnauthorized }: PageProps) {
       </Panel>
 
       {config.data && (
-        <Panel title="Router settings" note={config.data.translation.note}>
+        <Panel title="Router settings">
           <div className="panel-body">
-            <dl className="kv" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', marginTop: 0 }}>
+            <div className="settings-grid">
               <Setting label="Strategy" value={config.data.strategy} />
               <Setting label="Retries per attempt" value={String(router.num_retries ?? 0)} />
+              <Setting label="Max fallback hops" value={String(router.max_fallback_hops ?? 0)} />
               <Setting label="Request timeout" value={seconds(router.timeout_seconds)} />
               <Setting label="Stream timeout" value={seconds(router.stream_timeout_seconds)} />
-              <Setting label="Max fallback hops" value={String(router.max_fallback_hops ?? 0)} />
               <Setting label="Backoff jitter" value={String(router.backoff_jitter ?? 0)} />
               <Setting label="Lowest-latency buffer" value={String(router.lowest_latency_buffer ?? 0)} />
               <Setting
                 label="Cross-format translation"
                 value={config.data.translation.enabled ? 'enabled' : 'off'}
               />
-            </dl>
+            </div>
+            <p className="hint" style={{ marginTop: 16, maxWidth: '84ch' }}>
+              <strong>Cross-format translation.</strong> {config.data.translation.note}
+            </p>
           </div>
         </Panel>
       )}
@@ -215,8 +218,9 @@ export function Routing({ onUnauthorized }: PageProps) {
 
 function Setting({ label, value }: { label: string; value: string }) {
   return (
-    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '3px 0' }}>
-      <span style={{ color: 'var(--muted)', fontFamily: 'var(--sans)' }}>{label}</span>
+    <div className="setting">
+      <span className="setting-label">{label}</span>
+      <span className="setting-dots" />
       <span className="mono">{value}</span>
     </div>
   )

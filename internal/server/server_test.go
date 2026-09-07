@@ -771,3 +771,59 @@ func TestAccessLogIdentifiesKeyWithoutLeakingIt(t *testing.T) {
 		}
 	}
 }
+
+// A model this gateway does not serve is reported as absent, even to a key
+// whose allowlist would also have refused it.
+//
+// Existence and permission disagree about what to say, and the order decides
+// which answer a developer gets. "Not permitted" sends them to widen the key's
+// allowlist, which cannot help when the group exists nowhere — and a client
+// reading a 403 from its base URL concludes its credentials are bad and asks
+// the developer to sign in again.
+func TestUnknownModelIsNotFoundEvenForARestrictedKey(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", allowPassthrough: true})
+
+	const restricted = "sk-vk-RESTRICTED"
+	if err := h.store.Put(context.Background(), &core.Key{
+		Hash: auth.HashKey(restricted), Alias: "restricted", Models: []string{"anthropic-claude"},
+	}); err != nil {
+		t.Fatalf("add key: %v", err)
+	}
+
+	req := claudeCodeRequest("/v1/messages", `{"model":"claude-sonnet-4-5-20250929","messages":[]}`)
+	req.Header.Set("x-gateway-key", restricted)
+	rec := h.do(t, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "no such model") {
+		t.Errorf("the refusal should say the model does not exist, got %s", rec.Body.String())
+	}
+}
+
+// The other half of the ordering, which must not have moved: a group that does
+// exist and is withheld is still a permission refusal, not a 404. Answering
+// "no such model" there would tell a caller the operator's allowlist is a
+// typo in their own request.
+func TestKnownModelIsStillRefusedByTheKeyAllowlist(t *testing.T) {
+	h := newHarness(t, harnessOpts{authMode: "api_key", allowPassthrough: true, soloGroup: true})
+
+	const restricted = "sk-vk-SOLOONLY"
+	if err := h.store.Put(context.Background(), &core.Key{
+		Hash: auth.HashKey(restricted), Alias: "solo-only", Models: []string{soloModel},
+	}); err != nil {
+		t.Fatalf("add key: %v", err)
+	}
+
+	req := claudeCodeRequest("/v1/messages", `{"model":"anthropic-claude","messages":[]}`)
+	req.Header.Set("x-gateway-key", restricted)
+	rec := h.do(t, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not permitted") {
+		t.Errorf("the refusal should name the permission, got %s", rec.Body.String())
+	}
+}

@@ -4,6 +4,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -41,12 +42,31 @@ var (
 	ErrBudgetExceeded = errors.New("budget exceeded")
 )
 
+// StatusClientClosedRequest is nginx's 499, for a caller that hung up before
+// the reply was written.
+//
+// net/http defines no constant because it is not in any RFC, but the alternative
+// is worse: a disconnect reported as 500 says the gateway failed at something,
+// when what happened is that nobody is listening any more. That distinction is
+// the difference between an error rate an operator should investigate and one
+// they cannot act on at all.
+const StatusClientClosedRequest = 499
+
 // StatusFor maps a gateway error to the HTTP status the client should see.
 // Errors that do not match a sentinel become 500.
 func StatusFor(err error) int {
 	switch {
 	case err == nil:
 		return http.StatusOK
+	// Checked before the sentinels because a cancelled call is wrapped by
+	// whatever it was cancelled inside of, and the answer does not depend on
+	// which layer that was.
+	//
+	// context.DeadlineExceeded is deliberately not folded in here. That one is
+	// the gateway's own timeout expiring, which is a failure the operator owns
+	// and should see; this one is the caller walking away, which is not.
+	case errors.Is(err, context.Canceled):
+		return StatusClientClosedRequest
 	case errors.Is(err, ErrKeyInvalid):
 		return http.StatusUnauthorized
 	case errors.Is(err, ErrKeyBlocked):

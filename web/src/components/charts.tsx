@@ -76,7 +76,10 @@ function shortNum(n: number): string {
   const abs = Math.abs(n)
   if (abs >= 1_000_000) return (n / 1_000_000).toFixed(abs >= 10_000_000 ? 0 : 1) + 'M'
   if (abs >= 1_000) return (n / 1_000).toFixed(abs >= 10_000 ? 0 : 1) + 'K'
-  if (abs >= 10 || abs === 0) return String(Math.round(n))
+  // A whole number is printed whole. This formatter is the default for every
+  // axis and legend, and most of what it renders is a count of requests: "8.0
+  // sign-ins" is not a number anybody writes.
+  if (Number.isInteger(n)) return String(n)
   if (abs >= 1) return n.toFixed(1)
   return n.toFixed(abs < 0.01 ? 4 : 2)
 }
@@ -288,8 +291,13 @@ export function TimeSeries({
               </g>
             )}
 
-            <text className="chart-tick" x={0} y={plotH + 14}>{clockLabel(points[0].start)}</text>
-            {points.length > 2 && (
+            {/* Time labels are dropped as the plot narrows rather than left to
+                overlap. Three timestamps need about 220px between them to stay
+                apart, and two colliding labels are less use than one. */}
+            {plotW >= 120 && (
+              <text className="chart-tick" x={0} y={plotH + 14}>{clockLabel(points[0].start)}</text>
+            )}
+            {points.length > 2 && plotW >= 220 && (
               <text className="chart-tick" x={plotW / 2} y={plotH + 14} textAnchor="middle">
                 {clockLabel(points[Math.floor(points.length / 2)].start)}
               </text>
@@ -479,7 +487,7 @@ export function Percentiles({ marks, max, format }: {
 }) {
   const top = niceMax(max ?? Math.max(...marks.map((m) => m.value), 0))
   const colour = (tone?: string) =>
-    tone === 'bad' ? 'var(--bad)' : tone === 'warn' ? 'var(--warn)' : ACCENT
+    tone === 'bad' ? 'var(--bad-mark)' : tone === 'warn' ? 'var(--warn-mark)' : ACCENT
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>

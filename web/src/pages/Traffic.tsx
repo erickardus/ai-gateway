@@ -238,6 +238,13 @@ function Figure({ label, value, sub, tone }: {
 function RecordDrawer({ record: r, onClose }: { record: TrafficRecord; onClose: () => void }) {
   const totalTokens = (r.usage.input_tokens ?? 0) + (r.usage.output_tokens ?? 0)
 
+  // A cache hit is recorded against the sentinel deployment "cache" and carries
+  // no cost, so the two obvious tests — "has a deployment" and "is not
+  // billable" — both say passthrough about it. They are opposite facts: a
+  // passthrough request was answered by an upstream on the caller's own
+  // credential, and this one was answered by this process out of memory.
+  const calledUpstream = !!r.deployment && r.outcome !== 'cache_hit'
+
   return (
     <Drawer
       title={r.model_group || 'request'}
@@ -251,7 +258,7 @@ function RecordDrawer({ record: r, onClose }: { record: TrafficRecord; onClose: 
         {r.status_class && <Pill tone="neutral">upstream {r.status_class}</Pill>}
         {r.streaming && <Pill tone="neutral">streamed</Pill>}
         {r.format && <Pill tone="neutral">{r.format}</Pill>}
-        {!r.billable && r.deployment && <Pill tone="accent">passthrough</Pill>}
+        {!r.billable && calledUpstream && <Pill tone="accent">passthrough</Pill>}
       </div>
 
       <p className="section-label">Routing</p>
@@ -305,7 +312,15 @@ function RecordDrawer({ record: r, onClose }: { record: TrafficRecord; onClose: 
         <dt>Throughput</dt>
         <dd>{r.throughput_tps ? `${r.throughput_tps.toFixed(1)} tok/s` : r.streaming ? '—' : 'not streamed'}</dd>
         <dt>Effective rate</dt>
-        <dd>{totalTokens && r.latency_ms ? `${(totalTokens / (r.latency_ms / 1000)).toFixed(0)} tok/s end to end` : '—'}</dd>
+        <dd>
+          {/* Only for a request that actually generated something. Dividing a
+              token count by the microsecond a cache hit took reports hundreds
+              of millions of tokens a second, which is a true division and a
+              false claim about the gateway. */}
+          {calledUpstream && totalTokens > 0 && r.latency_ms >= 1
+            ? `${(totalTokens / (r.latency_ms / 1000)).toFixed(0)} tok/s end to end`
+            : r.outcome === 'cache_hit' ? 'not generated — served from cache' : '—'}
+        </dd>
         <dt>Request bytes</dt><dd>{bytes(r.request_bytes)}</dd>
         <dt>Response bytes</dt><dd>{bytes(r.response_bytes)}</dd>
       </dl>

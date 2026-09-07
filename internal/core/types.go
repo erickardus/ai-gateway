@@ -159,9 +159,13 @@ func (k *Key) AllowsModel(model string) bool {
 	return matchAny(k.Models, model)
 }
 
-// matchPattern matches an exact name or a trailing-"*" prefix pattern. A bare
+// MatchModel matches an exact name or a trailing-"*" prefix pattern. A bare
 // "*" matches everything.
-func matchPattern(pattern, s string) bool {
+//
+// Exported because startup validation checks the same allowlists this enforces,
+// and a second matcher written beside it would drift: an entry the gateway
+// accepted at load would then be refused at request time, or the reverse.
+func MatchModel(pattern, s string) bool {
 	if pattern == "*" {
 		return true
 	}

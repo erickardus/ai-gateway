@@ -59,6 +59,16 @@
   --info-soft: #e8f0fb;
   --info-line: #c3d8f2;
 
+  /* Mark variants of the status colours. The tokens above are stepped for text
+     on a panel, which makes them dark; a dark fill covering a third of a bar
+     reads as a smudge rather than as a colour. These are the same four states
+     re-stepped for an area of fill, and they are used only inside a chart. */
+  --ok-mark: #16a34a;
+  --warn-mark: #d9a01d;
+  --serious-mark: #d9743f;
+  --bad-mark: #d03b3b;
+  --info-mark: #2a78d6;
+
   /* Chart marks. Slots 1–4 are a validated categorical order and are only ever
      used where the pairs compared are adjacent — a stack, a grouped bar, a set
      of lines. Anything that puts every pair on screen at once (a donut, a
@@ -128,6 +138,12 @@
     --info-soft: #16202f;
     --info-line: #263a55;
 
+    --ok-mark: #5cbb7e;
+    --warn-mark: #d5a445;
+    --serious-mark: #d9945f;
+    --bad-mark: #ea8b83;
+    --info-mark: #6ba4e8;
+
     --chart-1: #3987e5;
     --chart-2: #d95926;
     --chart-3: #199e70;
@@ -178,6 +194,12 @@
   --info: #6ba4e8;
   --info-soft: #16202f;
   --info-line: #263a55;
+
+  --ok-mark: #5cbb7e;
+  --warn-mark: #d5a445;
+  --serious-mark: #d9945f;
+  --bad-mark: #ea8b83;
+  --info-mark: #6ba4e8;
 
   --chart-1: #3987e5;
   --chart-2: #d95926;
@@ -822,20 +844,20 @@ pre.code {
   line-height: 1.6;
 }
 
-.tree-indent-1 { padding-left: 22px; }
-.tree-indent-2 { padding-left: 44px; }
+.tree-indent-1 { padding-left: 36px; }
+.tree-indent-2 { padding-left: 58px; }
 /* The rule that makes a nested scope read as nested rather than merely
    indented. */
 .tree-indent-1, .tree-indent-2 { position: relative; }
 .tree-indent-1::before, .tree-indent-2::before {
   content: "";
   position: absolute;
-  left: 10px;
+  left: 20px;
   top: 0;
   bottom: 0;
   border-left: 1px solid var(--border);
 }
-.tree-indent-2::before { left: 32px; }
+.tree-indent-2::before { left: 42px; }
 
 /* Command palette --------------------------------------------------------- */
 
@@ -1063,3 +1085,29 @@ kbd {
   .kv dt { margin-top: 8px; }
 }
 @media (prefers-reduced-motion: reduce) { .sidebar { transition: none; } }
+
+/* Settings grid ----------------------------------------------------------- */
+
+/* A label and its value, joined by a leader so the eye can cross the gap. Two
+   columns rather than as many as fit: a setting stretched over a third of a wide
+   screen puts its own value further from its name than from the next one's. */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 2px 32px;
+  max-width: 900px;
+}
+.setting {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 13px;
+}
+.setting-label { color: var(--muted); white-space: nowrap; }
+.setting-dots {
+  flex: 1;
+  border-bottom: 1px dotted var(--border-strong);
+  opacity: 0.7;
+  transform: translateY(-3px);
+}

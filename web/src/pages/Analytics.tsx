@@ -103,10 +103,10 @@ export function Analytics({ onUnauthorized }: PageProps) {
               height={220}
               mode="bars"
               series={[
-                { key: 'served', label: 'Served', color: 'var(--ok)', format: count },
-                { key: 'cache_hits', label: 'Cache hit', color: 'var(--info)', format: count },
-                { key: 'rejected', label: 'Refused', color: 'var(--warn)', format: count },
-                { key: 'errors', label: 'Errored', color: 'var(--bad)', format: count },
+                { key: 'served', label: 'Served', color: 'var(--ok-mark)', format: count },
+                { key: 'cache_hits', label: 'Cache hit', color: 'var(--info-mark)', format: count },
+                { key: 'rejected', label: 'Refused', color: 'var(--warn-mark)', format: count },
+                { key: 'errors', label: 'Errored', color: 'var(--bad-mark)', format: count },
               ]}
               empty="No requests recorded in this window."
             />

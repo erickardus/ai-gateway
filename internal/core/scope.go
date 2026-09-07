@@ -150,7 +150,7 @@ func (s *Scope) Root() *Scope {
 // trailing-"*" rule as a key's own allowlist.
 func matchAny(patterns []string, s string) bool {
 	for _, p := range patterns {
-		if matchPattern(p, s) {
+		if MatchModel(p, s) {
 			return true
 		}
 	}

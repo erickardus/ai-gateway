@@ -72,7 +72,9 @@ rbac:
           budget_duration: 720h
 ```
 
-Watch what the gateway is doing from a browser, rather than from curl — see
+Watch what the gateway is doing from a browser, rather than from curl — health,
+throughput, latency and errors over time, spend by key and team, the keys
+themselves, the routing topology and the audit chain — see
 **[docs/admin-ui.md](docs/admin-ui.md)**:
 
 ```yaml
@@ -110,7 +112,7 @@ claude    # /login → "Claude account with subscription"
 | `GET /spend/history`, `GET /spend/export` | What was spent over a date range, and the per-request rows behind it as CSV. Master-key only; needs `observability.spend_history.dsn`. |
 | `GET /metrics` | Prometheus metrics, when `observability.metrics` is on. The same metrics push to an OpenTelemetry collector when `observability.otlp.endpoint` is set. |
 | `POST /cache/purge` | Empty the response cache, master-key only. |
-| `GET /ui/`, `/ui/api/*` | The admin console, when `ui.enabled`. A browser session, never a virtual key. |
+| `GET /ui/`, `/ui/api/*` | The admin console, when `ui.enabled`. A browser session, never a virtual key. Its own API covers health, traffic, analytics, keys, spend, scopes, the audit chain and the resolved configuration. |
 
 ## Scope
 
@@ -146,6 +148,8 @@ interface waiting for it.
 | Multi-instance shared key store (Postgres) | ✅ |
 | Tamper-evident audit log, one chain across a fleet (Postgres) | ✅ |
 | Admin UI — health, traffic, keys, spend, budgets, spend trend | ✅ |
+| Admin UI — throughput, latency and error analytics | ✅ |
+| Admin UI — audit chain, routing topology, CSV export | ✅ |
 | MCP gateway | ⏳ |
 
 **Cross-format translation is off by default.** With it off, an Anthropic

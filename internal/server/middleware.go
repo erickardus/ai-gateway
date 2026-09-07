@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/erickardus/ai-gateway/internal/core"
 )
 
 type requestIDKey struct{}
@@ -150,9 +152,15 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			}
 		}
 		level := slog.LevelInfo
-		if rec.status >= 500 {
+		switch {
+		// A caller that hung up is not a client error to warn about. Nobody
+		// sent a bad request; they stopped waiting for the answer, which the
+		// gateway can neither prevent nor fix.
+		case rec.status == core.StatusClientClosedRequest:
+			level = slog.LevelInfo
+		case rec.status >= 500:
 			level = slog.LevelError
-		} else if rec.status >= 400 {
+		case rec.status >= 400:
 			level = slog.LevelWarn
 		}
 		s.log.Log(ctx, level, "request", attrs...)

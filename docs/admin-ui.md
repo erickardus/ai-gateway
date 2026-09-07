@@ -72,10 +72,25 @@ request itself.
 
 **Overview** — deployment health, the routing strategy, prompt-cache affinity
 state, and spend over the current window with the billable and passthrough
-halves distinguished. Composed server-side in one request rather than stitched
-from `/health` and `/spend/*` in the browser, because four round trips each
-observe a slightly different instant and a page reporting twelve deployments
-healthy beside a total of eleven is worse than a page that waits.
+halves distinguished, over an hour of throughput, latency and outcomes. Composed
+server-side in one request rather than stitched from `/health` and `/spend/*` in
+the browser, because four round trips each observe a slightly different instant
+and a page reporting twelve deployments healthy beside a total of eleven is
+worse than a page that waits.
+
+**Analytics** — the same buffer the Traffic page lists row by row, aggregated
+into contiguous time buckets: requests stacked by how they ended, latency p50
+and p95 over time, token composition, and the same three dimensions — group,
+deployment, key — ranked beneath. The gateway does the bucketing because summing
+a few thousand records in the browser on every poll is work the process holding
+them can do once.
+
+Latency percentiles cover only requests that **actually called an upstream**. A
+refusal is decided in microseconds and arrives in volume, and a cache hit is
+recorded against the sentinel deployment `cache` — so a filter that merely asks
+whether a deployment was named admits it. Counting either would make a gateway
+look faster the more often it refused a key or was asked the same question
+twice, which is the one thing a latency figure must not do.
 
 **Traffic** — the last `request_log_size` requests this instance served, with
 the routing decision each produced: retries, fallbacks, whether the prompt-prefix
@@ -107,12 +122,34 @@ deployment, so those buckets sum the money once; it is charged to every scope
 above it as well, so a scope chart over every subject would draw an organisation
 and its teams on top of each other and double the height of every bar.
 
-**Deployments** and **Organisations** — read-only. Both are declared in
+**Audit** — the chain from `/ui/api/audit`, newest first, with its verification
+state stated at the top. The log is a shipped feature the console was previously
+blind to, which made the one question it exists to answer — who administered
+what — a question only `jq` could answer.
+
+A sink that cannot read back what it wrote says so instead of showing an empty
+table: `audit.sink: stdout` hands its records to whatever collects this
+process's logs and keeps nothing it can re-read. A file chain is re-verified on
+each request, which is affordable because it holds one host's administrative
+history; the Postgres chain is not, because verifying it walks a fleet's entire
+history across a network and a page view is the wrong thing to pay that for. It
+reports "not checked" rather than guessing, since `verified: false` beside no
+reason reads as a broken chain.
+
+**Routing** and **Organisations** — read-only. Both are declared in
 `gateway.yaml` and resolved at load, and a console that edited them would be a
 console rewriting the operator's configuration file behind their back.
 
-**Ops** — what this instance has enabled, shared-state health, and the one lever
-the console offers: purging the response cache.
+Routing leads with a card per model group: the deployments behind it, which are
+ready, and — the part invisible everywhere else — where its traffic goes when it
+cannot be served. A request that fell back reports the deployment that answered,
+not the group it was asked of, so the configured chain can only be read here,
+before it is needed.
+
+**Ops** — what this instance has enabled, shared-state health, where each store
+persists, and the one lever the console offers: purging the response cache. The
+targets it names are redacted to a host and database: a console is a place a
+connection string with a password in it must never be readable off the screen.
 
 ## The traffic buffer
 
