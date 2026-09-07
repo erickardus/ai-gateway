@@ -220,22 +220,47 @@ export function TimeSeries({
             })}
 
             {mode !== 'bars' && series.map((s, si) => {
-              const line = points.map((p, i) => {
-                const below = mode === 'stacked'
+              // below is this band's own baseline: the sum of every series
+              // stacked underneath it at the same instant, and zero when the
+              // series are drawn overlaid rather than stacked.
+              const below = (p: Point) =>
+                mode === 'stacked'
                   ? series.slice(0, si).reduce((sum, o) => sum + value(p, o.key), 0)
                   : 0
-                return `${i === 0 ? 'M' : 'L'}${x(i)},${y(below + value(p, s.key))}`
-              }).join(' ')
+
+              const line = points
+                .map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i)},${y(below(p) + value(p, s.key))}`)
+                .join(' ')
+
+              // The closing edge walks back along the band's own baseline. It
+              // has to visit the points in reverse while still reading each
+              // point's own baseline — pairing a reversed x with a forward
+              // value mirrors the floor, which fills the whole plot with the
+              // topmost band and hides every series under it.
               const floor = mode === 'stacked'
-                ? points.map((p, i) => {
-                    const below = series.slice(0, si).reduce((sum, o) => sum + value(p, o.key), 0)
-                    return `L${x(points.length - 1 - i)},${y(below)}`
-                  }).reverse().join(' ')
+                ? points
+                    .map((_, k) => points.length - 1 - k)
+                    .map((i) => `L${x(i)},${y(below(points[i]))}`)
+                    .join(' ')
                 : `L${x(points.length - 1)},${plotH} L${x(0)},${plotH}`
+
+              // A band that is zero everywhere is left undrawn. Stacked, its
+              // fill has no area and its line would sit exactly on top of the
+              // band below, reading as that band's colour; the legend still
+              // lists it, marked absent, so the measure is not silently
+              // dropped from the chart's vocabulary.
+              const present = points.some((p) => value(p, s.key) > 0)
+              if (!present && mode === 'stacked') return null
+
               return (
                 <g key={s.key}>
-                  <path d={`${line} ${floor} Z`} fill={`url(#${gradientId}-${si})`} />
-                  <path className="chart-line" d={line} stroke={s.color} />
+                  <path
+                    d={`${line} ${floor} Z`}
+                    fill={mode === 'stacked' ? s.color : `url(#${gradientId}-${si})`}
+                    fillOpacity={mode === 'stacked' ? 0.85 : 1}
+                    className={mode === 'stacked' ? 'chart-mark' : undefined}
+                  />
+                  {mode !== 'stacked' && <path className="chart-line" d={line} stroke={s.color} />}
                 </g>
               )
             })}
@@ -297,12 +322,21 @@ export function TimeSeries({
 
       {showLegend && series.length > 1 && (
         <div className="legend" style={{ marginTop: 10 }}>
-          {series.map((s) => (
-            <span className="item" key={s.key}>
-              <span className="swatch" style={{ background: s.color }} />
-              {s.label}
-            </span>
-          ))}
+          {series.map((s) => {
+            const total = points.reduce((sum, p) => sum + value(p, s.key), 0)
+            return (
+              <span
+                className="item"
+                key={s.key}
+                style={total > 0 ? undefined : { opacity: 0.45 }}
+                title={total > 0 ? undefined : 'none recorded in this window'}
+              >
+                <span className="swatch" style={{ background: s.color }} />
+                {s.label}
+                {total === 0 && <span className="val">none</span>}
+              </span>
+            )
+          })}
         </div>
       )}
     </div>

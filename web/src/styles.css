@@ -50,6 +50,11 @@
   --bad: #b3261e;
   --bad-soft: #fbeae8;
   --bad-line: #eec5c1;
+  /* "serious" sits between warn and bad: it marks a failure that came from
+     somewhere else — an upstream refusing us — as against one this gateway
+     caused. Same status family, different cause, and an operator triages the
+     two differently. */
+  --serious: #b4562c;
   --info: #1c5cab;
   --info-soft: #e8f0fb;
   --info-line: #c3d8f2;
@@ -118,6 +123,7 @@
     --bad: #ea8b83;
     --bad-soft: #2b1917;
     --bad-line: #4c2a26;
+    --serious: #d9945f;
     --info: #6ba4e8;
     --info-soft: #16202f;
     --info-line: #263a55;
@@ -168,6 +174,7 @@
   --bad: #ea8b83;
   --bad-soft: #2b1917;
   --bad-line: #4c2a26;
+  --serious: #d9945f;
   --info: #6ba4e8;
   --info-soft: #16202f;
   --info-line: #263a55;

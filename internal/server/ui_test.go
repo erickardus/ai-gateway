@@ -476,9 +476,10 @@ type analyticsBody struct {
 		LatencyP50MS float64   `json:"latency_p50_ms"`
 	} `json:"series"`
 	Totals struct {
-		Requests int `json:"requests"`
-		Errors   int `json:"errors"`
-		Rejected int `json:"rejected"`
+		Requests  int `json:"requests"`
+		Errors    int `json:"errors"`
+		Rejected  int `json:"rejected"`
+		CacheHits int `json:"cache_hits"`
 	} `json:"totals"`
 	Latency struct {
 		P50MS float64 `json:"p50_ms"`
@@ -637,6 +638,43 @@ func TestUIAnalyticsLatencyExcludesRequestsThatReachedNoUpstream(t *testing.T) {
 	}
 	if len(body.Groups) != 1 || body.Groups[0].Requests != 10 {
 		t.Fatalf("groups = %+v", body.Groups)
+	}
+}
+
+// A cache hit is recorded against the sentinel deployment "cache", so a test
+// for "reached a deployment" admits it — and it answered in microseconds
+// without calling anyone. Counting it would make a gateway look faster the more
+// often it was asked the same question twice, which is the one thing latency
+// must not report.
+func TestUIAnalyticsLatencyExcludesCacheHits(t *testing.T) {
+	h := newUIHarness(t)
+	cookie := h.signIn(t)
+
+	now := time.Now().UTC()
+	h.srv.traffic.Add(reqlog.Record{
+		ID: "served", At: now.Add(-time.Minute), ModelGroup: "anthropic-claude",
+		Deployment: h.deploymentID, KeyAlias: "test-key", Outcome: "success",
+		LatencyMS: 900,
+	})
+	for i := range 9 {
+		h.srv.traffic.Add(reqlog.Record{
+			ID: "hit" + strconv.Itoa(i), At: now.Add(-time.Minute),
+			ModelGroup: "anthropic-claude", KeyAlias: "test-key",
+			Deployment: "cache", Outcome: "cache_hit", LatencyMS: 0.2,
+		})
+	}
+
+	body := fetchAnalytics(t, h, cookie, "?window=10m&buckets=12")
+	if body.Totals.Requests != 10 || body.Totals.CacheHits != 9 {
+		t.Fatalf("totals = %+v, want 10 requests of which 9 cache hits", body.Totals)
+	}
+	if body.Latency.P50MS != 900 || body.Latency.MaxMS != 900 {
+		t.Fatalf("latency = %+v, want the one upstream call's 900ms alone", body.Latency)
+	}
+	for _, b := range body.Series {
+		if b.Requests > 0 && b.LatencyP50MS != 900 {
+			t.Fatalf("bucket latency p50 = %v, want 900", b.LatencyP50MS)
+		}
 	}
 }
 

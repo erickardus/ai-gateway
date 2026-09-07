@@ -13,11 +13,16 @@ export type PageProps = { onUnauthorized: () => void }
 // the informational blue — a hit is not a state of health, it is a different
 // path through the gateway — and every one of them is labelled, so the colour
 // is never carrying the meaning alone.
+//
+// The two error kinds are separated deliberately. An upstream error is a
+// provider refusing us and is fixed by talking to them or by adding a fallback;
+// a gateway error is this process failing and is fixed here. Painting both red
+// makes one number out of two problems with different owners.
 export const OUTCOME_COLOR: Record<string, string> = {
   success: 'var(--ok)',
   cache_hit: 'var(--info)',
   rejected: 'var(--warn)',
-  upstream_error: 'var(--bad)',
+  upstream_error: 'var(--serious)',
   gateway_error: 'var(--bad)',
 }
 

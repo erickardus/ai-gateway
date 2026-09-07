@@ -37,7 +37,7 @@ const (
 // fleet behind a load balancer shows each instance only the traffic it served,
 // so two operators looking at the same page disagree about how many requests
 // there were.
-const analyticsNote = "Aggregated from the recent-request buffer, which is per-process and bounded: this is a sample of one instance's recent traffic, not fleet-wide history. Latency percentiles cover only requests that reached a deployment, so refusals decided before dispatch do not pull them down."
+const analyticsNote = "Aggregated from the recent-request buffer, which is per-process and bounded: this is a sample of one instance's recent traffic, not fleet-wide history. Latency percentiles cover only requests that actually called an upstream, so neither a refusal decided before dispatch nor a response served from the cache pulls them down."
 
 // analyticsBucket is one interval of the series.
 //
@@ -235,7 +235,15 @@ func (s *Server) handleUIAnalytics(w http.ResponseWriter, r *http.Request) {
 		// microseconds and arrives in volume — a key at its budget refuses every
 		// request it makes — so counting those would report a p50 of nothing at
 		// all on a gateway whose upstream is slow.
-		served := rec.Deployment != ""
+		//
+		// A cache hit is excluded for the same reason and needs saying
+		// separately, because it does not look like a refusal: it is recorded
+		// against the sentinel deployment "cache", so a test for a deployment
+		// alone admits it. It answered without calling anyone, in well under a
+		// millisecond, and a warm cache would otherwise report a gateway as
+		// having grown faster when all that changed is how often it was asked
+		// the same question twice.
+		served := rec.Deployment != "" && rec.Outcome != metrics.OutcomeCacheHit
 
 		bucket.Requests++
 		totals.Requests++
