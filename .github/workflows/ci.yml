@@ -99,3 +99,21 @@ jobs:
 
       - name: Fuzz usage accounting briefly
         run: go test ./internal/provider -run Fuzz -fuzz FuzzUsageAccounting -fuzztime 30s
+
+      # Cross-format translation is the widest of these paths: it parses a whole
+      # document from an upstream nobody here controls and rebuilds it, and the
+      # rebuilt document is what the ledger, the budget and the caller all read.
+      # The first target is the one that turns into money — a translated reply
+      # must bill identically to the original — and the rest hold that no input
+      # can produce a body that is not JSON, or a stream that never terminates.
+      - name: Fuzz translated usage accounting briefly
+        run: go test ./internal/translate -run Fuzz -fuzz FuzzTranslateUsageAccounting -fuzztime 30s
+
+      - name: Fuzz request translation briefly
+        run: go test ./internal/translate -run Fuzz -fuzz FuzzTranslateRequest -fuzztime 30s
+
+      - name: Fuzz response translation briefly
+        run: go test ./internal/translate -run Fuzz -fuzz FuzzTranslateResponse -fuzztime 30s
+
+      - name: Fuzz stream translation briefly
+        run: go test ./internal/translate -run Fuzz -fuzz FuzzTranslateStream -fuzztime 30s

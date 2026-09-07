@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/promptcache"
 	"github.com/erickardus/ai-gateway/internal/provider"
 	"github.com/erickardus/ai-gateway/internal/router"
+	"github.com/erickardus/ai-gateway/internal/translate"
 )
 
 // pathMessages is Anthropic's inference endpoint, and pathCountTokens the
@@ -29,6 +31,15 @@ const (
 	pathMessages    = "/v1/messages"
 	pathCountTokens = "/v1/messages/count_tokens"
 )
+
+// translatedHeader names the format pair a translated request crossed, as
+// "openai->anthropic". It is set only where translation actually happened.
+//
+// A caller can otherwise not tell: the whole point of a translated reply is
+// that it is indistinguishable from a native one, which makes a fidelity
+// problem impossible to attribute from the client side. This is the header that
+// says "this answer was rebuilt" before anyone has to guess.
+const translatedHeader = "x-gateway-translated"
 
 // handleMessages serves the Anthropic Messages API.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +68,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	authCtx, err := s.auth.Authenticate(ctx, r.Header)
 	if err != nil {
 		s.reject(r, &obs, rejectUnauthenticated, started)
-		s.fail(w, r, err)
+		s.failAs(w, r, err, format)
 		return
 	}
 	// SpendSubject rather than Hash: an SSO key is reissued over its owner's
@@ -71,7 +82,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	body, err := s.readBody(r)
 	if err != nil {
 		s.reject(r, &obs, "body_too_large", started)
-		s.fail(w, r, err)
+		s.failAs(w, r, err, format)
 		return
 	}
 	obs.requestBytes = int64(len(body))
@@ -101,12 +112,12 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 
 	if err := s.auth.AuthorizeModel(authCtx, fields.Model); err != nil {
 		s.reject(r, &obs, "model_forbidden", started)
-		s.fail(w, r, err)
+		s.failAs(w, r, err, format)
 		return
 	}
 	if !s.router.HasGroup(fields.Model) {
 		s.reject(r, &obs, "model_unknown", started)
-		s.fail(w, r, fmt.Errorf("model %q: %w", fields.Model, core.ErrModelNotFound))
+		s.failAs(w, r, fmt.Errorf("model %q: %w", fields.Model, core.ErrModelNotFound), format)
 		return
 	}
 
@@ -137,7 +148,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// Refuse a key that has already spent its budget before incurring more cost.
 	if err := s.auth.CheckBudget(ctx, authCtx, s.ledger); err != nil {
 		s.reject(r, &obs, "budget_exceeded", started)
-		s.fail(w, r, err)
+		s.failAs(w, r, err, format)
 		return
 	}
 
@@ -145,7 +156,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// the gateway will actually dispatch.
 	if err := s.auth.Admit(ctx, authCtx); err != nil {
 		s.reject(r, &obs, "rate_limited", started)
-		s.fail(w, r, err)
+		s.failAs(w, r, err, format)
 		return
 	}
 
@@ -176,10 +187,19 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// refuse a field it does not recognize. Deciding here, where the group is
 	// still a set of candidates, would mean annotating all of them or none.
 	req := &provider.Request{
-		Path:     upstreamPath,
-		Query:    r.URL.RawQuery,
-		Body:     body,
-		Annotate: s.annotatorFor(format, fields.Stream, upstreamPath == pathMessages, RequestIDFrom(ctx)),
+		Path:  upstreamPath,
+		Query: r.URL.RawQuery,
+		Body:  body,
+		// The third argument says this endpoint actually runs the model, which
+		// is what gives Anthropic's automatic caching a conversation to follow.
+		// Token counting is the one endpoint that does not: it takes the same
+		// body to answer a different question and warms nothing. It is written
+		// as "not token counting" rather than "is /v1/messages" because a chat
+		// completion runs the model too, and once translation can send one to
+		// an Anthropic upstream, naming the endpoint instead of the property
+		// silently withholds the conversation breakpoint from exactly those
+		// requests — the growing history, which is the expensive half.
+		Annotate: s.annotatorFor(format, fields.Stream, upstreamPath != pathCountTokens, RequestIDFrom(ctx)),
 		Format:   format,
 		Header:   r.Header,
 		Creds:    authCtx.Credentials,
@@ -198,7 +218,7 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		}
 		obs.latency = time.Since(started)
 		s.record(r, obs)
-		s.fail(w, r, err)
+		s.failAs(w, r, err, format)
 		return
 	}
 	defer result.Response.Body.Close()
@@ -211,7 +231,47 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	s.metrics.InFlightAdd(obs.model, obs.deployment, 1)
 	defer s.metrics.InFlightAdd(obs.model, obs.deployment, -1)
 
+	// A deployment speaking another wire format answered in that format, so the
+	// reply has to be rewritten on its way out.
+	//
+	// A non-streamed one is rewritten here, before a single response header is
+	// written. There is no way to rewrite half a JSON document, so it has to be
+	// held whole in any case — and holding it before the status line is
+	// committed is what lets a reply this gateway cannot convert be reported as
+	// a gateway error, rather than reaching the caller as a 200 carrying a
+	// document their own format does not define. A streamed reply cannot be
+	// treated this way and is converted event by event during the relay: the
+	// status is sent with the first chunk, and buffering it would turn every
+	// long generation into the 300-second silence Claude Code aborts on.
+	obs.upstreamFormat = result.Response.Format
+	upstreamBody := io.Reader(result.Response.Body)
+	if result.Response.Format != format && !fields.Stream {
+		rewritten, terr := translate.ReadResponse(result.Response.Format, format, result.Response.Body)
+		if terr != nil {
+			obs.outcome = metrics.OutcomeGateway
+			obs.latency = time.Since(started)
+			s.record(r, obs)
+			s.log.Error("upstream reply could not be translated for the caller",
+				"request_id", RequestIDFrom(ctx),
+				"deployment", result.Deployment.ID(),
+				"from", result.Response.Format, "to", format,
+				"error", terr)
+			writeError(w, http.StatusBadGateway, "api_error",
+				"the upstream replied in a format the gateway could not translate for this request")
+			return
+		}
+		upstreamBody = bytes.NewReader(rewritten)
+	}
+
 	provider.SanitizeResponseHeaders(w.Header(), result.Response.Header)
+	// The upstream's own Content-Length describes a document that has just been
+	// rebuilt into a different one and would truncate it. The header naming the
+	// pair is what makes a translated request identifiable from the client side
+	// rather than only from the gateway's logs.
+	if result.Response.Format != format {
+		w.Header().Del("Content-Length")
+		w.Header().Set(translatedHeader, string(result.Response.Format)+"->"+string(format))
+	}
 	if cacheable {
 		w.Header().Set(cacheHeader, "miss")
 	}
@@ -237,7 +297,18 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 		relayTarget = tee
 	}
 
-	relayed, relayErr := provider.Relay(relayTarget, result.Response.Body, format)
+	// The relay reads the reply in the caller's own format, whether it was
+	// rewritten above or is being rewritten event by event here. Everything
+	// downstream — the usage sniffer, the response cache — therefore sees
+	// exactly what the client sees, which is deliberate: the translator
+	// restates the upstream's token counters under the caller's format's
+	// convention, so the reply the client reads and the figure the gateway
+	// bills come from one document rather than from two parses that could
+	// disagree.
+	if result.Response.Format != format && fields.Stream {
+		upstreamBody = translate.Stream(result.Response.Format, format, result.Response.Body)
+	}
+	relayed, relayErr := provider.Relay(relayTarget, upstreamBody, format)
 	usage := relayed.Usage
 	obs.responseBytes = relayed.Bytes
 	// Time to first token is measured from when the caller's request arrived,
@@ -412,14 +483,27 @@ func (s *Server) readBody(r *http.Request) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// fail writes an error response, relaying an upstream error verbatim when there
-// is one.
+// fail writes an error response for a caller whose format is not known, which
+// is every endpoint but inference.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	s.failAs(w, r, err, "")
+}
+
+// failAs writes an error response, relaying an upstream error verbatim when
+// there is one.
 //
 // Relaying matters: Claude Code inspects the upstream's own error wording to
 // decide whether to retry with a capability disabled. A gateway that rewrapped
 // those errors in its own envelope would break that recovery path even while
 // preserving the status code.
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+//
+// A translated request is the one case where something has to change, and only
+// the envelope does. The refusal came back in the upstream's format, and a
+// client handed an envelope its own format does not define finds no message in
+// it at all — so it reads a refusal it could have acted on as a corrupt reply.
+// The message text inside is carried across byte for byte, which is what that
+// matching depends on.
+func (s *Server) failAs(w http.ResponseWriter, r *http.Request, err error, format core.Format) {
 	var upstream *core.UpstreamError
 	if errors.As(err, &upstream) {
 		provider.SanitizeResponseHeaders(w.Header(), upstream.Header)
@@ -427,9 +511,14 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		if w.Header().Get("Content-Type") == "" {
 			w.Header().Set("Content-Type", "application/json")
 		}
+		body := upstream.Body
+		if format != "" && upstream.Format != "" && upstream.Format != format {
+			body = translate.Error(upstream.Format, format, body)
+			w.Header().Set(translatedHeader, string(upstream.Format)+"->"+string(format))
+		}
 		w.WriteHeader(upstream.StatusCode)
-		if len(upstream.Body) > 0 {
-			_, _ = w.Write(upstream.Body)
+		if len(body) > 0 {
+			_, _ = w.Write(body)
 		}
 		s.log.Warn("upstream error relayed",
 			"request_id", RequestIDFrom(r.Context()),

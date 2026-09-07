@@ -154,6 +154,104 @@ case-insensitively. That is exactly why the virtual key must use a name Claude
 Code does not already set — `x-gateway-key` is additive, whereas putting the key
 in `Authorization` would clobber your subscription token.
 
+## Reaching GPT and other OpenAI-format models from Claude Code
+
+Claude Code speaks the Anthropic Messages API and nothing else. Left alone, that
+means the only upstreams it can reach through the gateway are the
+Anthropic-compatible ones — a GPT deployment is configured, reachable by any
+OpenAI client, and invisible to the editor.
+
+Cross-format translation removes that wall. Switch it on:
+
+```yaml
+router:
+  translation:
+    enabled: true
+
+model_list:
+  # Unchanged: the subscription deployment from the setup above.
+  - model_name: anthropic-claude
+    params: {format: anthropic, api_base: https://api.anthropic.com, model: anthropic-claude, auth_mode: passthrough}
+
+  - model_name: openai-gpt
+    params:
+      format: openai
+      api_base: https://api.openai.com/v1
+      model: gpt-5
+      auth_mode: api_key
+      auth_header: authorization
+      auth_scheme: Bearer
+      api_key: ${OPENAI_API_KEY}
+      # OpenAI's reasoning models refuse the older max_tokens spelling.
+      max_completion_tokens: true
+    cost: {input_per_1m: 1.25, output_per_1m: 10, cache_read_per_1m: 0.125}
+```
+
+Then map Claude Code's own model aliases onto the gateway's group names, so
+`/model` switches vendor:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:4000",
+    "ANTHROPIC_MODEL": "anthropic-claude",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "anthropic-claude",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "anthropic-claude",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "openai-gpt",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-gateway-key: sk-vk-your-key-here"
+  }
+}
+```
+
+Now `/model` inside a session moves between them. The alias names still say
+"opus" and "haiku" — Claude Code's picker is built around them, and the gateway
+cannot rename it — so choose which alias points at which group with that in
+mind.
+
+### What changes when you switch to a translated model
+
+- **The subscription does not follow you.** Only the `passthrough` deployment
+  bills your claude.ai plan. A translated request is never sent to a passthrough
+  deployment, so `openai-gpt` traffic is billed per token to the server-side key
+  in that deployment's config. This is a property of the credential, not a
+  limitation of the translator: your subscription token is Anthropic's and
+  OpenAI would not accept it.
+- **The context meter may go quiet.** Claude Code measures context with
+  `/v1/messages/count_tokens`, and there is no OpenAI endpoint that measures a
+  prompt without running the model. On a group holding only `openai`
+  deployments the gateway answers `503` rather than inventing a number you would
+  then trim conversations against. Put one `anthropic` deployment in the same
+  group and counting works again, because the request routes to it.
+- **Some capabilities degrade quietly.** Extended thinking becomes a
+  `reasoning_effort` band and its returned reasoning is unsigned, so it does not
+  carry into the next turn. `top_k` is dropped. Images inside a tool result are
+  reduced to their text. The full list is in
+  [architecture.md](architecture.md#cross-format-translation-is-opt-in-and-says-what-it-costs),
+  and the gateway logs the ones your fleet can produce at startup.
+- **A translated reply says so.** It carries
+  `x-gateway-translated: openai->anthropic`, which is the only thing that
+  distinguishes it from a native one.
+
+### Mixing both in one group
+
+A group may hold deployments of both formats once translation is on, which is
+how a fallback crosses vendors:
+
+```yaml
+model_list:
+  - model_name: coding
+    params: {format: anthropic, api_base: https://api.anthropic.com, model: claude-sonnet-4-5-20250929, auth_mode: api_key, auth_header: x-api-key, api_key: ${ANTHROPIC_API_KEY}}
+    weight: 9
+  - model_name: coding
+    params: {format: openai, api_base: https://api.openai.com/v1, model: gpt-5, auth_mode: api_key, auth_header: authorization, auth_scheme: Bearer, api_key: ${OPENAI_API_KEY}, max_completion_tokens: true}
+    weight: 1
+```
+
+Claude Code asking for `coding` reaches either, and an Anthropic outage no
+longer stops the session. A `passthrough` deployment can sit in such a group
+too — it simply keeps serving the Anthropic callers and is passed over by
+everyone else.
+
 ## Known limitations
 
 **Model discovery is skipped.** Claude Code skips `GET /v1/models` when its only

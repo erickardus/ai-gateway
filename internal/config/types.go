@@ -221,6 +221,20 @@ type DeploymentParams struct {
 	// on a passthrough one, whose body is never annotated.
 	SupportsCacheControl bool `yaml:"supports_cache_control"`
 
+	// MaxCompletionTokens makes a translated request spell its output cap
+	// max_completion_tokens rather than max_tokens.
+	//
+	// It exists because the OpenAI-compatible ecosystem disagrees with itself
+	// and the gateway cannot ask a base URL which dialect it speaks: OpenAI's
+	// own reasoning models refuse the older spelling outright, while much of
+	// the compatible ecosystem has never implemented the newer one. There is no
+	// value that works everywhere, so an operator naming their upstream is the
+	// only sound source of the answer.
+	//
+	// Meaningless on an anthropic deployment, and on any deployment no
+	// cross-format request can reach.
+	MaxCompletionTokens bool `yaml:"max_completion_tokens"`
+
 	AuthMode core.AuthMode `yaml:"auth_mode"`
 	// AuthHeader names the header carrying the credential in api_key mode,
 	// typically "x-api-key" for Anthropic or "authorization" for OpenAI.
@@ -251,6 +265,43 @@ type RouterConfig struct {
 	// LowestLatencyBuffer widens the latency-based strategy's candidate set to
 	// every deployment within this fraction of the best observed latency.
 	LowestLatencyBuffer float64 `yaml:"lowest_latency_buffer"`
+
+	// Translation lets an ingress in one wire format reach deployments in the
+	// other. Off by default; see TranslationConfig.
+	Translation TranslationConfig `yaml:"translation"`
+}
+
+// TranslationConfig governs cross-format translation: accepting a request in
+// one provider's wire format, rewriting it for an upstream that speaks the
+// other, and rewriting the reply back.
+//
+// It is off by default and has to stay that way. Everywhere else this gateway
+// edits a body it splices one value and leaves every other byte identical;
+// translation parses the whole document and rebuilds it, which means owning the
+// fidelity of every field forever — including the fields that do not map, which
+// package translate enumerates in Loss and the gateway logs once per configured
+// cross-format route at startup.
+//
+// What it buys is the reason to have it at all: a client speaks one format for
+// its whole life. Claude Code speaks the Anthropic Messages API and nothing
+// else, so without this a developer pointed at the gateway can reach the
+// Anthropic-compatible half of the fleet and no more, and switching to a GPT
+// model mid-session is not a configuration away — it is impossible. With it,
+// one endpoint and one set of virtual keys serve both halves, and the model
+// aliases Claude Code already has become the switch.
+//
+// A passthrough deployment is never translated whatever this says. Its body
+// must arrive as the caller wrote it, and its credential belongs to the
+// caller's own subscription.
+type TranslationConfig struct {
+	// Enabled allows a request to be routed to a deployment whose format
+	// differs from the ingress it arrived at.
+	Enabled bool `yaml:"enabled"`
+	// DefaultMaxTokens bounds a translated request that named no output cap.
+	// The Messages API requires max_tokens and Chat Completions does not, so an
+	// OpenAI request reaching an Anthropic upstream has to be given one.
+	// Zero uses the translator's own default.
+	DefaultMaxTokens int `yaml:"default_max_tokens"`
 }
 
 // CooldownConfig controls ejection of failing deployments.

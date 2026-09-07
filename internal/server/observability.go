@@ -247,6 +247,13 @@ type observation struct {
 	// deployment quietly billing nothing.
 	format    core.Format
 	streaming bool
+	// upstreamFormat is the format the serving deployment answered in, which
+	// differs from format exactly when the request was translated. It is kept
+	// apart from format because the two answer different questions: the
+	// caller's format decides what the reply must look like, and the
+	// upstream's decides how its usage counters read — and after translation
+	// only the upstream's says whether a silent reply is expected.
+	upstreamFormat core.Format
 
 	// statusClass is the class of the upstream response the caller received,
 	// as "2xx", "4xx", "5xx". Empty where no upstream answered.
@@ -397,7 +404,16 @@ func (s *Server) warnUnpricedCacheWrite(obs observation, price core.Pricing) {
 // asked for no usage, or that this upstream ignores the field — and none of the
 // three announces itself anywhere else.
 func (s *Server) warnMissingStreamUsage(obs observation) {
-	if obs.format != core.FormatOpenAI || !obs.streaming || obs.deployment == "" {
+	// The serving deployment's format is what decides this, not the caller's.
+	// A translated request arrives in the Anthropic format and is answered by
+	// an OpenAI-compatible upstream, and it is that upstream that reports
+	// nothing unless asked — so keying on the caller's format would leave the
+	// translated half of a fleet billing zero with no warning anywhere.
+	upstream := obs.upstreamFormat
+	if upstream == "" {
+		upstream = obs.format
+	}
+	if upstream != core.FormatOpenAI || !obs.streaming || obs.deployment == "" {
 		return
 	}
 	if obs.outcome != metrics.OutcomeSuccess || !obs.usage.Empty() {

@@ -141,20 +141,28 @@ interface waiting for it.
 | Prometheus metrics — traffic, tokens, cost, cache, streaming, routing | ✅ |
 | OpenTelemetry — OTLP/HTTP metrics export | ✅ |
 | Guardrails | ⏳ |
-| Cross-format translation (Anthropic ↔ OpenAI) | ⏳ deliberate |
+| Cross-format translation (Anthropic ↔ OpenAI) | ✅ opt-in |
 | Multi-instance shared state (Redis) | ✅ |
 | Multi-instance shared key store (Postgres) | ✅ |
 | Tamper-evident audit log, one chain across a fleet (Postgres) | ✅ |
 | Admin UI — health, traffic, keys, spend, budgets, spend trend | ✅ |
 | MCP gateway | ⏳ |
 
-There is **no cross-format translation** in v1: an Anthropic ingress routes only
-to `anthropic` deployments, an OpenAI ingress only to `openai` ones. That is a
-deliberate choice — Anthropic's gateway rules require forwarding request bodies
-unchanged, and translation is the opposite of that. The reasoning is recorded in
-[architecture.md](docs/architecture.md#there-is-no-cross-format-translation), and
-[roadmap.md](docs/roadmap.md#-cross-format-translation) sizes what building it
-would take.
+**Cross-format translation is off by default.** With it off, an Anthropic
+ingress routes only to `anthropic` deployments and an OpenAI ingress only to
+`openai` ones. Set `router.translation.enabled` and one endpoint serves both:
+Claude Code, which speaks the Anthropic Messages API and nothing else, can then
+switch to a GPT model with `/model` and reach an OpenAI-format upstream, and a
+group or a fallback may span both halves of a fleet.
+
+It is opt-in because it is a trade. Everywhere else this gateway edits a body it
+splices one value and leaves every other byte identical; translating one parses
+the whole document and rebuilds it, which means owning the fidelity of every
+field — including the fields that do not map. What is dropped is enumerated in
+[architecture.md](docs/architecture.md#cross-format-translation-is-opt-in-and-says-what-it-costs),
+and the gateway logs the losses that apply to your own fleet, once, at startup.
+A passthrough deployment is never translated, so subscription traffic is
+untouched by any of it.
 
 ## Documentation
 

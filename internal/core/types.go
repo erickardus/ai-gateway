@@ -5,9 +5,13 @@ import (
 	"time"
 )
 
-// Format identifies the wire protocol a deployment speaks. The gateway does not
-// translate between formats in v1: an ingress in one format routes only to
-// deployments in that same format.
+// Format identifies the wire protocol a deployment speaks.
+//
+// By default it is a hard boundary: an ingress in one format routes only to
+// deployments in that same format. Setting router.translation.enabled lifts
+// that, and the request is rewritten for whichever upstream serves it — never
+// for a passthrough deployment, whose body must reach the upstream as the
+// caller wrote it. See package translate.
 type Format string
 
 const (

@@ -81,6 +81,13 @@ type UpstreamError struct {
 	Body       []byte
 	Header     http.Header
 	Deployment string
+	// Format is the wire format Body is written in, which is the serving
+	// deployment's rather than the caller's whenever the request was translated
+	// on the way out. Only the envelope around the message is rewritten for the
+	// caller; the upstream's own wording is preserved, because that wording is
+	// what a client matches on to decide whether to retry with a capability
+	// disabled.
+	Format Format
 }
 
 func (e *UpstreamError) Error() string {

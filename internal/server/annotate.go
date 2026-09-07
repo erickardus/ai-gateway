@@ -69,11 +69,20 @@ type annotator struct {
 // Nil is returned as the interface value rather than a nil *annotator, so the
 // caller's check for one actually finds nothing.
 func (s *Server) annotatorFor(format core.Format, stream, markConversation bool, requestID string) provider.Annotator {
+	// With translation switched on, an ingress can reach a deployment of either
+	// format, so neither shortcut below holds: which annotation applies is
+	// decided by the deployment that ends up serving, and that is not known
+	// here. Both shortcuts exist only to avoid allocating an annotator that
+	// would find nothing to add, so standing them down costs an allocation on
+	// requests that turn out to need nothing — against, if they were left in
+	// place, a translated streamed reply reaching an OpenAI-compatible upstream
+	// with no usage option on it, which is billed as nothing and charged
+	// against no budget.
+	crossFormat := s.cfg.Router.Translation.Enabled
+
 	wantsUsage := stream && s.cfg.Observability.StreamUsageEnabled()
-	// Both annotations are format-specific, and an ingress only ever reaches
-	// deployments speaking its own format, so a request in one format can never
-	// pick up the other's annotation.
-	if format == core.FormatAnthropic {
+	// The usage option belongs only to an OpenAI-compatible upstream.
+	if format == core.FormatAnthropic && !crossFormat {
 		wantsUsage = false
 	}
 	// Injection needs somewhere to land. An anthropic deployment always reads a
@@ -82,7 +91,7 @@ func (s *Server) annotatorFor(format core.Format, stream, markConversation bool,
 	// would otherwise allocate an annotator per request to decide it has nothing
 	// to add.
 	marksPrefix := s.cfg.PromptCache.Inject
-	if format == core.FormatOpenAI {
+	if format == core.FormatOpenAI && !crossFormat {
 		marksPrefix = marksPrefix && s.marksOpenAIPrefix
 	}
 	if !wantsUsage && !marksPrefix {
@@ -108,6 +117,9 @@ func (a *annotator) Annotate(dep *config.Deployment, base []byte) ([]byte, bool)
 		return base, false
 	}
 
+	// The deployment's format, never the caller's: on a translated request the
+	// body reaching this point has already been rewritten for this upstream, so
+	// the annotation that belongs on it is the one that upstream reads.
 	switch dep.Params.Format {
 	case core.FormatOpenAI:
 		// The usage option first: it is what billing depends on, so it is the

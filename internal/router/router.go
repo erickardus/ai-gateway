@@ -14,6 +14,7 @@ import (
 	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
 	"github.com/erickardus/ai-gateway/internal/provider"
+	"github.com/erickardus/ai-gateway/internal/translate"
 )
 
 // Executor performs one upstream attempt. provider.Client satisfies it.
@@ -30,6 +31,11 @@ type Router struct {
 	state    StateStore
 	exec     Executor
 	log      *slog.Logger
+
+	// translation says an ingress may reach a deployment speaking the other
+	// wire format. Off by default; see config.TranslationConfig for why that
+	// default is the right one.
+	translation bool
 
 	// rnd is guarded because math/rand/v2.Rand is not safe for concurrent use.
 	// The lock is taken only around a draw, never across a strategy's state
@@ -68,16 +74,17 @@ func New(cfg *config.Config, state StateStore, exec Executor, log *slog.Logger, 
 		seed = rand.Uint64()
 	}
 	return &Router{
-		cfg:      cfg.Router,
-		prompt:   cfg.PromptCache,
-		groups:   cfg.Groups(),
-		strategy: strategy,
-		state:    state,
-		exec:     exec,
-		log:      log,
-		rnd:      rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)),
-		ejected:  opts.Ejected,
-		now:      time.Now,
+		cfg:         cfg.Router,
+		prompt:      cfg.PromptCache,
+		groups:      cfg.Groups(),
+		strategy:    strategy,
+		state:       state,
+		exec:        exec,
+		log:         log,
+		translation: cfg.Router.Translation.Enabled,
+		rnd:         rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)),
+		ejected:     opts.Ejected,
+		now:         time.Now,
 	}, nil
 }
 
@@ -235,7 +242,7 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 	var firstErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		dep, err := r.pick(ctx, deployments, failed, overrides, req.Format, pinned)
+		dep, err := r.pick(ctx, deployments, failed, overrides, req, pinned)
 		if err != nil {
 			if firstErr != nil {
 				return nil, firstErr
@@ -279,7 +286,7 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 		// alternative available there is nothing to wait for. Only when every
 		// deployment has failed is it worth pausing before trying again, and
 		// the failure set is then cleared so the next attempt can proceed.
-		if r.hasUntried(ctx, deployments, failed, overrides, req.Format) {
+		if r.hasUntried(ctx, deployments, failed, overrides, req) {
 			continue
 		}
 		if err := r.sleep(ctx, r.backoff(attempt, attemptErr)); err != nil {
@@ -293,8 +300,8 @@ func (r *Router) routeGroup(ctx context.Context, model string, req *provider.Req
 // pick chooses a deployment and consumes its rate-limit budget. Capacity is
 // only consumed for the deployment actually dispatched to, so filtering never
 // spends budget on candidates that go unused.
-func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format, pinned string) (*config.Deployment, error) {
-	candidates, why, err := r.candidates(ctx, deployments, failed, overrides, format)
+func (r *Router) pick(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, req *provider.Request, pinned string) (*config.Deployment, error) {
+	candidates, why, err := r.candidates(ctx, deployments, failed, overrides, req)
 	if err != nil {
 		return nil, err
 	}
@@ -424,8 +431,8 @@ func (r *Router) reserve(ctx context.Context, dep *config.Deployment) (bool, err
 
 // hasUntried reports whether any deployment outside the failed set could still
 // serve this request. It does not consume capacity.
-func (r *Router) hasUntried(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) bool {
-	candidates, _, err := r.candidates(ctx, deployments, failed, overrides, format)
+func (r *Router) hasUntried(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, req *provider.Request) bool {
+	candidates, _, err := r.candidates(ctx, deployments, failed, overrides, req)
 	return err == nil && len(candidates) > 0
 }
 
@@ -545,6 +552,10 @@ type rejection struct {
 	cooldown    int
 	capacity    int
 	total       int
+	// translation records whether cross-format routing was even permitted, so
+	// a request refused for speaking the wrong format is told which of the two
+	// things to change: the fleet, or the switch that would let it be reached.
+	translation bool
 }
 
 // err returns the most informative error for a fully rejected candidate set.
@@ -554,8 +565,10 @@ func (r rejection) err() error {
 		return core.ErrNoHealthyDeployment
 	case r.passthrough == r.total:
 		return fmt.Errorf("every deployment requires passthrough permission: %w", core.ErrPassthroughNotAllowed)
+	case r.format == r.total && !r.translation:
+		return fmt.Errorf("no deployment speaks the requested wire format, and router.translation.enabled is not set: %w", core.ErrNoHealthyDeployment)
 	case r.format == r.total:
-		return fmt.Errorf("no deployment speaks the requested wire format: %w", core.ErrNoHealthyDeployment)
+		return fmt.Errorf("no deployment speaks the requested wire format or can be translated into it: %w", core.ErrNoHealthyDeployment)
 	case r.capacity == r.total:
 		return fmt.Errorf("every deployment is at its rate limit: %w", core.ErrRateLimited)
 	default:
@@ -563,9 +576,9 @@ func (r rejection) err() error {
 	}
 }
 
-func (r *Router) candidates(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, format core.Format) ([]*config.Deployment, rejection, error) {
+func (r *Router) candidates(ctx context.Context, deployments []*config.Deployment, failed map[string]bool, overrides Overrides, req *provider.Request) ([]*config.Deployment, rejection, error) {
 	now := r.now()
-	var why rejection
+	why := rejection{translation: r.translation}
 	out := make([]*config.Deployment, 0, len(deployments))
 	for _, d := range deployments {
 		if failed[d.ID()] {
@@ -578,11 +591,12 @@ func (r *Router) candidates(ctx context.Context, deployments []*config.Deploymen
 			why.passthrough++
 			continue
 		}
-		// The gateway does not translate between wire formats, so an ingress
-		// may only reach deployments speaking its own. Without this a fallback
-		// could relay an Anthropic body — and, on a passthrough deployment, the
-		// caller's Anthropic credential — to a different vendor's host.
-		if format != "" && d.Params.Format != format {
+		// An ingress reaches a deployment speaking another wire format only
+		// where translation is switched on and this request is one it can
+		// carry. Without that gate a fallback could relay an Anthropic body —
+		// and, on a passthrough deployment, the caller's Anthropic credential —
+		// to a different vendor's host expecting a different schema.
+		if req.Format != "" && d.Params.Format != req.Format && !r.translatable(d, req) {
 			why.format++
 			continue
 		}
@@ -607,6 +621,35 @@ func (r *Router) candidates(ctx context.Context, deployments []*config.Deploymen
 		out = append(out, d)
 	}
 	return out, why, nil
+}
+
+// translatable reports whether a request that arrived in one wire format may be
+// rewritten for a deployment speaking another.
+//
+// Three things have to hold, and each rules out a different way of being wrong:
+//
+//   - The operator switched translation on. It is a trade with real losses,
+//     enumerated in translate.Loss, and it is not made on anybody's behalf.
+//   - The deployment is not a passthrough one. Its body must reach the upstream
+//     exactly as the caller wrote it, and its credential is the caller's own
+//     subscription — so a rewritten body sent there would spend someone's
+//     personal quota on a document they did not write, at a vendor whose gateway
+//     rules forbid it. This is the check that lets one group hold both a
+//     subscription deployment for Claude Code and a translated one for
+//     everyone else.
+//   - The endpoint has an answer in the target format. Token counting does not:
+//     there is no OpenAI endpoint that measures a prompt without running the
+//     model, and a gateway that guessed would have a client trimming
+//     conversations against a number nobody computed.
+func (r *Router) translatable(d *config.Deployment, req *provider.Request) bool {
+	if !r.translation || d.Params.AuthMode == core.AuthModePassthrough {
+		return false
+	}
+	if !translate.Supported(req.Format, d.Params.Format) {
+		return false
+	}
+	_, ok := translate.UpstreamPath(req.Path, d.Params.Format)
+	return ok
 }
 
 // RecordPrefix pins this request's cacheable prefix to the deployment that

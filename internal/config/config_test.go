@@ -412,8 +412,8 @@ func TestNegativeDurationsRejected(t *testing.T) {
 	}
 }
 
-// The gateway does not translate between wire formats, so a group must not mix
-// them and a fallback must not cross them.
+// Without translation the gateway cannot carry a request between wire formats,
+// so a group must not mix them and a fallback must not cross them.
 func TestFormatHomogeneityEnforced(t *testing.T) {
 	mixed := `
 model_list:
@@ -439,6 +439,70 @@ router:
 `
 	if _, err := Parse([]byte(crossFallback)); err == nil || !strings.Contains(err.Error(), "cross wire formats") {
 		t.Errorf("a cross-format fallback should be rejected, got %v", err)
+	}
+}
+
+// With translation switched on, both arrangements are the point rather than a
+// mistake: one public model name spanning both halves of a fleet, and a group
+// in one format falling back to a group in the other.
+func TestFormatHomogeneityRelaxedByTranslation(t *testing.T) {
+	const enable = "\nrouter:\n  translation:\n    enabled: true\n"
+
+	mixed := `
+model_list:
+  - model_name: g
+    params: {format: anthropic, api_base: "https://api.anthropic.com", auth_mode: api_key, auth_header: x-api-key, api_key: k}
+  - model_name: g
+    params: {format: openai, api_base: "https://api.openai.com/v1", auth_mode: api_key, auth_header: authorization, api_key: k}
+` + enable
+	if _, err := Parse([]byte(mixed)); err != nil {
+		t.Errorf("a mixed-format group should be allowed with translation on: %v", err)
+	}
+
+	crossFallback := `
+model_list:
+  - model_name: a
+    params: {format: anthropic, api_base: "https://api.anthropic.com", auth_mode: api_key, auth_header: x-api-key, api_key: k}
+  - model_name: o
+    params: {format: openai, api_base: "https://api.openai.com/v1", auth_mode: api_key, auth_header: authorization, api_key: k}
+router:
+  translation:
+    enabled: true
+  fallbacks:
+    - from: a
+      to: [o]
+`
+	if _, err := Parse([]byte(crossFallback)); err != nil {
+		t.Errorf("a cross-format fallback should be allowed with translation on: %v", err)
+	}
+
+	// A passthrough deployment sharing a group with another format is not an
+	// error and not a hole: it is simply unreachable from an ingress of that
+	// other format, which the router enforces at selection.
+	withPassthrough := `
+virtual_keys:
+  allowed_upstream_hosts: ["api.anthropic.com"]
+model_list:
+  - model_name: g
+    params: {format: anthropic, api_base: "https://api.anthropic.com", auth_mode: passthrough}
+  - model_name: g
+    params: {format: openai, api_base: "https://api.openai.com/v1", auth_mode: api_key, auth_header: authorization, api_key: k}
+` + enable
+	if _, err := Parse([]byte(withPassthrough)); err != nil {
+		t.Errorf("a subscription deployment must still be allowed beside a translated one: %v", err)
+	}
+
+	negative := `
+model_list:
+  - model_name: g
+    params: {format: openai, api_base: "https://api.openai.com/v1", auth_mode: api_key, auth_header: authorization, api_key: k}
+router:
+  translation:
+    enabled: true
+    default_max_tokens: -1
+`
+	if _, err := Parse([]byte(negative)); err == nil || !strings.Contains(err.Error(), "default_max_tokens") {
+		t.Errorf("a negative default cap should be rejected, got %v", err)
 	}
 }
 
