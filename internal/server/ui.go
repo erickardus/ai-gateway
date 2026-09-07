@@ -54,6 +54,14 @@ func (s *Server) registerUI(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+uiPrefix+"/api/deployments", s.uiGated(s.handleUIDeployments))
 	mux.HandleFunc("GET "+uiPrefix+"/api/traffic", s.uiGated(s.handleUITraffic))
 	mux.HandleFunc("GET "+uiPrefix+"/api/scopes", s.uiGated(s.handleUIScopes))
+	mux.HandleFunc("GET "+uiPrefix+"/api/analytics", s.uiGated(s.handleUIAnalytics))
+	// The audit chain and the resolved configuration. Both are reads of things
+	// that already exist elsewhere — a file or a table, and gateway.yaml — and
+	// neither has any write path here: the records are appended by the actions
+	// they describe, and the configuration is the operator's file rather than
+	// something a browser edits behind their back.
+	mux.HandleFunc("GET "+uiPrefix+"/api/audit", s.uiGated(s.handleUIAudit))
+	mux.HandleFunc("GET "+uiPrefix+"/api/config", s.uiGated(s.handleUIConfig))
 
 	mux.HandleFunc("GET "+uiPrefix+"/api/keys", s.uiGated(s.handleUIKeys))
 	mux.HandleFunc("POST "+uiPrefix+"/api/keys/generate", s.uiGated(s.keyGenerate))
@@ -73,6 +81,9 @@ func (s *Server) registerUI(mux *http.ServeMux) {
 	// does, through the session cookie rather than through a key — the third
 	// credential plane, as everywhere else under /ui.
 	mux.HandleFunc("GET "+uiPrefix+"/api/spend/history", s.uiGated(s.writeSpendHistory))
+	// The CSV whoever does chargeback asks for, downloaded through the console
+	// session rather than by handing them the master key to run a curl with.
+	mux.HandleFunc("GET "+uiPrefix+"/api/spend/export", s.uiGated(s.writeSpendExport))
 
 	mux.HandleFunc("POST "+uiPrefix+"/api/cache/purge", s.uiGated(func(w http.ResponseWriter, r *http.Request) {
 		if s.cache == nil {

@@ -520,6 +520,15 @@ func (s *Server) handleSpendExport(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMaster(w, r) {
 		return
 	}
+	s.writeSpendExport(w, r)
+}
+
+// writeSpendExport is the export without its authentication, split off the way
+// writeSpendHistory is and for the same reason: the console reaches the same
+// report through a session cookie rather than the master key, and a second copy
+// of the streaming CSV logic would be a second place for the column list to
+// drift from the one whoever does chargeback already has a spreadsheet for.
+func (s *Server) writeSpendExport(w http.ResponseWriter, r *http.Request) {
 	if s.history == nil {
 		writeError(w, http.StatusNotFound, "not_found_error",
 			"spend history is not enabled; set observability.spend_history.dsn to keep one")

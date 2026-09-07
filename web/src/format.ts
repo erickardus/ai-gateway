@@ -86,3 +86,41 @@ export function ago(iso: string | undefined): string {
 export function shortHash(hash: string | undefined): string {
   return hash ? hash.slice(0, 10) : '—'
 }
+
+// percent renders a rate that is usually small and occasionally decisive. An
+// error rate of 0.4% and one of 0% are different facts, so it keeps a decimal
+// below ten per cent rather than rounding the first to the second.
+export function percent(part: number, whole: number): string {
+  if (!whole) return '—'
+  const value = (part / whole) * 100
+  if (value === 0) return '0%'
+  if (value < 0.1) return '<0.1%'
+  return value.toFixed(value < 10 ? 1 : 0) + '%'
+}
+
+export function bytes(value: number | undefined): string {
+  const n = value ?? 0
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB'
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + ' KB'
+  return n + ' B'
+}
+
+// seconds renders a configured interval the way the YAML that set it spells it,
+// so an operator comparing the console against gateway.yaml is comparing like
+// with like.
+export function seconds(value: number | undefined): string {
+  if (!value) return '—'
+  if (value % 86400 === 0) return value / 86400 + 'd'
+  if (value % 3600 === 0) return value / 3600 + 'h'
+  if (value % 60 === 0) return value / 60 + 'm'
+  return value + 's'
+}
+
+export function rate(count: number, windowSeconds: number): string {
+  if (!windowSeconds) return '—'
+  const perMinute = (count / windowSeconds) * 60
+  if (perMinute >= 100) return Math.round(perMinute) + '/min'
+  if (perMinute >= 1) return perMinute.toFixed(1) + '/min'
+  if (perMinute === 0) return '0/min'
+  return (perMinute * 60).toFixed(1) + '/hr'
+}
