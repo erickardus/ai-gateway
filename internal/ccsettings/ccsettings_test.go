@@ -337,3 +337,82 @@ func TestStateRoundTrip(t *testing.T) {
 		t.Errorf("deleting an absent state file must not be an error: %v", err)
 	}
 }
+
+// The header name is configurable on the gateway, so the key has to be read out
+// of whatever name is present rather than a hardcoded one.
+func TestGatewayKeyReadsTheValueWhateverTheHeaderIsCalled(t *testing.T) {
+	for name, tc := range map[string]struct {
+		headers string
+		want    string
+	}{
+		"default name":        {"x-gateway-key: sk-vk-A", "sk-vk-A"},
+		"renamed":             {"x-litellm-api-key: sk-vk-B", "sk-vk-B"},
+		"prefers the key":     {"x-trace-id: abc\nx-gateway-key: sk-vk-C", "sk-vk-C"},
+		"falls back to first": {"x-trace-id: abc", "abc"},
+		"absent":              {"", ""},
+		"malformed":           {"nonsense", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := SettingsPath(dir)
+			doc := `{"env":{}}`
+			if tc.headers != "" {
+				raw, err := json.Marshal(map[string]any{"env": map[string]string{EnvCustomHeaders: tc.headers}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				doc = string(raw)
+			}
+			if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			f, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := f.GatewayKey(); got != tc.want {
+				t.Errorf("GatewayKey() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// RemoveEnv is reachable from a command, so it must not become a way to strip
+// settings that belong to the developer rather than to this package.
+func TestRemoveEnvOnlyRemovesOwnedVariables(t *testing.T) {
+	dir := t.TempDir()
+	path := SettingsPath(dir)
+	raw, err := json.Marshal(map[string]any{"env": map[string]string{
+		EnvCustomModelOption: "kimi-k3",
+		"MY_OWN_VARIABLE":    "keep me",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !f.RemoveEnv(EnvCustomModelOption, "MY_OWN_VARIABLE") {
+		t.Fatal("RemoveEnv reported no change")
+	}
+	if err := f.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := reloaded.env(false)
+	if _, ok := env[EnvCustomModelOption]; ok {
+		t.Error("an owned variable survived")
+	}
+	if env["MY_OWN_VARIABLE"] != "keep me" {
+		t.Error("a variable this package does not own was removed")
+	}
+}

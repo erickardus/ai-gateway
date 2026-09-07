@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -37,7 +38,41 @@ const (
 	EnvBaseURL       = "ANTHROPIC_BASE_URL"
 	EnvModel         = "ANTHROPIC_MODEL"
 	EnvCustomHeaders = "ANTHROPIC_CUSTOM_HEADERS"
+	// EnvSmallFastModel is the model Claude Code uses for its own background
+	// work — session titles and the like — rather than for the developer's
+	// turns. It is set separately because the cheap choice for that traffic is
+	// rarely the model someone wants answering them.
+	EnvSmallFastModel = "ANTHROPIC_SMALL_FAST_MODEL"
+	// EnvCustomModelOption registers one model name that is not Claude Code's
+	// own, so that /model and --model will resolve it.
+	//
+	// Without it a gateway model name is not merely absent from the picker: it
+	// is unresolvable, and Claude Code answers an unresolvable name by falling
+	// back to the saved default *silently*. The request succeeds against the
+	// wrong model, which is worse than an error. There is one slot, so only one
+	// such model can be selectable at a time.
+	EnvCustomModelOption = "ANTHROPIC_CUSTOM_MODEL_OPTION"
+	// EnvCustomModelOptionName and EnvCustomModelOptionDescription are how that
+	// entry is labelled in the picker. Cosmetic, but a row reading
+	// "kimi-k3-anthropic" next to "Sonnet 5" is a row nobody can tell the
+	// purpose of six months later.
+	EnvCustomModelOptionName        = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
+	EnvCustomModelOptionDescription = "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"
 )
+
+// ownedVars are the variables this package writes and removes. SetEnv and
+// ClearEnv both read it, so a variable cannot be added to one and forgotten in
+// the other — which would leave a logout that tidies away a key but leaves the
+// model selection it was written beside.
+var ownedVars = []string{
+	EnvBaseURL,
+	EnvModel,
+	EnvSmallFastModel,
+	EnvCustomHeaders,
+	EnvCustomModelOption,
+	EnvCustomModelOptionName,
+	EnvCustomModelOptionDescription,
+}
 
 // displacingVars are the settings that replace a claude.ai subscription login
 // with a per-token credential. Writing a gateway key alongside any of them
@@ -134,7 +169,7 @@ func (f *File) env(create bool) map[string]any {
 func (f *File) SetEnv(vars map[string]string) bool {
 	env := f.env(true)
 	changed := false
-	for _, name := range []string{EnvBaseURL, EnvModel, EnvCustomHeaders} {
+	for _, name := range ownedVars {
 		want, ok := vars[name]
 		if !ok {
 			continue
@@ -228,12 +263,65 @@ func (f *File) RemoveHook(command string) bool {
 	return true
 }
 
+// GatewayKey returns the virtual key already recorded in this file, or "".
+//
+// It is what lets a second run reconfigure a project without the developer
+// finding their credential again — and without it passing through a shell
+// history on the way. The header name is not assumed: it is configurable on the
+// gateway, so whatever name is present is accepted and only the value is read.
+func (f *File) GatewayKey() string {
+	raw, _ := f.env(false)[EnvCustomHeaders].(string)
+	var first string
+	for _, line := range strings.Split(raw, "\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		// Claude Code allows several headers here. Preferring the one whose
+		// name says "key" keeps an unrelated header from being mistaken for a
+		// credential; the first header is the fallback because the gateway
+		// writes exactly one.
+		if strings.Contains(strings.ToLower(name), "key") {
+			return value
+		}
+		if first == "" {
+			first = value
+		}
+	}
+	return first
+}
+
+// RemoveEnv deletes the named variables, and reports whether anything changed.
+// Only variables this package owns may be removed, so a caller cannot use it to
+// strip settings that belong to the developer.
+func (f *File) RemoveEnv(names ...string) bool {
+	env := f.env(false)
+	changed := false
+	for _, name := range names {
+		if !slices.Contains(ownedVars, name) {
+			continue
+		}
+		if _, ok := env[name]; ok {
+			delete(env, name)
+			changed = true
+		}
+	}
+	if len(env) == 0 {
+		delete(f.doc, "env")
+	}
+	return changed
+}
+
 // ClearEnv removes the variables this package owns, and reports whether
 // anything changed.
 func (f *File) ClearEnv() bool {
 	env := f.env(false)
 	changed := false
-	for _, name := range []string{EnvBaseURL, EnvModel, EnvCustomHeaders} {
+	for _, name := range ownedVars {
 		if _, ok := env[name]; ok {
 			delete(env, name)
 			changed = true

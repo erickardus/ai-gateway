@@ -51,6 +51,8 @@ func main() {
 			exit(runLogin(os.Args[2:]))
 		case "logout":
 			exit(runLogout(os.Args[2:]))
+		case "setup":
+			exit(runSetup(os.Args[2:]))
 		}
 	}
 	exit(run())

@@ -71,9 +71,26 @@ virtual_keys:
 
 If your gateway has an identity provider configured, skip the rest of this
 section: `gateway login` writes all of it, and the developer never handles a
-key. See **[sso.md](sso.md)**. The manual form follows.
+key. See **[sso.md](sso.md)**.
 
-In `~/.claude/settings.json`:
+Otherwise `gateway setup` writes it for you. It asks the gateway which model
+groups it serves, offers them, and writes the result into the project's
+`.claude/settings.json`:
+
+```bash
+gateway setup                      # picks up GATEWAY_KEY, or the key already written
+gateway setup -yes -model kimi-k3  # same thing without the prompts
+```
+
+It writes a **project** directory rather than `~/.claude`, because a model
+pinned at user level applies to every checkout on the machine. Run it again to
+change models; it reuses the key already in the file, so the credential does not
+pass through a shell history twice.
+
+The manual form follows, and is worth reading once even if you use the command —
+the third variable in particular is not guessable.
+
+In `.claude/settings.json`:
 
 ```json
 {
@@ -84,6 +101,28 @@ In `~/.claude/settings.json`:
   }
 }
 ```
+
+**`ANTHROPIC_MODEL` alone does not make a gateway model *selectable*.** Claude
+Code resolves a model name before using it, and a name it does not recognise —
+which is every name that does not begin `claude-` — is not an error: it falls
+back to the saved default *silently*, and answers arrive from a model nobody
+chose. `ANTHROPIC_CUSTOM_MODEL_OPTION` registers one such name so that `/model`
+will resolve it, which is what makes switching away and back possible:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "kimi-k3-anthropic",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Kimi K3",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Kimi K3 through the gateway"
+  }
+}
+```
+
+There is one slot, so one gateway model can be selectable at a time. Note also
+that Claude Code sends dated ids for some models — `claude-haiku-4-5-20251001`
+for Haiku 4.5 — while sending current-generation ones bare. A group is an exact
+map key with no wildcards, so declare whichever spelling your client sends.
 
 Or as shell exports:
 
