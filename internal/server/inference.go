@@ -187,10 +187,19 @@ func (s *Server) serveInference(w http.ResponseWriter, r *http.Request, upstream
 	// refuse a field it does not recognize. Deciding here, where the group is
 	// still a set of candidates, would mean annotating all of them or none.
 	req := &provider.Request{
-		Path:     upstreamPath,
-		Query:    r.URL.RawQuery,
-		Body:     body,
-		Annotate: s.annotatorFor(format, fields.Stream, upstreamPath == pathMessages, RequestIDFrom(ctx)),
+		Path:  upstreamPath,
+		Query: r.URL.RawQuery,
+		Body:  body,
+		// The third argument says this endpoint actually runs the model, which
+		// is what gives Anthropic's automatic caching a conversation to follow.
+		// Token counting is the one endpoint that does not: it takes the same
+		// body to answer a different question and warms nothing. It is written
+		// as "not token counting" rather than "is /v1/messages" because a chat
+		// completion runs the model too, and once translation can send one to
+		// an Anthropic upstream, naming the endpoint instead of the property
+		// silently withholds the conversation breakpoint from exactly those
+		// requests — the growing history, which is the expensive half.
+		Annotate: s.annotatorFor(format, fields.Stream, upstreamPath != pathCountTokens, RequestIDFrom(ctx)),
 		Format:   format,
 		Header:   r.Header,
 		Creds:    authCtx.Credentials,

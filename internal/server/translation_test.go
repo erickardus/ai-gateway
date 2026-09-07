@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/erickardus/ai-gateway/internal/config"
 	"github.com/erickardus/ai-gateway/internal/core"
 )
 
@@ -429,5 +431,111 @@ func TestUntranslatableReplyIsAGatewayError(t *testing.T) {
 	// The upstream's own body must not have leaked into it.
 	if strings.Contains(rec.Body.String(), "<html>") {
 		t.Fatalf("the untranslatable body was relayed: %s", rec.Body.String())
+	}
+}
+
+func TestPromptCachingSurvivesTranslation(t *testing.T) {
+	// A translated request must still get every breakpoint the same upstream
+	// would have been sent natively. The conversation breakpoint is the one at
+	// risk: it is gated on the endpoint running the model, and a chat
+	// completion does — so gating it on the endpoint's name rather than that
+	// property would withhold it from exactly the requests that grow, which is
+	// the expensive half of an agent loop's prompt.
+	const system = "a stable system prompt, repeated every turn, long enough for a provider to cache. " +
+		"It stands in here for the tool definitions and instructions Claude Code sends on every request."
+
+	upstream := func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"id":"msg_1","type":"message","usage":{"input_tokens":5,"output_tokens":9}}`)
+	}
+	opts := harnessOpts{
+		format:      core.FormatAnthropic,
+		authMode:    "api_key",
+		translation: true,
+		promptCache: config.PromptCacheConfig{Inject: true, InjectMinBytes: 1},
+		upstream:    upstream,
+	}
+
+	// Native: an Anthropic caller reaching an Anthropic upstream.
+	native := newHarness(t, opts)
+	if rec := native.do(t, claudeCodeRequest("/v1/messages",
+		`{"model":"anthropic-claude","max_tokens":10,"system":"`+system+`","messages":[{"role":"user","content":"hi"}]}`,
+	)); rec.Code != http.StatusOK {
+		t.Fatalf("native status = %d: %s", rec.Code, rec.Body.String())
+	}
+	_, nativeBody, _, _ := native.seen.get()
+	nativeMarks := strings.Count(string(nativeBody), "cache_control")
+	if nativeMarks == 0 {
+		t.Fatalf("the fixture itself gets no breakpoints, so it proves nothing:\n%s", nativeBody)
+	}
+
+	// Translated: an OpenAI caller reaching the same upstream.
+	translated := newHarness(t, opts)
+	if rec := translated.do(t, claudeCodeRequest("/v1/chat/completions",
+		`{"model":"anthropic-claude","messages":[{"role":"system","content":"`+system+`"},{"role":"user","content":"hi"}]}`,
+	)); rec.Code != http.StatusOK {
+		t.Fatalf("translated status = %d: %s", rec.Code, rec.Body.String())
+	}
+	_, translatedBody, _, _ := translated.seen.get()
+
+	if got := strings.Count(string(translatedBody), "cache_control"); got != nativeMarks {
+		t.Fatalf("translated request got %d breakpoints, native got %d:\n%s", got, nativeMarks, translatedBody)
+	}
+}
+
+func TestTranslatedRequestIsBytewiseStableAcrossTurns(t *testing.T) {
+	// The property every prompt cache depends on. An upstream keys its cache on
+	// the prefix bytes, so translating the same conversation twice has to give
+	// the same bytes, and adding a turn must not rewrite the turns before it.
+	// A translator that re-encoded tool arguments through a map would sort
+	// their keys and miss the cache on every single request.
+	h := newHarness(t, harnessOpts{
+		format:      core.FormatOpenAI,
+		authMode:    "api_key",
+		translation: true,
+		upstream:    openAIUpstream(t, `{"id":"chatcmpl-1","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`),
+	})
+
+	conversation := func(turns int) string {
+		msgs := []string{`{"role":"user","content":"start"}`}
+		for i := 0; i < turns; i++ {
+			msgs = append(msgs,
+				`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_`+strconv.Itoa(i)+`","name":"f","input":{"z":1,"a":2}}]}`,
+				`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_`+strconv.Itoa(i)+`","content":"done"}]}`)
+		}
+		return `{"model":"openai-gpt","max_tokens":64,"system":"stable","messages":[` + strings.Join(msgs, ",") + `]}`
+	}
+
+	send := func(body string) string {
+		if rec := h.do(t, claudeCodeRequest("/v1/messages", body)); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		_, sent, _, _ := h.seen.get()
+		return string(sent)
+	}
+
+	short, shortAgain := send(conversation(2)), send(conversation(2))
+	if short != shortAgain {
+		t.Fatalf("the same conversation translated to different bytes:\n%s\n%s", short, shortAgain)
+	}
+
+	// The caller's own tool-input document must be carried, not re-encoded:
+	// its key order is part of the prefix the upstream hashes.
+	if !strings.Contains(short, `{\"z\":1,\"a\":2}`) {
+		t.Fatalf("tool arguments were re-encoded rather than carried across:\n%s", short)
+	}
+
+	long := send(conversation(3))
+	messagesOf := func(body string) string {
+		var doc struct {
+			Messages json.RawMessage `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(body), &doc); err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSuffix(string(doc.Messages), "]")
+	}
+	if !strings.HasPrefix(messagesOf(long), messagesOf(short)) {
+		t.Fatalf("adding a turn rewrote the earlier ones, so every turn misses the cache:\n short=%s\n long =%s",
+			messagesOf(short), messagesOf(long))
 	}
 }
